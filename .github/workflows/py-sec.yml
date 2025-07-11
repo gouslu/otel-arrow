@@ -35,13 +35,13 @@ jobs:
             if [ -f "$project/requirements.txt" ]; then
               echo "Auditing $project"
               cd "$project"
-              
+
               # Check for vulnerabilities in dependencies
               safety check -r requirements.txt --json || exit 1
-              
+
               # Scan Python code for security issues
               bandit -r . -ll || exit 1
-              
+
               cd - > /dev/null
             fi
           done
