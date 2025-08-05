@@ -157,6 +157,7 @@ jobs:
           manifest-path: ./rust/${{ matrix.folder }}/Cargo.toml
 
   bench:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'cargobench')
     strategy:
       fail-fast: false
       matrix:
