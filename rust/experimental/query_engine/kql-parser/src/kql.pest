@@ -16,7 +16,9 @@ plus_token = { "+" }
 positive_infinity_token = { "+inf" }
 negative_infinity_token = { "-inf" }
 equals_token = @{ "==" }
+equals_insensitive_token = @{ "=~" }
 not_equals_token = @{ "!=" }
+not_equals_insensitive_token = @{ "!~" }
 greater_than_token = @{ ">" ~ !"=" }
 greater_than_or_equal_to_token = @{ ">=" }
 less_than_token = @{ "<" ~ !"=" }
@@ -58,6 +60,18 @@ identifier_or_pattern_literal = ${
     | ("[" ~ string_literal ~ "]")
 }
 
+null_literal = { 
+    ("bool(" ~ "null" ~ ")") |
+    ("datetime(" ~ "null" ~ ")") |
+    ("dynamic(" ~ "null" ~ ")") |
+    ("guid(" ~ "null" ~ ")") |
+    ("int(" ~ "null" ~ ")") |
+    ("long(" ~ "null" ~ ")") |
+    ("real(" ~ "null" ~ ")") |
+    ("double(" ~ "null" ~ ")") |
+    ("timespan(" ~ "null" ~ ")")
+}
+
 // Expressions
 accessor_index = _{ "[" ~ (integer_literal | string_literal | (minus_token? ~ scalar_expression)) ~ "]" }
 accessor = _{ (identifier_literal | ("[" ~ string_literal ~ "]")) ~ accessor_index? }
@@ -67,11 +81,16 @@ boolean_expression = _{ true_literal | false_literal }
 real_expression = { "real(" ~ (positive_infinity_token|negative_infinity_token|double_literal|integer_literal) ~ ")" }
 datetime_expression = { "datetime(" ~ datetime_literal ~ ")" }
 conditional_expression = { ("iff"|"iif") ~ "(" ~ logical_expression ~ "," ~ scalar_expression ~ "," ~ scalar_expression ~ ")" }
+tostring_expression = { "tostring(" ~ scalar_expression ~ ")" }
+case_expression = { "case" ~ "(" ~ logical_expression ~ "," ~ scalar_expression ~ ("," ~ logical_expression ~ "," ~ scalar_expression)* ~ "," ~ scalar_expression ~ ")" }
 
 scalar_expression = {
-    real_expression
+    null_literal
+    | real_expression
     | datetime_expression
     | conditional_expression
+    | tostring_expression
+    | case_expression
     | boolean_expression
     | double_literal
     | integer_literal
@@ -81,7 +100,7 @@ scalar_expression = {
     | ("(" ~ logical_expression ~ ")")
 }
 
-comparison_expression = { scalar_expression ~ (equals_token|not_equals_token|greater_than_token|greater_than_or_equal_to_token|less_than_token|less_than_or_equal_to_token) ~ scalar_expression }
+comparison_expression = { scalar_expression ~ (equals_token|equals_insensitive_token|not_equals_token|not_equals_insensitive_token|greater_than_token|greater_than_or_equal_to_token|less_than_token|less_than_or_equal_to_token) ~ scalar_expression }
 logical_expressions = _{ comparison_expression|scalar_expression }
 logical_expression = { logical_expressions ~ ((and_token|or_token) ~ logical_expressions)* }
 

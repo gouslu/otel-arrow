@@ -9,6 +9,8 @@ OTLP collector endpoint over gRPC.
 Features:
 - Generates OTLP log records with random content for testing or benchmarking.
 - Runs multiple worker threads to simulate concurrent load.
+- Supports shared or dedicated TCP connection per-worker thread.
+- Supports optional rate targeting for message throughput (or max achievable).
 - Provides a Flask-based HTTP API to start, stop, and monitor the load
     generator.
 - Can run either as a one-off command line tool or as a long-running server.
@@ -30,17 +32,20 @@ Environment Variables:
 - OTLP_ENDPOINT: Target OTLP gRPC endpoint (default: localhost:4317).
 """
 
-import os
-import grpc  # type: ignore
-import time
 import argparse
+import concurrent.futures
+import os
 import random
 import signal
+import socket
 import string
 import sys
 import threading
+import time
+from typing import Optional
+
+import grpc  # type: ignore
 from flask import Flask, jsonify, request
-import concurrent.futures
 from opentelemetry.proto.collector.logs.v1 import (
     logs_service_pb2_grpc,
     logs_service_pb2,
@@ -68,6 +73,12 @@ class LoadGenConfig(BaseModel):
     )
     batch_size: int = Field(5000, gt=0, description="Number of logs per batch")
     threads: int = Field(4, gt=0, description="Number of worker threads to run")
+    target_rate: Optional[int] = Field(
+        None, gt=0, description="Optional target messages per second"
+    )
+    tcp_connection_per_thread: bool = Field(
+        True, description="Use a dedicated TCP connection per-thread"
+    )
 
     @field_validator(
         "body_size", "num_attributes", "attribute_value_size", "batch_size", "threads"
@@ -85,7 +96,7 @@ class LoadGenerator:
         self.stop_event = threading.Event()
         self.current_config = {}
         self.lock = threading.Lock()
-        self.metrics = {"sent": 0, "failed": 0, "bytes_sent": 0}
+        self.metrics = {"sent": 0, "failed": 0, "bytes_sent": 0, "late_batches": 0}
 
     def generate_random_string(self, length: int) -> str:
         """
@@ -122,7 +133,7 @@ class LoadGenerator:
             attributes=attributes,
         )
 
-    def update_metrics(self, key: str, amount: int = 1) -> None:
+    def increment_metric(self, key: str, amount: int = 1) -> None:
         with self.lock:
             self.metrics[key] += amount
 
@@ -131,8 +142,33 @@ class LoadGenerator:
         Worker thread that sends batches of log records to an OTLP endpoint.
         """
         endpoint = os.getenv("OTLP_ENDPOINT", "localhost:4317")
-        channel = grpc.insecure_channel(endpoint)
+
+        channel = None
+        if args.get("tcp_connection_per_thread"):
+            # This disables the default python grpc client behavior of shared global
+            # subchannels per destination.
+            channel = grpc.insecure_channel(
+                endpoint, options=[("grpc.use_local_subchannel_pool", 1)]
+            )
+        else:
+            channel = grpc.insecure_channel(endpoint)
+
         stub = logs_service_pb2_grpc.LogsServiceStub(channel)
+
+        batch_size = args["batch_size"]
+        thread_count = args["threads"]
+        target_rate = args.get("target_rate")
+
+        if target_rate:
+            thread_rate = target_rate / thread_count
+            batch_interval = batch_size / thread_rate
+            print(
+                f"Thread {thread_id} started with rate limit: {thread_rate} "
+                f"logs/sec (interval: {batch_interval:.4f}s)"
+            )
+        else:
+            batch_interval = None
+            print(f"Thread {thread_id} started with no rate limit")
 
         log_batch = [
             self.create_log_record(
@@ -140,7 +176,7 @@ class LoadGenerator:
                 num_attributes=args["num_attributes"],
                 attribute_value_size=args["attribute_value_size"],
             )
-            for _ in range(args["batch_size"])
+            for _ in range(batch_size)
         ]
 
         scope_logs = logs_pb2.ScopeLogs(log_records=log_batch)
@@ -149,15 +185,29 @@ class LoadGenerator:
             resource_logs=[resource_logs]
         )
 
-        print(f"Thread {thread_id} started, sending logs to {endpoint}")
+        next_send_time = time.perf_counter()
         while not self.stop_event.is_set():
             try:
                 stub.Export(logs_request)
-                self.update_metrics("sent", args["batch_size"])
-                self.update_metrics("bytes_sent", logs_request.ByteSize())
+                self.increment_metric("sent", args["batch_size"])
+                self.increment_metric("bytes_sent", logs_request.ByteSize())
             except Exception as e:
                 print(f"Thread {thread_id}: Failed to send log batch: {e}")
-                self.update_metrics("failed", args["batch_size"])
+                self.increment_metric("failed", args["batch_size"])
+
+            # If we're targeting a specific rate we do additional calculations
+            # to ensure we're not exceeding it via sleep. If we're not reaching
+            # the target rate (e.g. we're sending without sleep and it's
+            # still too slow), we increment a metric to inform observers.
+            if batch_interval:
+                now = time.perf_counter()
+                sleep_time = next_send_time - now
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                elif now - next_send_time > batch_interval:
+                    # More than 1 interval behind
+                    self.increment_metric("late_batches")
+                next_send_time += batch_interval
 
     def run_loadgen(self, args_dict):
         """
@@ -258,6 +308,11 @@ def handle_signal(sig, frame):
     sys.exit(0)
 
 
+def is_port_in_use(port, host="0.0.0.0"):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) == 0
+
 def main():
     def get_default_value(field_name: str):
         return LoadGenConfig.model_fields[field_name].default
@@ -314,9 +369,29 @@ def main():
         default=get_default_value("threads"),
         help=f"Number of worker threads (default {get_default_value('threads')})",
     )
+    parser.add_argument(
+        "--target-rate",
+        type=int,
+        default=get_default_value("target_rate"),
+        help=(
+            "Optional message rate to target "
+            f"(default {get_default_value('target_rate')})"
+        ),
+    )
+    parser.add_argument(
+        "--tcp-connection-per-thread",
+        type=bool,
+        default=get_default_value("tcp_connection_per_thread"),
+        help=(
+            "Use a dedicated TCP connection per-thread (default "
+            f"{get_default_value("tcp_connection_per_thread")})"
+        ),
+    )
     args = parser.parse_args()
 
     if args.serve:
+        if is_port_in_use(FLASK_PORT):
+            raise RuntimeError(f"Port {FLASK_PORT} is already in use.")
         app.run(host="0.0.0.0", port=args.serve_port)
         return
 
@@ -324,6 +399,7 @@ def main():
     print(f"- Duration: {args.duration} seconds")
     print(f"- Batch size: {args.batch_size} logs")
     print(f"- Threads: {args.threads}")
+    print(f"- Target Rate: {args.target_rate}")
     print(f"- Log body size: {args.body_size} characters")
     print(f"- Attributes per log: {args.num_attributes}")
     print(f"- Attribute value size: {args.attribute_value_size} characters")
@@ -334,6 +410,7 @@ def main():
         attribute_value_size=args.attribute_value_size,
         batch_size=args.batch_size,
         threads=args.threads,
+        target_rate=args.target_rate,
     )
 
     loadgen.start(config=config)

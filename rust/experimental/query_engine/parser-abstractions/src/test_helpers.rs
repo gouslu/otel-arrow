@@ -20,10 +20,8 @@ pub mod pest_test_helpers {
             );
         }
         for input in err_inputs {
-            assert!(
-                P::parse(parser_rule, input).is_err(),
-                "Expected Err for input: {input}"
-            );
+            let result = P::parse(parser_rule, input);
+            assert!(result.is_err(), "Expected Err for input: {input}");
         }
     }
 
@@ -145,6 +143,27 @@ pub mod parse_test_helpers {
                 StaticScalarExpression::String(v) => assert_eq!(*expected, v.get_value()),
                 _ => panic!("Unexpected type returned from parse_string_literal"),
             }
+        }
+    }
+
+    pub fn test_parse_null_literal<P, R>(parser_rule: R, inputs: &[&str])
+    where
+        P: Parser<R>,
+        R: RuleType,
+    {
+        let run_test = |input: &str| {
+            let mut result = P::parse(parser_rule, input).unwrap();
+            let pair = result.next().unwrap();
+            let expr = parse_standard_null_literal(pair);
+
+            match expr {
+                StaticScalarExpression::Null(_) => {} // Success!
+                _ => panic!("Unexpected type returned from parse_null_literal, got: {expr:?}"),
+            }
+        };
+
+        for input in inputs {
+            run_test(input);
         }
     }
 }

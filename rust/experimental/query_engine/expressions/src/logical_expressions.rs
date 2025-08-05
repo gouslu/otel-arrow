@@ -1,6 +1,6 @@
 use crate::{
-    Expression, ExpressionError, PipelineExpression, QueryLocation, ResolvedStaticScalarExpression,
-    ScalarExpression,
+    Expression, ExpressionError, PipelineExpression, QueryLocation, ScalarExpression,
+    resolved_static_scalar_expression::ResolvedStaticScalarExpression,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +34,7 @@ pub enum LogicalExpression {
 }
 
 impl LogicalExpression {
-    pub fn try_resolve_static<'a, 'b, 'c>(
+    pub(crate) fn try_resolve_static<'a, 'b, 'c>(
         &'a self,
         pipeline: &'b PipelineExpression,
     ) -> Result<Option<ResolvedStaticScalarExpression<'c>>, ExpressionError>
@@ -133,6 +133,7 @@ pub struct EqualToLogicalExpression {
     query_location: QueryLocation,
     left: ScalarExpression,
     right: ScalarExpression,
+    case_insensitive: bool,
 }
 
 impl EqualToLogicalExpression {
@@ -140,12 +141,18 @@ impl EqualToLogicalExpression {
         query_location: QueryLocation,
         left: ScalarExpression,
         right: ScalarExpression,
+        case_insensitive: bool,
     ) -> EqualToLogicalExpression {
         Self {
             query_location,
             left,
             right,
+            case_insensitive,
         }
+    }
+
+    pub fn get_case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     pub fn get_left(&self) -> &ScalarExpression {

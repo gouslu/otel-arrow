@@ -1,7 +1,7 @@
 use chrono::{DateTime, FixedOffset};
 use regex::Regex;
 
-use crate::{ArrayScalarExpression, Expression, MapScalarExpression, QueryLocation, primitives::*};
+use crate::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StaticScalarExpression {
@@ -33,36 +33,6 @@ pub enum StaticScalarExpression {
     String(StringScalarExpression),
 }
 
-impl StaticScalarExpression {
-    pub fn get_value_type(&self) -> ValueType {
-        match self {
-            StaticScalarExpression::Array(_) => ValueType::Array,
-            StaticScalarExpression::Boolean(_) => ValueType::Boolean,
-            StaticScalarExpression::DateTime(_) => ValueType::DateTime,
-            StaticScalarExpression::Double(_) => ValueType::Double,
-            StaticScalarExpression::Integer(_) => ValueType::Integer,
-            StaticScalarExpression::Map(_) => ValueType::Map,
-            StaticScalarExpression::Null(_) => ValueType::Null,
-            StaticScalarExpression::Regex(_) => ValueType::Regex,
-            StaticScalarExpression::String(_) => ValueType::String,
-        }
-    }
-
-    pub fn to_value(&self) -> Value {
-        match self {
-            StaticScalarExpression::Array(a) => Value::Array(a),
-            StaticScalarExpression::Boolean(b) => Value::Boolean(b),
-            StaticScalarExpression::DateTime(d) => Value::DateTime(d),
-            StaticScalarExpression::Double(d) => Value::Double(d),
-            StaticScalarExpression::Integer(i) => Value::Integer(i),
-            StaticScalarExpression::Map(m) => Value::Map(m),
-            StaticScalarExpression::Null(_) => Value::Null,
-            StaticScalarExpression::Regex(r) => Value::Regex(r),
-            StaticScalarExpression::String(s) => Value::String(s),
-        }
-    }
-}
-
 impl Expression for StaticScalarExpression {
     fn get_query_location(&self) -> &QueryLocation {
         match self {
@@ -89,6 +59,22 @@ impl Expression for StaticScalarExpression {
             StaticScalarExpression::Null(_) => "StaticScalar(Null)",
             StaticScalarExpression::String(_) => "StaticScalar(String)",
             StaticScalarExpression::Regex(_) => "StaticScalar(Regex)",
+        }
+    }
+}
+
+impl AsStaticValue for StaticScalarExpression {
+    fn to_static_value(&self) -> StaticValue {
+        match self {
+            StaticScalarExpression::Array(a) => StaticValue::Array(a),
+            StaticScalarExpression::Boolean(b) => StaticValue::Boolean(b),
+            StaticScalarExpression::DateTime(d) => StaticValue::DateTime(d),
+            StaticScalarExpression::Double(d) => StaticValue::Double(d),
+            StaticScalarExpression::Integer(i) => StaticValue::Integer(i),
+            StaticScalarExpression::Map(m) => StaticValue::Map(m),
+            StaticScalarExpression::Null(_) => StaticValue::Null,
+            StaticScalarExpression::Regex(r) => StaticValue::Regex(r),
+            StaticScalarExpression::String(s) => StaticValue::String(s),
         }
     }
 }

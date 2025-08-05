@@ -1,7 +1,4 @@
-use crate::{
-    Expression, ImmutableValueExpression, MutableValueExpression, QueryLocation, ScalarExpression,
-    ValueAccessor, ValueType,
-};
+use crate::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransformExpression {
@@ -195,8 +192,8 @@ impl Expression for ReduceMapTransformExpression {
 
     fn get_name(&self) -> &'static str {
         match self {
-            ReduceMapTransformExpression::Remove(_) => "ReduceTransform(Remove)",
-            ReduceMapTransformExpression::Retain(_) => "ReduceTransform(Retain)",
+            ReduceMapTransformExpression::Remove(_) => "ReduceMapTransform(Remove)",
+            ReduceMapTransformExpression::Retain(_) => "ReduceMapTransform(Retain)",
         }
     }
 }
