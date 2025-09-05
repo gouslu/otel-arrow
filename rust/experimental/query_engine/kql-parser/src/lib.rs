@@ -5,6 +5,7 @@ pub(crate) mod aggregate_expressions;
 pub(crate) mod date_utils;
 pub(crate) mod kql_parser;
 pub(crate) mod logical_expressions;
+pub(crate) mod pratt_arithmetic;
 pub(crate) mod query_expression;
 pub(crate) mod scalar_array_function_expressions;
 pub(crate) mod scalar_conditional_function_expressions;
