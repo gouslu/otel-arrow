@@ -1,0 +1,79 @@
+# rust/otap-dataflow/crates/otap/src/experimental/gigla_exporter/otlp-gigla.yaml
+# Azure GigLA Exporter Test Configuration with OTLP Receiver
+#
+# This configuration sets up an OTLP gRPC receiver that accepts telemetry
+# from instrumented applications and forwards it to the Azure GigLA exporter.
+#
+# Usage:
+#   cd rust/otap-dataflow
+#   cargo run --bin df_engine --features gigla-exporter -- --pipeline crates/otap/src/experimental/gigla_exporter/otlp-gigla.yaml --num-cores 1
+#
+# Send test data:
+#   cargo run --bin test_otlp_client -- --endpoint http://localhost:4317
+
+settings:
+  default_pipeline_ctrl_msg_channel_size: 100
+  default_node_ctrl_msg_channel_size: 100
+  default_pdata_channel_size: 100
+
+nodes:
+  otlp-receiver:
+    kind: receiver
+    plugin_urn: "urn:otel:otlp:receiver"
+    out_ports:
+      out_port:
+        destinations:
+          - gigla-exporter
+        dispatch_strategy: round_robin
+    config:
+      listening_addr: "127.0.0.1:4317"
+
+  gigla-exporter:
+    kind: exporter
+    plugin_urn: "urn:otel:gigla:exporter"
+    config:
+      # API configuration (REQUIRED)
+      api:
+        dcr_endpoint: "https://my-workspace.eastus-1.ingest.monitor.azure.com/dataCollectionRules/dcr-abc123/streams/Custom-MyTable_CL"
+        stream_name: "Custom-MyTable_CL"
+        dcr: "dcr-abc123"
+        schema:
+          # Map OTLP resource attributes to GigLA fields
+          resource_mapping:
+            "service.name": "ServiceName"
+            "service.version": "ServiceVersion"
+            "host.name": "HostName"
+            "deployment.environment": "Environment"
+          # Map OTLP scope attributes to GigLA fields
+          scope_mapping:
+            "otel.library.name": "InstrumentationLibrary"
+            "otel.library.version": "InstrumentationVersion"
+          # Map OTLP log record fields to GigLA fields
+          log_record_mapping:
+            "body": "Message"
+            "severity_text": "SeverityText"
+            "severity_number": "SeverityNumber"
+            "time_unix_nano": "TimeGenerated"
+            "attributes": "Properties"
+            "trace_id": "TraceId"
+            "span_id": "SpanId"
+          # Keep automatic schema mapping enabled
+          disable_schema_mapping: false
+      
+      # Concurrent publishing configuration (all optional)
+      concurrent_publishing:
+        fixed_count: 10                    # Use 10 concurrent publishers
+        cpu_multiplier: 2                   # Or 2x CPU count if not using fixed_count
+        payload_queue_size: 1000            # Queue up to 1000 payloads
+        log_queue_size: 10000               # Queue up to 10000 individual logs
+        cache_workers_count: 4              # Use 4 cache workers
+        compression_timeout: "5s"           # Timeout compression after 5 seconds
+      
+      # Set to true to disable actual export (for testing)
+      disable_gig_export: false
+      
+      # Optional: Enable cache for reliability (uncomment to use)
+      # cache_engine_config:
+      #   cache_path: "/var/cache/gigla-exporter"
+      #   max_disk_usage_mb: 1024           # Use up to 1GB for cache
+      #   expiration_duration_hours: 24     # Expire cached data after 24 hours

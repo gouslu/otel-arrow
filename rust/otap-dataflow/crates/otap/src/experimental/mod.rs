@@ -10,3 +10,8 @@
 /// Geneva exporter for Microsoft telemetry backend
 #[cfg(feature = "geneva-exporter")]
 pub mod geneva_exporter;
+
+
+/// GigLA exporter for Azure Log Analytics
+#[cfg(feature = "gigla-exporter")]
+pub mod gigla_exporter;
