@@ -14,6 +14,10 @@ pub struct Config {
     /// API configuration for GigLA
     pub api: ApiConfig,
     
+    /// Authentication configuration
+    #[serde(default)]
+    pub auth: AuthConfig,
+    
     /// Concurrent publishing settings
     #[serde(default)]
     pub concurrent_publishing: ConcurrentPublishingConfig,
@@ -24,6 +28,30 @@ pub struct Config {
     
     /// Optional cache engine configuration
     pub cache_engine_config: Option<CacheEngineConfig>,
+}
+
+/// Authentication configuration for Azure
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthConfig {
+    /// Azure AD tenant ID (optional, uses AZURE_TENANT_ID env var if not set)
+    pub tenant_id: Option<String>,
+    
+    /// OAuth scope for token acquisition (defaults to "https://monitor.azure.com/.default")
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            tenant_id: None,
+            scope: default_scope(),
+        }
+    }
+}
+
+fn default_scope() -> String {
+    "https://monitor.azure.com/.default".to_string()
 }
 
 /// API configuration for connecting to GigLA
@@ -102,6 +130,11 @@ pub struct CacheEngineConfig {
 impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
+        // Validate auth configuration
+        if self.auth.scope.is_empty() {
+            return Err("Invalid configuration: auth scope must be non-empty".to_string());
+        }
+        
         // Validate cache engine config if present
         if let Some(ref cache_config) = self.cache_engine_config {
             if cache_config.cache_path.is_empty() {

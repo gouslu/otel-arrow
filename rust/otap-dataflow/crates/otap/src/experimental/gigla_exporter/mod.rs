@@ -14,10 +14,14 @@ use crate::OTAP_EXPORTER_FACTORIES;
 use crate::pdata::OtapPdata;
 
 mod config;
+mod transformer;
 mod exporter;
+mod sender;
 
 pub use config::Config;
 pub use exporter::GigLaExporter;
+pub use sender::Sender;
+pub use transformer::Transformer;
 
 /// URN identifying the GigLA exporter in configuration pipelines.
 pub const GIGLA_EXPORTER_URN: &str = "urn:otel:gigla:exporter";

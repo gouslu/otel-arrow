@@ -68,6 +68,12 @@ zip.workspace = true
 geneva-uploader = { version = "0.3.0", optional = true }
 opentelemetry-proto = { workspace = true, optional = true }
 
+# GigLA exporter dependencies
+azure_identity = "0.29.0"
+flate2 = "1.1.5"
+reqwest = "0.12.24"
+azure_core = "0.29.1"
+
 [features]
 # Base experimental feature - enabled by all experimental exporters
 experimental-exporters = []
