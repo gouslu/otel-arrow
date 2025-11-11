@@ -7,11 +7,11 @@ use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
 use prost::Message as _;
 
-use crate::pdata::{OtapPdata, OtapPayload, OtlpProtoBytes};
+use crate::pdata::{OtapPdata, OtlpProtoBytes};
 
 use crate::experimental::gigla_exporter::config::Config;
 use crate::experimental::gigla_exporter::transformer::Transformer;
-use crate::experimental::gigla_exporter::sender::Sender;
+use crate::experimental::gigla_exporter::gigla_client::GigLaClient;
 
 /// GigLA exporter sending telemetry to the GigLA backend.
 ///
@@ -19,7 +19,7 @@ use crate::experimental::gigla_exporter::sender::Sender;
 /// (Geneva Infrastructure General-purpose Logging Analytics).
 pub struct GigLaExporter {
     config: Config,
-    sender: Sender,
+    client: GigLaClient,
     transformer: Transformer,
 }
 
@@ -31,14 +31,14 @@ impl GigLaExporter {
             .validate()
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig { error: e })?;
         
-        // Create sender with the full config
-        let sender = Sender::new(&config)
+        // Create GigLA client with the full config
+        let client = GigLaClient::new(&config)
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig { error: e })?;
 
         // Create log transformer
         let transformer = Transformer::new(&config);
         
-        Ok(Self { config, sender, transformer })
+        Ok(Self { config, client, transformer })
     }
 
     /// Handle a single pdata message.
@@ -47,74 +47,66 @@ impl GigLaExporter {
         pdata: OtapPdata,
         effect_handler: &EffectHandler<OtapPdata>,
     ) -> Result<(), String> {
-        // Early return if export is disabled
-        if self.config.disable_gig_export {
-            effect_handler
-                .info("[GigLaExporter] Export disabled by configuration")
-                .await;
-            return Ok(());
-        }
+        // Split pdata into context and payload
+        let (_context, payload) = pdata.into_parts();
 
-        let (_ctx, payload) = pdata.into_parts();
+        // Convert OTAP payload to OTLP bytes
+        // TODO: This conversion step should be eliminated (see method documentation above)
+        let otlp_bytes: OtlpProtoBytes = payload
+            .try_into()
+            .map_err(|e| format!("Failed to convert OTAP to OTLP: {:?}", e))?;
 
-        match payload {
-            OtapPayload::OtlpBytes(bytes) => match bytes {
-                OtlpProtoBytes::ExportLogsRequest(raw) => {
-                    let request = ExportLogsServiceRequest::decode(raw.as_slice())
-                        .map_err(|e| format!("Failed to decode logs request: {e}"))?;
-                    
-                    // Use the transformer with config
-                    let log_entries = self.transformer.convert_to_log_analytics(&request);
-                    
-                    if log_entries.is_empty() {
-                        effect_handler
-                            .info("[GigLaExporter] No logs to send")
-                            .await;
-                        return Ok(());
-                    }
-                    
+        match otlp_bytes {
+            OtlpProtoBytes::ExportLogsRequest(bytes) => {
+                let request = ExportLogsServiceRequest::decode(bytes.as_slice())
+                    .map_err(|e| format!("Failed to decode logs request: {e}"))?;
+                
+                // Use the transformer with config
+                let log_entries = self.transformer.convert_to_log_analytics(&request);
+                
+                if log_entries.is_empty() {
                     effect_handler
-                        .info(&format!(
-                            "[GigLaExporter] Sending {} log entries to stream '{}'",
-                            log_entries.len(),
-                            self.config.api.stream_name,
-                        ))
+                        .info("[GigLaExporter] No logs to send")
                         .await;
-                    
-                    // Debug: Print first entry as sample
-                    if let Some(first) = log_entries.first() {
-                        effect_handler
-                            .info(&format!(
-                                "[GigLaExporter] Sample entry: {}",
-                                serde_json::to_string_pretty(first).unwrap_or_default()
-                            ))
-                            .await;
-                    }
-                    
-                    // Send to Azure Log Analytics
-                    self.sender.send(&log_entries).await?;
-                    
-                    effect_handler
-                        .info(&format!(
-                            "[GigLaExporter] Successfully sent {} logs",
-                            log_entries.len()
-                        ))
-                        .await;
+                    return Ok(());
                 }
-                OtlpProtoBytes::ExportMetricsRequest(_) => {
-                    effect_handler
-                        .info("[GigLaExporter] Metrics not supported; dropping payload")
-                        .await;
-                }
-                OtlpProtoBytes::ExportTracesRequest(_) => {
-                    effect_handler
-                        .info("[GigLaExporter] Traces not supported; dropping payload")
-                        .await;
-                }
-            },
-            OtapPayload::OtapArrowRecords(_) => {
+                
                 effect_handler
-                    .info("[GigLaExporter] Arrow format not supported; dropping payload")
+                    .info(&format!(
+                        "[GigLaExporter] Sending {} log entries to stream '{}'",
+                        log_entries.len(),
+                        self.config.api.stream_name,
+                    ))
+                    .await;
+                
+                // Debug: Print first entry as sample
+                if let Some(first) = log_entries.first() {
+                    effect_handler
+                        .info(&format!(
+                            "[GigLaExporter] Sample entry: {}",
+                            serde_json::to_string_pretty(first).unwrap_or_default()
+                        ))
+                        .await;
+                }
+                
+                // Send to Azure Log Analytics
+                self.client.send(&log_entries).await?;
+                
+                effect_handler
+                    .info(&format!(
+                        "[GigLaExporter] Successfully sent {} logs",
+                        log_entries.len()
+                    ))
+                    .await;
+            }
+            OtlpProtoBytes::ExportMetricsRequest(_) => {
+                effect_handler
+                    .info("[GigLaExporter] Metrics not supported; dropping payload")
+                    .await;
+            }
+            OtlpProtoBytes::ExportTracesRequest(_) => {
+                effect_handler
+                    .info("[GigLaExporter] Traces not supported; dropping payload")
                     .await;
             }
         }
@@ -147,10 +139,6 @@ impl Exporter<OtapPdata> for GigLaExporter {
                         deadline,
                         std::iter::empty::<otap_df_telemetry::metrics::MetricSetSnapshot>(),
                     ));
-                }
-                Message::Control(NodeControlMsg::CollectTelemetry { metrics_reporter }) => {
-                    // TODO: Add metrics support
-                    let _ = metrics_reporter;
                 }
                 Message::PData(pdata) => {
                     if let Err(e) = self.handle_pdata(pdata, &effect_handler).await {

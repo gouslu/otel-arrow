@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Configuration for the GigLA Exporter matching the Collector's schema.
 #[derive(Debug, Deserialize, Clone)]
@@ -17,14 +16,6 @@ pub struct Config {
     /// Authentication configuration
     #[serde(default)]
     pub auth: AuthConfig,
-    
-    /// Concurrent publishing settings
-    #[serde(default)]
-    pub concurrent_publishing: ConcurrentPublishingConfig,
-    
-    /// Flag to disable GigLA export (for testing)
-    #[serde(default)]
-    pub disable_gig_export: bool,
     
     /// Optional cache engine configuration
     pub cache_engine_config: Option<CacheEngineConfig>,
@@ -91,29 +82,6 @@ pub struct SchemaConfig {
     pub disable_schema_mapping: bool,
 }
 
-/// Concurrent publishing configuration
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct ConcurrentPublishingConfig {
-    /// Fixed number of concurrent publishers
-    pub fixed_count: Option<usize>,
-    
-    /// CPU multiplier for dynamic publisher count
-    pub cpu_multiplier: Option<usize>,
-    
-    /// Size of the payload queue
-    pub payload_queue_size: Option<usize>,
-    
-    /// Size of the log queue
-    pub log_queue_size: Option<usize>,
-    
-    /// Number of cache workers
-    pub cache_workers_count: Option<usize>,
-    
-    /// Timeout for compression operations
-    #[serde(with = "humantime_serde")]
-    pub compression_timeout: Option<Duration>,
-}
-
 /// Cache engine configuration for reliability
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheEngineConfig {
@@ -152,15 +120,6 @@ impl Config {
                 return Err(
                     "Invalid configuration: expiration_duration_hours must be positive"
                         .to_string(),
-                );
-            }
-        }
-        
-        // Validate compression timeout
-        if let Some(timeout) = self.concurrent_publishing.compression_timeout {
-            if timeout.as_secs() == 0 {
-                return Err(
-                    "Invalid configuration: compression_timeout must be positive".to_string()
                 );
             }
         }

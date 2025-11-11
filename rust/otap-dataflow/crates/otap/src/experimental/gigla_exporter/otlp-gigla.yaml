@@ -60,18 +60,6 @@ nodes:
           # Keep automatic schema mapping enabled
           disable_schema_mapping: false
       
-      # Concurrent publishing configuration (all optional)
-      concurrent_publishing:
-        fixed_count: 10                    # Use 10 concurrent publishers
-        cpu_multiplier: 2                   # Or 2x CPU count if not using fixed_count
-        payload_queue_size: 1000            # Queue up to 1000 payloads
-        log_queue_size: 10000               # Queue up to 10000 individual logs
-        cache_workers_count: 4              # Use 4 cache workers
-        compression_timeout: "5s"           # Timeout compression after 5 seconds
-      
-      # Set to true to disable actual export (for testing)
-      disable_gig_export: false
-      
       # Optional: Enable cache for reliability (uncomment to use)
       # cache_engine_config:
       #   cache_path: "/var/cache/gigla-exporter"

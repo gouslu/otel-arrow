@@ -13,25 +13,25 @@ use std::time::Duration;
 
 use crate::experimental::gigla_exporter::config::Config;
 
-/// HTTP sender for Azure Log Analytics Data Collection Rule (DCR) endpoint.
+/// HTTP client for Azure Log Analytics Data Collection Rule (DCR) endpoint.
 /// 
 /// Handles authentication, compression, and HTTP communication with the Azure
 /// Monitor ingestion API.
-pub struct Sender {
+pub struct GigLaClient {
     http_client: Client,
     endpoint: String,
     credential: Arc<DeveloperToolsCredential>,
-    scope: String,  // Add scope field
+    scope: String,
 }
 
-impl Sender {
-    /// Creates a new sender instance from the configuration.
+impl GigLaClient {
+    /// Creates a new GigLA client instance from the configuration.
     /// 
     /// # Arguments
     /// * `config` - The GigLA exporter configuration
     /// 
     /// # Returns
-    /// * `Ok(Sender)` - A configured sender instance
+    /// * `Ok(GigLaClient)` - A configured client instance
     /// * `Err(String)` - Error message if initialization fails
     pub fn new(config: &Config) -> Result<Self, String> {
         let http_client = Client::builder()
@@ -56,7 +56,7 @@ impl Sender {
             http_client,
             endpoint,
             credential,
-            scope: config.auth.scope.clone(),  // Store scope from config
+            scope: config.auth.scope.clone(),
         })
     }
 

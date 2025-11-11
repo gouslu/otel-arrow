@@ -16,11 +16,11 @@ use crate::pdata::OtapPdata;
 mod config;
 mod transformer;
 mod exporter;
-mod sender;
+mod gigla_client;
 
 pub use config::Config;
 pub use exporter::GigLaExporter;
-pub use sender::Sender;
+pub use gigla_client::GigLaClient;
 pub use transformer::Transformer;
 
 /// URN identifying the GigLA exporter in configuration pipelines.
