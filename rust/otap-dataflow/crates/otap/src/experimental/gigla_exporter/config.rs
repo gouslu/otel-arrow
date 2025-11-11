@@ -9,10 +9,10 @@ pub struct Config {
     /// HTTP client configuration (timeout, TLS, etc.)
     #[serde(flatten)]
     pub client_config: HashMap<String, Value>,
-    
+
     /// API configuration for GigLA
     pub api: ApiConfig,
-    
+
     /// Authentication configuration
     #[serde(default)]
     pub auth: AuthConfig,
@@ -23,7 +23,7 @@ pub struct Config {
 pub struct AuthConfig {
     /// Azure AD tenant ID (optional, uses AZURE_TENANT_ID env var if not set)
     pub tenant_id: Option<String>,
-    
+
     /// OAuth scope for token acquisition (defaults to "https://monitor.azure.com/.default")
     #[serde(default = "default_scope")]
     pub scope: String,
@@ -47,13 +47,13 @@ fn default_scope() -> String {
 pub struct ApiConfig {
     /// Data Collection Rule endpoint
     pub dcr_endpoint: String,
-    
+
     /// Stream name for the logs
     pub stream_name: String,
-    
+
     /// Data Collection Rule identifier
     pub dcr: String,
-    
+
     /// Schema mapping configuration
     #[serde(default)]
     pub schema: SchemaConfig,
@@ -65,15 +65,15 @@ pub struct SchemaConfig {
     /// Resource attribute mappings
     #[serde(default)]
     pub resource_mapping: HashMap<String, String>,
-    
+
     /// Scope attribute mappings
     #[serde(default)]
     pub scope_mapping: HashMap<String, String>,
-    
+
     /// Log record field mappings
     #[serde(default)]
     pub log_record_mapping: HashMap<String, Value>,
-    
+
     /// Disable automatic schema mapping
     #[serde(default)]
     pub disable_schema_mapping: bool,
@@ -86,7 +86,7 @@ impl Config {
         if self.auth.scope.is_empty() {
             return Err("Invalid configuration: auth scope must be non-empty".to_string());
         }
-        
+
         // Validate API configuration
         if self.api.dcr_endpoint.is_empty() {
             return Err("Invalid configuration: dcr_endpoint must be non-empty".to_string());
@@ -97,7 +97,7 @@ impl Config {
         if self.api.dcr.is_empty() {
             return Err("Invalid configuration: dcr must be non-empty".to_string());
         }
-        
+
         Ok(())
     }
 }

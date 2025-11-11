@@ -1,7 +1,7 @@
 use azure_core::credentials::TokenCredential;
 use azure_identity::DeveloperToolsCredential;
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use reqwest::{
     Client,
     header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue},
@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::experimental::gigla_exporter::config::Config;
 
 /// HTTP client for Azure Log Analytics Data Collection Rule (DCR) endpoint.
-/// 
+///
 /// Handles authentication, compression, and HTTP communication with the Azure
 /// Monitor ingestion API.
 pub struct GigLaClient {
@@ -26,10 +26,10 @@ pub struct GigLaClient {
 
 impl GigLaClient {
     /// Creates a new GigLA client instance from the configuration.
-    /// 
+    ///
     /// # Arguments
     /// * `config` - The GigLA exporter configuration
-    /// 
+    ///
     /// # Returns
     /// * `Ok(GigLaClient)` - A configured client instance
     /// * `Err(String)` - Error message if initialization fails
@@ -42,9 +42,7 @@ impl GigLaClient {
         // Build the endpoint URL from config components
         let endpoint = format!(
             "{}/dataCollectionRules/{}/streams/{}?api-version=2021-11-01-preview",
-            config.api.dcr_endpoint,
-            config.api.dcr,
-            config.api.stream_name
+            config.api.dcr_endpoint, config.api.dcr, config.api.stream_name
         );
 
         // Create credential with None for default options
@@ -72,29 +70,30 @@ impl GigLaClient {
     }
 
     /// Send compressed data to Log Analytics ingestion API.
-    /// 
+    ///
     /// # Arguments
     /// * `body` - The data to send (must be serializable to JSON)
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` - If the request was successful
     /// * `Err(String)` - Error message if the request failed
     pub async fn send(&self, body: impl Serialize) -> Result<(), String> {
         // Use scope from config instead of hardcoded value
-        let token_response = self.credential
+        let token_response = self
+            .credential
             .get_token(&[&self.scope], None)
             .await
             .map_err(|e| format!("Failed to get token: {e}"))?;
-        
+
         let token = token_response.token.secret();
-        
+
         // Serialize to JSON
-        let json_bytes = serde_json::to_vec(&body)
-            .map_err(|e| format!("Failed to serialize to JSON: {e}"))?;
-        
+        let json_bytes =
+            serde_json::to_vec(&body).map_err(|e| format!("Failed to serialize to JSON: {e}"))?;
+
         // Compress the JSON
         let compressed_body = self.gzip_compress(&json_bytes)?;
-        
+
         // Build headers
         let mut headers = HeaderMap::new();
         let _ = headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -102,9 +101,9 @@ impl GigLaClient {
         let _ = headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| "Invalid token format".to_string())?
+                .map_err(|_| "Invalid token format".to_string())?,
         );
-        
+
         // Log compression ratio for debugging
         let compression_ratio = json_bytes.len() as f64 / compressed_body.len() as f64;
         log::debug!(
@@ -113,20 +112,21 @@ impl GigLaClient {
             compressed_body.len(),
             compression_ratio
         );
-        
+
         // Send compressed body
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&self.endpoint)
             .headers(headers)
             .body(compressed_body)
             .send()
             .await
             .map_err(|e| format!("Failed to send request: {e}"))?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await.unwrap_or_default();
-            
+
             match status.as_u16() {
                 401 => return Err(format!("Authentication failed: {error}")),
                 403 => return Err(format!("Authorization failed: {error}")),
@@ -135,7 +135,7 @@ impl GigLaClient {
                 _ => return Err(format!("Request failed ({status}): {error}")),
             }
         }
-        
+
         Ok(())
     }
 }

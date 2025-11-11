@@ -1,17 +1,17 @@
 use async_trait::async_trait;
-use otel_arrow_rust::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
 use otap_df_engine::control::NodeControlMsg;
 use otap_df_engine::error::Error;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
+use otel_arrow_rust::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message as _;
 
 use crate::pdata::{OtapPdata, OtlpProtoBytes};
 
 use crate::experimental::gigla_exporter::config::Config;
-use crate::experimental::gigla_exporter::transformer::Transformer;
 use crate::experimental::gigla_exporter::gigla_client::GigLaClient;
+use crate::experimental::gigla_exporter::transformer::Transformer;
 
 /// GigLA exporter sending telemetry to the GigLA backend.
 ///
@@ -30,15 +30,19 @@ impl GigLaExporter {
         config
             .validate()
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig { error: e })?;
-        
+
         // Create GigLA client with the full config
         let client = GigLaClient::new(&config)
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig { error: e })?;
 
         // Create log transformer
         let transformer = Transformer::new(&config);
-        
-        Ok(Self { config, client, transformer })
+
+        Ok(Self {
+            config,
+            client,
+            transformer,
+        })
     }
 
     /// Handle a single pdata message.
@@ -60,17 +64,15 @@ impl GigLaExporter {
             OtlpProtoBytes::ExportLogsRequest(bytes) => {
                 let request = ExportLogsServiceRequest::decode(bytes.as_slice())
                     .map_err(|e| format!("Failed to decode logs request: {e}"))?;
-                
+
                 // Use the transformer with config
                 let log_entries = self.transformer.convert_to_log_analytics(&request);
-                
+
                 if log_entries.is_empty() {
-                    effect_handler
-                        .info("[GigLaExporter] No logs to send")
-                        .await;
+                    effect_handler.info("[GigLaExporter] No logs to send").await;
                     return Ok(());
                 }
-                
+
                 effect_handler
                     .info(&format!(
                         "[GigLaExporter] Sending {} log entries to stream '{}'",
@@ -78,7 +80,7 @@ impl GigLaExporter {
                         self.config.api.stream_name,
                     ))
                     .await;
-                
+
                 // Debug: Print first entry as sample
                 if let Some(first) = log_entries.first() {
                     effect_handler
@@ -88,10 +90,10 @@ impl GigLaExporter {
                         ))
                         .await;
                 }
-                
+
                 // Send to Azure Log Analytics
                 self.client.send(&log_entries).await?;
-                
+
                 effect_handler
                     .info(&format!(
                         "[GigLaExporter] Successfully sent {} logs",
@@ -125,9 +127,7 @@ impl Exporter<OtapPdata> for GigLaExporter {
         effect_handler
             .info(&format!(
                 "[GigLaExporter] Starting: endpoint={}, stream={}, dcr={}",
-                self.config.api.dcr_endpoint,
-                self.config.api.stream_name,
-                self.config.api.dcr
+                self.config.api.dcr_endpoint, self.config.api.stream_name, self.config.api.dcr
             ))
             .await;
 
