@@ -14,9 +14,9 @@ use crate::OTAP_EXPORTER_FACTORIES;
 use crate::pdata::OtapPdata;
 
 mod config;
-mod transformer;
 mod exporter;
 mod gigla_client;
+mod transformer;
 
 pub use config::Config;
 pub use exporter::GigLaExporter;
@@ -52,3 +52,13 @@ pub static GIGLA_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
         ))
     },
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_urn_constant() {
+        assert_eq!(GIGLA_EXPORTER_URN, "urn:otel:gigla:exporter");
+    }
+}

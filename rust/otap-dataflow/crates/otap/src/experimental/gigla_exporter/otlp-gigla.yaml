@@ -59,9 +59,3 @@ nodes:
             "span_id": "SpanId"
           # Keep automatic schema mapping enabled
           disable_schema_mapping: false
-      
-      # Optional: Enable cache for reliability (uncomment to use)
-      # cache_engine_config:
-      #   cache_path: "/var/cache/gigla-exporter"
-      #   max_disk_usage_mb: 1024           # Use up to 1GB for cache
-      #   expiration_duration_hours: 24     # Expire cached data after 24 hours

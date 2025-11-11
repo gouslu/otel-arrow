@@ -16,9 +16,6 @@ pub struct Config {
     /// Authentication configuration
     #[serde(default)]
     pub auth: AuthConfig,
-    
-    /// Optional cache engine configuration
-    pub cache_engine_config: Option<CacheEngineConfig>,
 }
 
 /// Authentication configuration for Azure
@@ -82,46 +79,12 @@ pub struct SchemaConfig {
     pub disable_schema_mapping: bool,
 }
 
-/// Cache engine configuration for reliability
-#[derive(Debug, Deserialize, Clone)]
-pub struct CacheEngineConfig {
-    /// Path for cache storage
-    pub cache_path: String,
-    
-    /// Maximum disk usage in MB
-    pub max_disk_usage_mb: u64,
-    
-    /// Cache expiration in hours
-    pub expiration_duration_hours: u32,
-}
-
 impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
         // Validate auth configuration
         if self.auth.scope.is_empty() {
             return Err("Invalid configuration: auth scope must be non-empty".to_string());
-        }
-        
-        // Validate cache engine config if present
-        if let Some(ref cache_config) = self.cache_engine_config {
-            if cache_config.cache_path.is_empty() {
-                return Err(
-                    "Invalid configuration: CacheEngineConfig requires non-empty cache_path"
-                        .to_string(),
-                );
-            }
-            if cache_config.max_disk_usage_mb == 0 {
-                return Err(
-                    "Invalid configuration: max_disk_usage_mb must be positive".to_string()
-                );
-            }
-            if cache_config.expiration_duration_hours == 0 {
-                return Err(
-                    "Invalid configuration: expiration_duration_hours must be positive"
-                        .to_string(),
-                );
-            }
         }
         
         // Validate API configuration
@@ -136,5 +99,45 @@ impl Config {
         }
         
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_config() {
+        let config = Config {
+            client_config: HashMap::new(),
+            api: ApiConfig {
+                dcr_endpoint: "https://example.com".to_string(),
+                stream_name: "mystream".to_string(),
+                dcr: "mydcr".to_string(),
+                schema: SchemaConfig::default(),
+            },
+            auth: AuthConfig {
+                tenant_id: Some("mytenant".to_string()),
+                scope: "https://monitor.azure.com/.default".to_string(),
+            },
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_config_missing_api_fields() {
+        let config = Config {
+            client_config: HashMap::new(),
+            api: ApiConfig {
+                dcr_endpoint: "".to_string(),
+                stream_name: "".to_string(),
+                dcr: "".to_string(),
+                schema: SchemaConfig::default(),
+            },
+            auth: AuthConfig::default(),
+        };
+
+        assert!(config.validate().is_err());
     }
 }
