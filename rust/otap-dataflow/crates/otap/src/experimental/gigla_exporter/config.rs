@@ -18,22 +18,52 @@ pub struct Config {
     pub auth: AuthConfig,
 }
 
+/// Authentication method for Azure
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    /// Use Managed Identity (system or user-assigned with client_id)
+    #[serde(alias = "msi", alias = "managed_identity")]
+    ManagedIdentity,
+    /// Use developer tools (Azure CLI, Azure Developer CLI)
+    #[serde(alias = "dev", alias = "developer", alias = "cli")]
+    Development,
+}
+
+impl Default for AuthMethod {
+    fn default() -> Self {
+        // Default to Development for backward compatibility and local dev experience
+        Self::Development
+    }
+}
+
 /// Authentication configuration for Azure
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
-    /// Azure AD tenant ID (optional, uses AZURE_TENANT_ID env var if not set)
-    pub tenant_id: Option<String>,
+    /// Authentication method to use
+    #[serde(default)]
+    pub method: AuthMethod,
+
+    /// Client ID for user-assigned managed identity (optional)
+    /// Only used when method is ManagedIdentity
+    /// If not provided with ManagedIdentity, system-assigned identity will be used
+    pub client_id: Option<String>,
 
     /// OAuth scope for token acquisition (defaults to "https://monitor.azure.com/.default")
     #[serde(default = "default_scope")]
     pub scope: String,
+
+    /// Azure AD tenant ID (optional, currently not used but kept for future compatibility)
+    pub tenant_id: Option<String>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            tenant_id: None,
+            method: AuthMethod::default(),
+            client_id: None,
             scope: default_scope(),
+            tenant_id: None,
         }
     }
 }
@@ -119,6 +149,8 @@ mod tests {
             auth: AuthConfig {
                 tenant_id: Some("mytenant".to_string()),
                 scope: "https://monitor.azure.com/.default".to_string(),
+                client_id: Some("myclientid".to_string()),
+                method: AuthMethod::ManagedIdentity,
             },
         };
 

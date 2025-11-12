@@ -1,15 +1,13 @@
-# rust/otap-dataflow/crates/otap/src/experimental/gigla_exporter/otlp-gigla.yaml
-# Azure GigLA Exporter Test Configuration with OTLP Receiver
+# rust/otap-dataflow/crates/otap/src/experimental/gigla_exporter/otlp-gigla-aks.yaml
+# Azure GigLA Exporter Configuration for AKS with Managed Identity
 #
-# This configuration sets up an OTLP gRPC receiver that accepts telemetry
-# from instrumented applications and forwards it to the Azure GigLA exporter.
+# This configuration is designed for running in AKS with workload identity
+# or managed identity enabled.
 #
-# Usage:
-#   cd rust/otap-dataflow
-#   cargo run --bin df_engine --features gigla-exporter -- --pipeline crates/otap/src/experimental/gigla_exporter/otlp-gigla.yaml --num-cores 1
-#
-# Send test data:
-#   cargo run --bin test_otlp_client -- --endpoint http://localhost:4317
+# Prerequisites:
+# 1. Enable managed identity on your AKS cluster
+# 2. Assign the managed identity appropriate permissions to the DCR
+# 3. Deploy this configuration to your AKS cluster
 
 settings:
   default_pipeline_ctrl_msg_channel_size: 100
@@ -26,29 +24,29 @@ nodes:
           - gigla-exporter
         dispatch_strategy: round_robin
     config:
-      listening_addr: "127.0.0.1:4317"
+      # Listen on all interfaces in container
+      listening_addr: "0.0.0.0:4317"
 
   gigla-exporter:
     kind: exporter
     plugin_urn: "urn:otel:gigla:exporter"
     config:
-      # API configuration (REQUIRED)
+      # API configuration - Update with your actual values
       api:
-        dcr_endpoint: "https://my-workspace.eastus-1.ingest.monitor.azure.com/dataCollectionRules/dcr-abc123/streams/Custom-MyTable_CL"
+        dcr_endpoint: "https://my-workspace.eastus-1.ingest.monitor.azure.com"
         stream_name: "Custom-MyTable_CL"
         dcr: "dcr-abc123"
         schema:
-          # Map OTLP resource attributes to GigLA fields
           resource_mapping:
             "service.name": "ServiceName"
             "service.version": "ServiceVersion"
-            "host.name": "HostName"
-            "deployment.environment": "Environment"
-          # Map OTLP scope attributes to GigLA fields
+            "k8s.pod.name": "PodName"
+            "k8s.namespace.name": "Namespace"
+            "k8s.deployment.name": "Deployment"
+            "k8s.node.name": "NodeName"
           scope_mapping:
             "otel.library.name": "InstrumentationLibrary"
             "otel.library.version": "InstrumentationVersion"
-          # Map OTLP log record fields to GigLA fields
           log_record_mapping:
             "body": "Message"
             "severity_text": "SeverityText"
@@ -57,5 +55,19 @@ nodes:
             "attributes": "Properties"
             "trace_id": "TraceId"
             "span_id": "SpanId"
-          # Keep automatic schema mapping enabled
           disable_schema_mapping: false
+      
+      # Authentication configuration for AKS
+      auth:
+        # Use managed identity for AKS workloads
+        method: "managedidentity"  # or "msi"
+        
+        # For user-assigned managed identity (common in AKS)
+        # Get this from your AKS managed identity configuration
+        client_id: "YOUR-USER-ASSIGNED-IDENTITY-CLIENT-ID"
+        
+        # For system-assigned managed identity (less common in AKS)
+        # Comment out the client_id field above
+        
+        # OAuth scope for Azure Monitor
+        scope: "https://monitor.azure.com/.default"

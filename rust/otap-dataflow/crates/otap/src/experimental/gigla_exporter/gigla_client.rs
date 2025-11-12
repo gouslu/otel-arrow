@@ -1,5 +1,9 @@
 use azure_core::credentials::TokenCredential;
-use azure_identity::DeveloperToolsCredential;
+use azure_identity::{
+    DeveloperToolsCredential, DeveloperToolsCredentialOptions,
+    ManagedIdentityCredential, ManagedIdentityCredentialOptions,
+    UserAssignedId,
+};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use reqwest::{
@@ -11,7 +15,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::experimental::gigla_exporter::config::Config;
+use crate::experimental::gigla_exporter::config::{AuthMethod, Config};
 
 /// HTTP client for Azure Log Analytics Data Collection Rule (DCR) endpoint.
 ///
@@ -20,7 +24,7 @@ use crate::experimental::gigla_exporter::config::Config;
 pub struct GigLaClient {
     http_client: Client,
     endpoint: String,
-    credential: Arc<DeveloperToolsCredential>,
+    credential: Arc<dyn TokenCredential>,
     scope: String,
 }
 
@@ -45,10 +49,32 @@ impl GigLaClient {
             config.api.dcr_endpoint, config.api.dcr, config.api.stream_name
         );
 
-        // Create credential with None for default options
-        // DeveloperToolsCredential will use the AZURE_TENANT_ID env var we just set
-        let credential = DeveloperToolsCredential::new(None)
-            .map_err(|e| format!("Failed to create credential: {e}"))?;
+        // Create credential based on auth method in config
+        let credential: Arc<dyn TokenCredential> = match config.auth.method {
+            AuthMethod::ManagedIdentity => {
+                let mut options = ManagedIdentityCredentialOptions::default();
+                
+                if let Some(client_id) = &config.auth.client_id {
+                    // User-assigned managed identity
+                    log::info!("Using user-assigned managed identity with client_id: {}", client_id);
+                    options.user_assigned_id = Some(UserAssignedId::ClientId(client_id.clone()));
+                } else {
+                    // System-assigned managed identity
+                    log::info!("Using system-assigned managed identity");
+                    // user_assigned_id remains None for system-assigned
+                }
+                
+                ManagedIdentityCredential::new(Some(options))
+                    .map_err(|e| format!("Failed to create managed identity credential: {e}"))?
+            }
+            AuthMethod::Development => {
+                log::info!("Using developer tools credential (Azure CLI / Azure Developer CLI)");
+                // DeveloperToolsCredential tries Azure CLI and Azure Developer CLI
+                DeveloperToolsCredential::new(Some(DeveloperToolsCredentialOptions::default()))
+                    .map_err(|e| format!("Failed to create developer tools credential: {e}. \
+                        Ensure Azure CLI or Azure Developer CLI is installed and logged in"))?
+            }
+        };
 
         Ok(Self {
             http_client,
