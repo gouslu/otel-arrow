@@ -58,7 +58,7 @@ impl GigLaExporter {
         // TODO: This conversion step should be eliminated (see method documentation above)
         let otlp_bytes: OtlpProtoBytes = payload
             .try_into()
-            .map_err(|e| format!("Failed to convert OTAP to OTLP: {:?}", e))?;
+            .map_err(|e| format!("Failed to convert OTAP to OTLP: {e:?}"))?;
 
         match otlp_bytes {
             OtlpProtoBytes::ExportLogsRequest(bytes) => {
@@ -143,7 +143,7 @@ impl Exporter<OtapPdata> for GigLaExporter {
                 Message::PData(pdata) => {
                     if let Err(e) = self.handle_pdata(pdata, &effect_handler).await {
                         effect_handler
-                            .info(&format!("[GigLaExporter] Error processing data: {}", e))
+                            .info(&format!("[GigLaExporter] Error processing data: {e}"))
                             .await;
                     }
                 }

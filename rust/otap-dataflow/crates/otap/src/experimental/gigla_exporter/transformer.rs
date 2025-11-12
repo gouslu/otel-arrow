@@ -13,14 +13,14 @@ pub struct Transformer {
 
 impl Transformer {
     /// Create a new transformer with the given configuration
-    pub fn new(config: &Config) -> Self {
+    #[must_use] pub fn new(config: &Config) -> Self {
         Self {
             schema: config.api.schema.clone(),
         }
     }
 
     /// Convert OTLP logs to flat JSON objects for Log Analytics
-    pub fn convert_to_log_analytics(&self, request: &ExportLogsServiceRequest) -> Vec<Value> {
+    #[must_use] pub fn convert_to_log_analytics(&self, request: &ExportLogsServiceRequest) -> Vec<Value> {
         let mut entries = Vec::new();
 
         for resource_logs in &request.resource_logs {
@@ -60,7 +60,7 @@ impl Transformer {
 
                         // Transform log record based on mapping
                         if let Err(e) = self.transform_log_record(&mut entry, log_record) {
-                            log::warn!("Failed to transform log record: {}", e);
+                            log::warn!("Failed to transform log record: {e}");
                             continue;
                         }
                     }
@@ -177,7 +177,7 @@ impl Transformer {
                     Ok(json!(null))
                 }
             }
-            _ => Err(format!("Unknown field name: {}", key)),
+            _ => Err(format!("Unknown field name: {key}")),
         }
     }
 
@@ -295,7 +295,7 @@ impl Transformer {
     fn bytes_to_hex(&self, bytes: &[u8]) -> String {
         bytes
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{b:02x}"))
             .collect::<String>()
     }
 
