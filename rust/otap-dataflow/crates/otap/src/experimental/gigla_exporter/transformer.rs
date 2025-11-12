@@ -12,15 +12,19 @@ pub struct Transformer {
 }
 
 impl Transformer {
-    /// Create a new transformer with the given configuration
-    #[must_use] pub fn new(config: &Config) -> Self {
+    /// Create a new transformer with the given configuration.
+    /// Must be used; constructing and discarding would be a no-op.
+    #[must_use]
+    pub fn new(config: &Config) -> Self {
         Self {
             schema: config.api.schema.clone(),
         }
     }
 
-    /// Convert OTLP logs to flat JSON objects for Log Analytics
-    #[must_use] pub fn convert_to_log_analytics(&self, request: &ExportLogsServiceRequest) -> Vec<Value> {
+    /// Convert OTLP logs to flat JSON objects for Log Analytics.
+    /// Must be used; otherwise transformed entries are lost.
+    #[must_use]
+    pub fn convert_to_log_analytics(&self, request: &ExportLogsServiceRequest) -> Vec<Value> {
         let mut entries = Vec::new();
 
         for resource_logs in &request.resource_logs {
@@ -60,7 +64,7 @@ impl Transformer {
 
                         // Transform log record based on mapping
                         if let Err(e) = self.transform_log_record(&mut entry, log_record) {
-                            log::warn!("Failed to transform log record: {e}");
+                            log::warn!("Failed to transform log record: {}", e);
                             continue;
                         }
                     }
