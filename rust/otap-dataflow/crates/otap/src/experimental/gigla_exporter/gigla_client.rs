@@ -1,8 +1,7 @@
 use azure_core::credentials::TokenCredential;
 use azure_identity::{
-    DeveloperToolsCredential, DeveloperToolsCredentialOptions,
-    ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-    UserAssignedId,
+    DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
+    ManagedIdentityCredentialOptions, UserAssignedId,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -53,17 +52,20 @@ impl GigLaClient {
         let credential: Arc<dyn TokenCredential> = match config.auth.method {
             AuthMethod::ManagedIdentity => {
                 let mut options = ManagedIdentityCredentialOptions::default();
-                
+
                 if let Some(client_id) = &config.auth.client_id {
                     // User-assigned managed identity
-                    log::info!("Using user-assigned managed identity with client_id: {}", client_id);
+                    log::info!(
+                        "Using user-assigned managed identity with client_id: {}",
+                        client_id
+                    );
                     options.user_assigned_id = Some(UserAssignedId::ClientId(client_id.clone()));
                 } else {
                     // System-assigned managed identity
                     log::info!("Using system-assigned managed identity");
                     // user_assigned_id remains None for system-assigned
                 }
-                
+
                 ManagedIdentityCredential::new(Some(options))
                     .map_err(|e| format!("Failed to create managed identity credential: {e}"))?
             }
@@ -71,8 +73,12 @@ impl GigLaClient {
                 log::info!("Using developer tools credential (Azure CLI / Azure Developer CLI)");
                 // DeveloperToolsCredential tries Azure CLI and Azure Developer CLI
                 DeveloperToolsCredential::new(Some(DeveloperToolsCredentialOptions::default()))
-                    .map_err(|e| format!("Failed to create developer tools credential: {e}. \
-                        Ensure Azure CLI or Azure Developer CLI is installed and logged in"))?
+                    .map_err(|e| {
+                        format!(
+                            "Failed to create developer tools credential: {e}. \
+                        Ensure Azure CLI or Azure Developer CLI is installed and logged in"
+                        )
+                    })?
             }
         };
 
