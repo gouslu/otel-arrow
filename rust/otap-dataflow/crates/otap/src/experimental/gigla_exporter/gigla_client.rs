@@ -55,8 +55,7 @@ impl GigLaClient {
 
                 if let Some(client_id) = &config.auth.client_id {
                     // User-assigned managed identity
-                    log::info!(
-                        "Using user-assigned managed identity with client_id: {client_id}");
+                    log::info!("Using user-assigned managed identity with client_id: {client_id}");
                     options.user_assigned_id = Some(UserAssignedId::ClientId(client_id.clone()));
                 } else {
                     // System-assigned managed identity
