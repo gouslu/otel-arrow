@@ -1,5 +1,5 @@
-use otel_arrow_rust::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
-use otel_arrow_rust::proto::opentelemetry::common::v1::any_value::Value as OtelAnyValueEnum;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as OtelAnyValueEnum;
 use serde_json::{Value, json};
 
 use super::config::{Config, SchemaConfig};
@@ -81,7 +81,7 @@ impl Transformer {
     fn legacy_transform(
         &self,
         destination: &mut serde_json::Map<String, Value>,
-        log_record: &otel_arrow_rust::proto::opentelemetry::logs::v1::LogRecord,
+        log_record: &opentelemetry_proto::tonic::logs::v1::LogRecord,
     ) {
         // Use timestamp or fallback to observed timestamp
         let timestamp = if log_record.time_unix_nano != 0 {
@@ -104,7 +104,7 @@ impl Transformer {
     fn transform_log_record(
         &self,
         destination: &mut serde_json::Map<String, Value>,
-        log_record: &otel_arrow_rust::proto::opentelemetry::logs::v1::LogRecord,
+        log_record: &opentelemetry_proto::tonic::logs::v1::LogRecord,
     ) -> Result<(), String> {
         // Process each mapping in log_record_mapping
         for (key, value) in &self.schema.log_record_mapping {
@@ -138,7 +138,7 @@ impl Transformer {
     fn extract_value_from_log_record(
         &self,
         key: &str,
-        log_record: &otel_arrow_rust::proto::opentelemetry::logs::v1::LogRecord,
+        log_record: &opentelemetry_proto::tonic::logs::v1::LogRecord,
     ) -> Result<Value, String> {
         let key_lower = key.to_lowercase();
         match key_lower.as_str() {
@@ -188,7 +188,7 @@ impl Transformer {
     /// Extract attribute value by key from the attributes list
     fn extract_attribute(
         &self,
-        attributes: &[otel_arrow_rust::proto::opentelemetry::common::v1::KeyValue],
+        attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
         key: &str,
     ) -> Option<Value> {
         for attr in attributes {
@@ -206,7 +206,7 @@ impl Transformer {
     /// Apply resource mapping based on configuration
     fn apply_resource_mapping(
         &self,
-        resource: &Option<otel_arrow_rust::proto::opentelemetry::resource::v1::Resource>,
+        resource: &Option<opentelemetry_proto::tonic::resource::v1::Resource>,
     ) -> serde_json::Map<String, Value> {
         let mut attrs = serde_json::Map::new();
 
@@ -224,7 +224,7 @@ impl Transformer {
     /// Apply scope mapping based on configuration
     fn apply_scope_mapping(
         &self,
-        scope: &Option<otel_arrow_rust::proto::opentelemetry::common::v1::InstrumentationScope>,
+        scope: &Option<opentelemetry_proto::tonic::common::v1::InstrumentationScope>,
     ) -> serde_json::Map<String, Value> {
         let mut attrs = serde_json::Map::new();
 

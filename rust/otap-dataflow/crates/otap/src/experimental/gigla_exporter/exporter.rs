@@ -1,17 +1,17 @@
 use async_trait::async_trait;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use otap_df_engine::control::NodeControlMsg;
 use otap_df_engine::error::Error;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
-use otel_arrow_rust::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+use otap_df_pdata::otlp::OtlpProtoBytes;
 use prost::Message as _;
-
-use crate::pdata::{OtapPdata, OtlpProtoBytes};
 
 use crate::experimental::gigla_exporter::config::Config;
 use crate::experimental::gigla_exporter::gigla_client::GigLaClient;
 use crate::experimental::gigla_exporter::transformer::Transformer;
+use crate::pdata::OtapPdata;
 
 /// GigLA exporter sending telemetry to the GigLA backend.
 ///
