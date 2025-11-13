@@ -24,10 +24,11 @@ pub struct Config {
 pub enum AuthMethod {
     /// Use Managed Identity (system or user-assigned with client_id)
     #[serde(alias = "msi", alias = "managed_identity")]
+    #[default]
     ManagedIdentity,
+
     /// Use developer tools (Azure CLI, Azure Developer CLI)
     #[serde(alias = "dev", alias = "developer", alias = "cli")]
-    #[default]
     Development,
 }
 
