@@ -19,7 +19,7 @@ pub struct Config {
 }
 
 /// Authentication method for Azure
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     /// Use Managed Identity (system or user-assigned with client_id)
@@ -27,14 +27,8 @@ pub enum AuthMethod {
     ManagedIdentity,
     /// Use developer tools (Azure CLI, Azure Developer CLI)
     #[serde(alias = "dev", alias = "developer", alias = "cli")]
+    #[default]
     Development,
-}
-
-impl Default for AuthMethod {
-    fn default() -> Self {
-        // Default to Development for backward compatibility and local dev experience
-        Self::Development
-    }
 }
 
 /// Authentication configuration for Azure
