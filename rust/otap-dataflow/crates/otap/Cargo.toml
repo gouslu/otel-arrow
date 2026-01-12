@@ -80,7 +80,7 @@ data_engine_recordset = { workspace = true, optional = true }
 # Azure Monitor Exporter dependencies
 azure_identity = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true, features = ["rustls"] }
+reqwest = { workspace = true, optional = true, features = ["rustls", "query", "json"] }
 azure_core = { workspace = true, optional = true,  features = ["reqwest"] }
 ahash = { workspace = true, optional = true }
 

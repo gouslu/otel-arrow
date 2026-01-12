@@ -9,7 +9,8 @@ use azure_identity::{
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
+use tokio::time::{Instant, Duration};
+use serde::Deserialize;
 
 use crate::experimental::azure_monitor_exporter::config::{AuthConfig, AuthMethod};
 
@@ -24,8 +25,124 @@ pub struct Auth {
     pub token_valid_until: Instant,
 }
 
-// TODO: Remove print_stdout after logging is set up
-#[allow(clippy::print_stdout)]
+/// Direct IMDS implementation for managed identity
+#[derive(Debug, Clone)]
+struct ImdsCredential {
+    client_id: Option<String>,
+    http_client: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+struct ImdsTokenResponse {
+    access_token: String,
+    expires_on: String,  // Unix timestamp as string
+}
+
+impl ImdsCredential {
+    fn new(client_id: Option<String>) -> Result<Self, String> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+            
+        Ok(Self {
+            client_id,
+            http_client,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for ImdsCredential {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        _options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<AccessToken> {
+        const IMDS_ENDPOINT: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
+        const API_VERSION: &str = "2018-02-01";
+        
+        // Convert scopes to resource (AAD v1 style for IMDS)
+        let resource = if let Some(scope) = scopes.first() {
+            // Remove "/.default" suffix if present for IMDS compatibility
+            scope.trim_end_matches("/.default")
+        } else {
+            return Err(azure_core::error::Error::new(
+                azure_core::error::ErrorKind::Credential,
+                "No scope provided",
+            ));
+        };
+        
+        let mut query_params = vec![
+            ("api-version", API_VERSION),
+            ("resource", resource),
+        ];
+        
+        // Add client_id for user-assigned identity
+        let client_id_string;
+        if let Some(id) = &self.client_id {
+            client_id_string = id.clone();
+            query_params.push(("client_id", &client_id_string));
+        }
+        
+        // IMDS requires this header
+        let response = self.http_client
+            .get(IMDS_ENDPOINT)
+            .header("Metadata", "true")
+            .query(&query_params)  // Add this line to set query parameters
+            .send()
+            .await
+            .map_err(|e| {
+                azure_core::error::Error::new(
+                    azure_core::error::ErrorKind::Credential,
+                    format!("IMDS request failed: {e}"),
+                )
+            })?;
+            
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(azure_core::error::Error::new(
+                azure_core::error::ErrorKind::Credential,
+                format!("IMDS returned {}: {}", status, body),
+            ));
+        }
+        
+        let token_response: ImdsTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| {
+                azure_core::error::Error::new(
+                    azure_core::error::ErrorKind::Credential,
+                    format!("Failed to parse IMDS response: {e}"),
+                )
+            })?;
+
+        // Parse Unix timestamp
+        let expires_on_unix: i64 = token_response.expires_on
+            .parse()
+            .map_err(|e| {
+                azure_core::error::Error::new(
+                    azure_core::error::ErrorKind::Credential,
+                    format!("Invalid expires_on timestamp: {e}"),
+                )
+            })?;
+            
+        let expires_on = OffsetDateTime::from_unix_timestamp(expires_on_unix)
+            .map_err(|e| {
+                azure_core::error::Error::new(
+                    azure_core::error::ErrorKind::Credential,
+                    format!("Invalid expires_on timestamp: {e}"),
+                )
+            })?;
+            
+        Ok(AccessToken {
+            token: token_response.access_token.into(),
+            expires_on,
+        })
+    }
+}
+
 impl Auth {
     pub fn new(auth_config: &AuthConfig) -> Result<Self, String> {
         let credential = Self::create_credential(auth_config)?;
@@ -90,6 +207,16 @@ impl Auth {
 
     fn create_credential(auth_config: &AuthConfig) -> Result<Arc<dyn TokenCredential>, String> {
         match auth_config.method {
+            AuthMethod::Imds => {
+                if let Some(client_id) = &auth_config.client_id {
+                    println!("Using IMDS with user-assigned identity (client_id: {client_id})");
+                } else {
+                    println!("Using IMDS with system-assigned identity");
+                }
+                
+                let credential = ImdsCredential::new(auth_config.client_id.clone())?;
+                Ok(Arc::new(credential) as Arc<dyn TokenCredential>)
+            }
             AuthMethod::ManagedIdentity => {
                 let mut options = ManagedIdentityCredentialOptions::default();
 

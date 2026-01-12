@@ -26,6 +26,10 @@ pub enum AuthMethod {
     #[default]
     ManagedIdentity,
 
+    /// Use Instance Metadata Service (IMDS) explicitly
+    #[serde(alias = "imds")]
+    Imds,
+
     /// Use developer tools (Azure CLI, Azure Developer CLI)
     #[serde(alias = "dev", alias = "developer", alias = "cli")]
     Development,
