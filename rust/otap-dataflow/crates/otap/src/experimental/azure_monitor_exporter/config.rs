@@ -107,6 +107,17 @@ impl Config {
             return Err("Invalid configuration: auth scope must be non-empty".to_string());
         }
 
+        // Validate client_id format if present
+        if let Some(client_id) = &self.auth.client_id {
+            if !Self::is_valid_guid(client_id) {
+                return Err(format!(
+                    "Invalid configuration: client_id '{}' is not a valid GUID. \
+                     Expected format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+                    client_id
+                ));
+            }
+        }
+
         // Validate API configuration
         if self.api.dcr_endpoint.is_empty() {
             return Err("Invalid configuration: dcr_endpoint must be non-empty".to_string());
@@ -119,6 +130,29 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Validate GUID format (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)
+    fn is_valid_guid(s: &str) -> bool {
+        // GUID regex: 8-4-4-4-12 hexadecimal digits
+        let parts: Vec<&str> = s.split('-').collect();
+
+        if parts.len() != 5 {
+            return false;
+        }
+
+        // Check each part has correct length and contains only hex digits
+        let expected_lengths = [8, 4, 4, 4, 12];
+        for (part, &expected_len) in parts.iter().zip(expected_lengths.iter()) {
+            if part.len() != expected_len {
+                return false;
+            }
+            if !part.chars().all(|c| c.is_ascii_hexdigit()) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -162,5 +196,89 @@ mod tests {
             config.validate().unwrap_err(),
             "Invalid configuration: dcr_endpoint must be non-empty"
         );
+    }
+
+    #[test]
+    fn test_valid_guid() {
+        assert!(Config::is_valid_guid("12345678-1234-1234-1234-123456789012"));
+        assert!(Config::is_valid_guid("00000000-0000-0000-0000-000000000000"));
+        assert!(Config::is_valid_guid("ABCDEF01-2345-6789-ABCD-EF0123456789"));
+        assert!(Config::is_valid_guid("abcdef01-2345-6789-abcd-ef0123456789"));
+    }
+
+    #[test]
+    fn test_invalid_guid() {
+        // Wrong format
+        assert!(!Config::is_valid_guid("12345678123412341234123456789012")); // No dashes
+        assert!(!Config::is_valid_guid("12345678-1234-1234-1234"));           // Too short
+        assert!(!Config::is_valid_guid("12345678-1234-1234-1234-123456789012-extra")); // Too long
+        assert!(!Config::is_valid_guid("1234567-1234-1234-1234-123456789012")); // Wrong segment length
+        assert!(!Config::is_valid_guid("12345678-123-1234-1234-123456789012")); // Wrong segment length
+
+        // Invalid characters
+        assert!(!Config::is_valid_guid("12345678-1234-1234-1234-12345678901G")); // G is not hex
+        assert!(!Config::is_valid_guid("ZZZZZZZZ-1234-1234-1234-123456789012")); // Z is not hex
+        assert!(!Config::is_valid_guid("not-a-guid"));
+        assert!(!Config::is_valid_guid(""));
+    }
+
+    #[test]
+    fn test_config_with_valid_client_id() {
+        let config = Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://example.com".to_string(),
+                stream_name: "mystream".to_string(),
+                dcr: "mydcr".to_string(),
+                schema: SchemaConfig::default(),
+            },
+            auth: AuthConfig {
+                scope: "https://monitor.azure.com/.default".to_string(),
+                client_id: Some("12345678-1234-1234-1234-123456789012".to_string()),
+                method: AuthMethod::ManagedIdentity,
+            },
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_with_invalid_client_id() {
+        let config = Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://example.com".to_string(),
+                stream_name: "mystream".to_string(),
+                dcr: "mydcr".to_string(),
+                schema: SchemaConfig::default(),
+            },
+            auth: AuthConfig {
+                scope: "https://monitor.azure.com/.default".to_string(),
+                client_id: Some("not-a-guid".to_string()),
+                method: AuthMethod::ManagedIdentity,
+            },
+        };
+
+        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("not a valid GUID"));
+    }
+
+    #[test]
+    fn test_config_with_no_client_id() {
+        // System-assigned identity (no client_id) should be valid
+        let config = Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://example.com".to_string(),
+                stream_name: "mystream".to_string(),
+                dcr: "mydcr".to_string(),
+                schema: SchemaConfig::default(),
+            },
+            auth: AuthConfig {
+                scope: "https://monitor.azure.com/.default".to_string(),
+                client_id: None,
+                method: AuthMethod::ManagedIdentity,
+            },
+        };
+
+        assert!(config.validate().is_ok());
     }
 }
