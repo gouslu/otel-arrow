@@ -15,6 +15,7 @@ use crate::{
     entity_context::{NodeTelemetryGuard, NodeTelemetryHandle, with_node_telemetry_handle},
     error::{Error, TypedError},
     exporter::ExporterWrapper,
+    extension::ExtensionWrapper,
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -42,6 +43,10 @@ use std::{collections::HashMap, sync::OnceLock};
 
 pub mod error;
 pub mod exporter;
+/// Extension trait and wrapper for service-locator style components.
+pub mod extension;
+/// Registry of instantiated extensions available to pipeline components.
+pub mod extensions;
 pub mod message;
 pub mod processor;
 pub mod receiver;
@@ -154,6 +159,29 @@ impl<PData> Clone for ExporterFactory<PData> {
 }
 
 impl<PData> NamedFactory for ExporterFactory<PData> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// A factory for creating extension
+pub struct ExtensionFactory {
+    /// The name of the extension.
+    pub name: &'static str,
+    /// A function that creates a new extension instance.
+    pub create: fn() -> Result<ExtensionWrapper, otap_df_config::error::Error>,
+}
+
+impl Clone for ExtensionFactory {
+    fn clone(&self) -> Self {
+        ExtensionFactory {
+            name: self.name,
+            create: self.create,
+        }
+    }
+}
+
+impl NamedFactory for ExtensionFactory {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -289,9 +317,11 @@ pub struct PipelineFactory<PData: 'static + Clone> {
     receiver_factory_map: OnceLock<HashMap<&'static str, ReceiverFactory<PData>>>,
     processor_factory_map: OnceLock<HashMap<&'static str, ProcessorFactory<PData>>>,
     exporter_factory_map: OnceLock<HashMap<&'static str, ExporterFactory<PData>>>,
+    extension_factory_map: OnceLock<HashMap<&'static str, ExtensionFactory>>,
     receiver_factories: &'static [ReceiverFactory<PData>],
     processor_factories: &'static [ProcessorFactory<PData>],
     exporter_factories: &'static [ExporterFactory<PData>],
+    extension_factories: &'static [ExtensionFactory],
 }
 
 impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
@@ -301,14 +331,17 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         receiver_factories: &'static [ReceiverFactory<PData>],
         processor_factories: &'static [ProcessorFactory<PData>],
         exporter_factories: &'static [ExporterFactory<PData>],
+        extension_factories: &'static [ExtensionFactory],
     ) -> Self {
         Self {
             receiver_factory_map: OnceLock::new(),
             processor_factory_map: OnceLock::new(),
             exporter_factory_map: OnceLock::new(),
+            extension_factory_map: OnceLock::new(),
             receiver_factories,
             processor_factories,
             exporter_factories,
+            extension_factories,
         }
     }
 
@@ -339,6 +372,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 .iter()
                 .map(|f| (f.name(), f.clone()))
                 .collect::<HashMap<&'static str, ExporterFactory<PData>>>()
+        })
+    }
+
+    /// Gets the extension factory map, initializing it if necessary.
+    pub fn get_extension_factory_map(&self) -> &HashMap<&'static str, ExtensionFactory> {
+        self.extension_factory_map.get_or_init(|| {
+            self.extension_factories
+                .iter()
+                .map(|f| (f.name, f.clone()))
+                .collect::<HashMap<&'static str, ExtensionFactory>>()
         })
     }
 
