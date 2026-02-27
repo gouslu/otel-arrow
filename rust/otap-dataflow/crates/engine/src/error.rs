@@ -323,6 +323,20 @@ pub enum Error {
         plugin_urn: NodeUrn,
     },
 
+    /// The specified extension already exists in the pipeline.
+    #[error("The extension `{extension}` already exists")]
+    ExtensionAlreadyExists {
+        /// The name of the extension that already exists.
+        extension: NodeId,
+    },
+
+    /// Unknown extension plugin.
+    #[error("Unknown extension plugin `{plugin_urn}`")]
+    UnknownExtension {
+        /// The name of the unknown extension plugin.
+        plugin_urn: NodeUrn,
+    },
+
     /// Unknown node.
     #[error("Unknown node `{node}`")]
     UnknownNode {
@@ -471,6 +485,8 @@ impl Error {
             Error::UnknownReceiver { .. } => "UnknownReceiver",
             Error::UnsupportedNodeKind { .. } => "UnsupportedNodeKind",
             Error::InvalidNodeWiring { .. } => "InvalidNodeWiring",
+            Error::ExtensionAlreadyExists { .. } => "ExtensionAlreadyExists",
+            Error::UnknownExtension { .. } => "UnknownExtension",
         }
         .to_owned()
     }

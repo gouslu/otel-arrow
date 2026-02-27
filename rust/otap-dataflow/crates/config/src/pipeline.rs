@@ -526,6 +526,8 @@ impl PipelineConfig {
                         !has_incoming || !has_outgoing
                     }
                     NodeKind::Exporter => !has_incoming,
+                    // Extensions never participate in data connections.
+                    NodeKind::Extension => false,
                 };
 
                 if should_remove {
