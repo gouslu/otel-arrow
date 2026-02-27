@@ -438,7 +438,7 @@ mod tests {
         let wrapper = ExtensionWrapper::new(
             extension,
             (),
-            ExtensionTraits::new(),
+            ExtensionTraits::for_service::<()>(),
             node_id,
             user_config,
             &config,

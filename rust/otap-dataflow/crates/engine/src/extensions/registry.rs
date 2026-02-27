@@ -3,58 +3,45 @@
 
 //! Extension registry for storing and retrieving extension trait implementations by name.
 //!
-//! This registry uses a caster-based approach where extensions store a single boxed
-//! instance and cast functions for each trait they implement. This avoids Arc/Rc
-//! and the associated Send+Sync requirements on trait objects.
+//! This registry uses a clone-and-box approach: each extension stores a single
+//! concrete instance, along with cast functions that clone the concrete type and
+//! return a `Box<dyn Trait>`. This is entirely safe — no raw pointer manipulation,
+//! no `unsafe impl Sync`, no fat-pointer transmutation.
+//!
+//! The concrete service type must implement `Clone`. Typically the clone is cheap
+//! because the service holds `Arc`-wrapped shared state internally (e.g.,
+//! `Arc<Mutex<TokenState>>`).
 //!
 //! # Example
 //!
 //! ```ignore
 //! // An extension registers its capabilities using the macro:
-//! let instance = AzureIdentityAuthExtension::new(...);
-//! let casters = extension_traits!(AzureIdentityAuthExtension => BearerTokenProvider);
+//! let service = MyAuthService::new(...);
+//! let traits = extension_traits!(MyAuthService => BearerTokenProvider);
 //!
 //! // Pass to ExtensionWrapper which builds the registry entry:
-//! ExtensionWrapper::new(instance, casters, node_id, config, ...);
+//! ExtensionWrapper::new(extension, service, traits, node_id, config, ...);
 //!
-//! // A consumer retrieves a capability by trait (returns a reference):
-//! let token_provider: &dyn BearerTokenProvider = registry
-//!     .get_trait::<dyn BearerTokenProvider>("azure_auth")?;
+//! // A consumer retrieves a boxed trait object:
+//! let provider: Box<dyn BearerTokenProvider> = registry
+//!     .get_extension::<dyn BearerTokenProvider>("azure_auth")?;
+//! provider.get_token().await?;
 //! ```
-
-// Allow unsafe code in this module for fat pointer transmutation.
-// The safety invariants are documented and upheld by the implementation.
-#![allow(unsafe_code)]
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
 
-/// A cast function: downcasts `&dyn Any` → `&ConcreteType` → `&dyn Trait`,
-/// then returns the fat pointer as `[usize; 2]` for type-erased storage.
-/// Returns None if the downcast fails.
-pub type CastFn = fn(&dyn Any) -> Option<[usize; 2]>;
-
-/// Reconstruct a `&dyn Trait` from a `[usize; 2]` fat pointer.
+/// A cast function that clones the concrete instance and returns it as a
+/// boxed trait object, double-boxed for type-erased storage.
 ///
-/// # Safety
-/// The caller must ensure `fat` was produced by `trait_ref_to_raw` with the
-/// same `Trait` type, and that the underlying data is still alive.
-#[inline]
-pub unsafe fn raw_to_trait_ref<'a, T: ?Sized + 'a>(fat: [usize; 2]) -> &'a T {
-    // SAFETY: The caller guarantees fat was produced by trait_ref_to_raw with the same T.
-    unsafe { std::mem::transmute_copy(&fat) }
-}
-
-/// Convert a `&dyn Trait` fat pointer into `[usize; 2]` for storage.
+/// The function:
+/// 1. Downcasts `&dyn Any` to `&ConcreteType`
+/// 2. Clones the concrete instance
+/// 3. Boxes it as `Box<dyn Trait>`
+/// 4. Wraps in another `Box<dyn Any + Send>` for type erasure
 ///
-/// # Safety
-/// Relies on the standard Rust fat-pointer layout: `[data_ptr, vtable_ptr]`.
-#[inline]
-pub unsafe fn trait_ref_to_raw<T: ?Sized>(r: &T) -> [usize; 2] {
-    // SAFETY: Fat pointer layout is stable for trait objects.
-    unsafe { std::mem::transmute_copy(&r) }
-}
+/// Returns `None` if the downcast fails.
+pub type CastFn = fn(&dyn Any) -> Option<Box<dyn Any + Send>>;
 
 /// Marker trait for TypeId lookup of trait types.
 /// Used to get a stable TypeId for `dyn Trait` types.
@@ -96,11 +83,19 @@ impl std::fmt::Display for ExtensionError {
 
 impl std::error::Error for ExtensionError {}
 
+/// A function that clones the concrete service instance and returns it
+/// as a type-erased `Box<dyn Any + Send>`.
+///
+/// This is captured at construction time (monomorphized for the concrete type)
+/// so that type-erased entries can be cloned without knowing the concrete type.
+pub type CloneFn = fn(&dyn Any) -> Box<dyn Any + Send>;
+
 /// Cast functions for an extension's trait implementations.
 ///
 /// This is the return type of the [`extension_traits!`] macro. It contains
-/// the mapping from trait TypeIds to cast functions that can convert
-/// `&dyn Any` to `&dyn Trait`.
+/// the mapping from trait TypeIds to cast functions that clone the concrete
+/// instance and return a `Box<dyn Trait>`, plus a clone function for the
+/// concrete instance itself.
 ///
 /// # Example
 ///
@@ -108,35 +103,50 @@ impl std::error::Error for ExtensionError {}
 /// use otap_df_engine::extension_traits;
 /// use otap_df_engine::extensions::BearerTokenProvider;
 ///
-/// struct MyAuthExtension { /* ... */ }
-/// impl BearerTokenProvider for MyAuthExtension { /* ... */ }
+/// #[derive(Clone)]
+/// struct MyAuthService { /* ... */ }
+/// impl BearerTokenProvider for MyAuthService { /* ... */ }
 ///
-/// let casters = extension_traits!(MyAuthExtension => BearerTokenProvider);
+/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
 /// ```
-#[derive(Default)]
 pub struct ExtensionTraits {
     casters: HashMap<TypeId, CastFn>,
+    /// Clones the concrete service instance (type-erased).
+    clone_fn: CloneFn,
 }
 
 impl ExtensionTraits {
-    /// Create a new empty casters collection.
+    /// Create from casters and a clone function (used by the macro).
     #[must_use]
-    pub fn new() -> Self {
+    pub fn from_parts(
+        casters: HashMap<TypeId, CastFn>,
+        clone_fn: CloneFn,
+    ) -> Self {
+        Self { casters, clone_fn }
+    }
+
+    /// Create empty casters for a service type that exposes no traits.
+    ///
+    /// Useful for extensions that participate in the pipeline lifecycle
+    /// but don't expose any capabilities to other components.
+    #[must_use]
+    pub fn for_service<T: Clone + Send + 'static>() -> Self {
+        fn do_clone<S: Clone + Send + 'static>(any: &dyn Any) -> Box<dyn Any + Send> {
+            let val = any
+                .downcast_ref::<S>()
+                .expect("TypeId mismatch in ExtensionTraits clone — this is a bug");
+            Box::new(val.clone())
+        }
         Self {
             casters: HashMap::new(),
+            clone_fn: do_clone::<T>,
         }
     }
 
-    /// Create from a raw HashMap (used by the macro).
+    /// Decompose into the caster map and clone function.
     #[must_use]
-    pub fn from_map(casters: HashMap<TypeId, CastFn>) -> Self {
-        Self { casters }
-    }
-
-    /// Returns the inner HashMap.
-    #[must_use]
-    pub fn into_inner(self) -> HashMap<TypeId, CastFn> {
-        self.casters
+    pub fn into_parts(self) -> (HashMap<TypeId, CastFn>, CloneFn) {
+        (self.casters, self.clone_fn)
     }
 
     /// Check if a trait is registered.
@@ -168,12 +178,12 @@ impl std::fmt::Debug for ExtensionTraits {
 
 /// Macro to generate cast functions for an extension's trait implementations.
 ///
-/// This macro generates a mapping from trait TypeIds to cast functions that
-/// can convert `&dyn Any` to `&dyn Trait`. No Arc/Rc cloning is involved.
+/// Each generated cast function clones the concrete service instance and boxes
+/// it as the trait object. The concrete type **must** implement `Clone`.
 ///
 /// # Arguments
 ///
-/// * First: The concrete type name (needed for downcast)
+/// * First: The concrete type name (must implement `Clone`)
 /// * After `=>`: Comma-separated list of trait names this type implements
 ///
 /// Returns an [`ExtensionTraits`] that can be passed to `ExtensionWrapper::new()`.
@@ -181,9 +191,9 @@ impl std::fmt::Debug for ExtensionTraits {
 /// # Type Safety
 ///
 /// Only traits that implement [`crate::extensions::ExtensionTrait`] can be used
-/// with this macro. This is enforced at compile time - attempting to use an
+/// with this macro. This is enforced at compile time — attempting to use an
 /// arbitrary trait will result in a compilation error. The macro also verifies
-/// that the concrete type implements each specified trait.
+/// that the concrete type implements `Clone` and each specified trait.
 ///
 /// # Example
 ///
@@ -191,13 +201,12 @@ impl std::fmt::Debug for ExtensionTraits {
 /// use otap_df_engine::extension_traits;
 /// use otap_df_engine::extensions::BearerTokenProvider;
 ///
-/// struct MyAuthExtension { /* ... */ }
-/// impl BearerTokenProvider for MyAuthExtension { /* ... */ }
+/// #[derive(Clone)]
+/// struct MyAuthService { /* ... */ }
+/// impl BearerTokenProvider for MyAuthService { /* ... */ }
 ///
-/// let instance = MyAuthExtension { /* ... */ };
-/// let traits = extension_traits!(MyAuthExtension => BearerTokenProvider);
-///
-/// ExtensionWrapper::new(instance, traits, node_id, user_config, config);
+/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
+/// ExtensionWrapper::new(extension, service, traits, node_id, user_config, config);
 /// ```
 #[macro_export]
 macro_rules! extension_traits {
@@ -210,19 +219,24 @@ macro_rules! extension_traits {
         $(
             {
                 // Compile-time check: ensure the trait is a valid ExtensionTrait.
-                // This prevents using arbitrary traits with this macro.
                 const _: fn() = || {
                     fn assert_extension_trait<T: ?Sized + $crate::extensions::ExtensionTrait>() {}
                     assert_extension_trait::<dyn $trait>();
                 };
 
-                // Inner fn is monomorphic — $concrete_ty is substituted by the macro,
-                // so there are no captures and this coerces to a fn pointer.
-                fn __cast(any: &dyn std::any::Any) -> Option<[usize; 2]> {
+                // Compile-time check: ensure the concrete type is Clone.
+                const _: fn() = || {
+                    fn assert_clone<T: Clone>() {}
+                    assert_clone::<$concrete_ty>();
+                };
+
+                // Cast function: clone the concrete instance, box as trait, double-box
+                // for type erasure. All safe — no raw pointers, no transmute.
+                fn __cast(any: &dyn std::any::Any) -> Option<Box<dyn std::any::Any + Send>> {
                     let concrete = any.downcast_ref::<$concrete_ty>()?;
-                    let trait_ref: &dyn $trait = concrete;
-                    // SAFETY: We're converting a valid trait reference to its raw representation
-                    Some(unsafe { $crate::extensions::registry::trait_ref_to_raw(trait_ref) })
+                    let cloned: $concrete_ty = concrete.clone();
+                    let trait_obj: Box<dyn $trait> = Box::new(cloned);
+                    Some(Box::new(trait_obj))
                 }
                 let _ = casters.insert(
                     std::any::TypeId::of::<dyn $crate::extensions::registry::TraitId<dyn $trait>>(),
@@ -230,28 +244,52 @@ macro_rules! extension_traits {
                 );
             }
         )*
-        $crate::extensions::registry::ExtensionTraits::from_map(casters)
+        // Clone function for the concrete instance (type-erased).
+        fn __clone_instance(any: &dyn std::any::Any) -> Box<dyn std::any::Any + Send> {
+            let concrete = any
+                .downcast_ref::<$concrete_ty>()
+                .expect("TypeId mismatch in ExtensionEntry clone — this is a bug");
+            Box::new(concrete.clone())
+        }
+        $crate::extensions::registry::ExtensionTraits::from_parts(
+            casters,
+            __clone_instance as $crate::extensions::registry::CloneFn,
+        )
     }};
 }
 
-/// Internal storage for an extension instance and its casters.
+/// Internal storage for an extension instance and its cast functions.
 ///
 /// This is used internally by the registry to store extensions.
-/// Users should not create this directly - use [`extension_traits!`] macro
+/// Users should not create this directly — use the [`extension_traits!`] macro
 /// with `ExtensionWrapper::new()`.
 pub struct ExtensionEntry {
     /// The single concrete instance, type-erased.
     instance: Box<dyn Any + Send>,
     /// One cast function per registered trait.
     casters: HashMap<TypeId, CastFn>,
+    /// Clones the concrete instance inside the box.
+    clone_fn: CloneFn,
+}
+
+impl Clone for ExtensionEntry {
+    fn clone(&self) -> Self {
+        Self {
+            instance: (self.clone_fn)(self.instance.as_ref()),
+            casters: self.casters.clone(),
+            clone_fn: self.clone_fn,
+        }
+    }
 }
 
 impl ExtensionEntry {
     /// Create a new entry from an instance and casters.
     pub fn new<T: Send + 'static>(instance: T, casters: ExtensionTraits) -> Self {
+        let (casters, clone_fn) = casters.into_parts();
         Self {
             instance: Box::new(instance),
-            casters: casters.into_inner(),
+            casters,
+            clone_fn,
         }
     }
 
@@ -260,20 +298,24 @@ impl ExtensionEntry {
     /// This is used during pipeline build when the service has been
     /// type-erased by `ExtensionWrapper`.
     pub fn from_boxed(instance: Box<dyn Any + Send>, casters: ExtensionTraits) -> Self {
+        let (casters, clone_fn) = casters.into_parts();
         Self {
             instance,
-            casters: casters.into_inner(),
+            casters,
+            clone_fn,
         }
     }
 
-    /// Get a trait reference from the entry.
-    #[must_use]
-    pub fn get<T: ?Sized + 'static>(&self) -> Option<&T> {
+    /// Get a boxed trait object from the entry.
+    ///
+    /// Clones the concrete instance and returns it as `Box<dyn Trait>`.
+    pub fn get<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         let cast = self.casters.get(&TypeId::of::<dyn TraitId<T>>())?;
-        let fat = cast(self.instance.as_ref())?;
-        // SAFETY: `fat` was produced by `trait_ref_to_raw::<T>` from a valid
-        // `&T` derived from the boxed instance. The box is alive for `&self`.
-        Some(unsafe { raw_to_trait_ref(fat) })
+        let boxed_any: Box<dyn Any + Send> = cast(self.instance.as_ref())?;
+        // The cast function produced Box<Box<dyn T>> erased as Box<dyn Any + Send>.
+        // Downcast to Box<Box<T>> then unwrap the outer Box.
+        let boxed_trait: Box<Box<T>> = boxed_any.downcast().ok()?;
+        Some(*boxed_trait)
     }
 
     /// Check if the entry contains a trait implementation.
@@ -295,15 +337,6 @@ impl ExtensionEntry {
     }
 }
 
-// ExtensionEntry is Send because:
-// - instance: Box<dyn Any + Send> is Send
-// - casters: HashMap<TypeId, CastFn> - TypeId is Send+Sync, fn pointers are Send+Sync
-//
-// ExtensionEntry is Sync because:
-// - The entry is immutable after construction
-// - get() only returns shared references
-unsafe impl Sync for ExtensionEntry {}
-
 impl std::fmt::Debug for ExtensionEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionEntry")
@@ -314,15 +347,18 @@ impl std::fmt::Debug for ExtensionEntry {
 
 /// Registry for extension trait implementations.
 ///
-/// Extensions register themselves here during creation so other components
-/// can look them up by name and retrieve trait references.
+/// Extensions register themselves here during pipeline build so other components
+/// can look them up by name and retrieve boxed trait objects.
 ///
-/// The registry wraps entries in an `Arc` so it can be cheaply cloned
-/// (e.g., when cloning effect handlers). Callers receive borrowed
-/// `&dyn Trait` references tied to the registry's lifetime.
+/// The registry is `Clone + Send` — each pipeline component receives its own
+/// clone at startup. `Sync` is intentionally **not** implemented, consistent
+/// with the shared-nothing, single-threaded `LocalSet` architecture.
+///
+/// Each `get_extension` call clones the concrete service instance (typically
+/// cheap since services hold `Arc` state) and returns an owned `Box<dyn Trait>`.
 #[derive(Default, Clone)]
 pub struct ExtensionRegistry {
-    extensions: Arc<HashMap<String, ExtensionEntry>>,
+    extensions: HashMap<String, ExtensionEntry>,
 }
 
 impl ExtensionRegistry {
@@ -330,21 +366,20 @@ impl ExtensionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            extensions: Arc::new(HashMap::new()),
+            extensions: HashMap::new(),
         }
     }
 
     /// Create a registry from a map of extension entries.
     #[must_use]
     pub fn from_map(extensions: HashMap<String, ExtensionEntry>) -> Self {
-        Self {
-            extensions: Arc::new(extensions),
-        }
+        Self { extensions }
     }
 
-    /// Get a trait reference by extension name.
+    /// Get a boxed trait object by extension name.
     ///
-    /// Returns a borrowed `&dyn Trait` tied to the registry's lifetime.
+    /// Clones the concrete service instance and returns it as `Box<dyn Trait>`.
+    /// The clone is typically cheap since services hold `Arc`-wrapped shared state.
     ///
     /// # Type Parameters
     ///
@@ -358,10 +393,14 @@ impl ExtensionRegistry {
     /// # Example
     ///
     /// ```ignore
-    /// let token_provider: &dyn BearerTokenProvider = registry
-    ///     .get_trait::<dyn BearerTokenProvider>("azure_auth")?;
+    /// let provider: Box<dyn BearerTokenProvider> = registry
+    ///     .get_extension::<dyn BearerTokenProvider>("azure_auth")?;
+    /// provider.get_token().await?;
     /// ```
-    pub fn get_trait<T: ?Sized + 'static>(&self, name: &str) -> Result<&T, ExtensionError> {
+    pub fn get_extension<T: ?Sized + 'static>(
+        &self,
+        name: &str,
+    ) -> Result<Box<T>, ExtensionError> {
         let entry = self
             .extensions
             .get(name)
@@ -418,9 +457,9 @@ impl std::fmt::Debug for ExtensionRegistry {
 /// ```ignore
 /// let mut builder = ExtensionRegistryBuilder::new();
 ///
-/// let auth = AzureIdentityAuthExtension::new(...);
-/// let casters = extension_traits!(AzureIdentityAuthExtension => BearerTokenProvider);
-/// builder.register("azure_auth", auth, casters);
+/// let service = MyAuthService::new(...);
+/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
+/// builder.register("azure_auth", service, traits);
 ///
 /// let registry = builder.build();
 /// ```
@@ -488,6 +527,7 @@ mod tests {
     use crate::extensions::BearerTokenProvider;
     use tokio::sync::watch;
 
+    #[derive(Clone)]
     struct TestTokenProvider {
         token: String,
     }
@@ -523,12 +563,12 @@ mod tests {
         assert_eq!(entry.len(), 1);
         assert!(entry.contains::<dyn BearerTokenProvider>());
 
-        let token_provider: &dyn BearerTokenProvider = entry.get().unwrap();
-        drop(token_provider);
+        let provider: Box<dyn BearerTokenProvider> = entry.get().unwrap();
+        drop(provider);
     }
 
     #[test]
-    fn test_registry_get_trait() {
+    fn test_registry_get_extension() {
         let instance = TestTokenProvider {
             token: "test_token".to_string(),
         };
@@ -540,10 +580,12 @@ mod tests {
 
         let registry = ExtensionRegistry::from_map(map);
 
-        let result: Result<&dyn BearerTokenProvider, _> = registry.get_trait("test_ext");
+        let result: Result<Box<dyn BearerTokenProvider>, _> =
+            registry.get_extension("test_ext");
         assert!(result.is_ok());
 
-        let not_found: Result<&dyn BearerTokenProvider, _> = registry.get_trait("missing");
+        let not_found: Result<Box<dyn BearerTokenProvider>, _> =
+            registry.get_extension("missing");
         assert!(matches!(not_found, Err(ExtensionError::NotFound { .. })));
     }
 
@@ -562,7 +604,26 @@ mod tests {
         let registry = builder.build();
         assert_eq!(registry.len(), 1);
         assert!(registry.contains("my_extension"));
-        let _: &dyn BearerTokenProvider = registry.get_trait("my_extension").unwrap();
+        let _: Box<dyn BearerTokenProvider> =
+            registry.get_extension("my_extension").unwrap();
+    }
+
+    #[test]
+    fn test_get_extension_returns_independent_clones() {
+        let instance = TestTokenProvider {
+            token: "clone_test".to_string(),
+        };
+        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
+        let entry = ExtensionEntry::new(instance, casters);
+
+        let registry =
+            ExtensionRegistry::from_map(HashMap::from([("ext".to_string(), entry)]));
+
+        // Each call returns an independent clone
+        let a: Box<dyn BearerTokenProvider> = registry.get_extension("ext").unwrap();
+        let b: Box<dyn BearerTokenProvider> = registry.get_extension("ext").unwrap();
+        drop(a);
+        drop(b);
     }
 
     #[test]
@@ -596,5 +657,22 @@ mod tests {
         let debug_str = format!("{:?}", registry);
         assert!(debug_str.contains("ExtensionRegistry"));
         assert!(debug_str.contains("test_ext"));
+    }
+
+    #[tokio::test]
+    async fn test_get_extension_actually_works() {
+        let instance = TestTokenProvider {
+            token: "real_token".to_string(),
+        };
+        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        builder.register("auth".to_string(), instance, casters);
+        let registry = builder.build();
+
+        let provider: Box<dyn BearerTokenProvider> =
+            registry.get_extension("auth").unwrap();
+        let token = provider.get_token().await.unwrap();
+        assert_eq!(token.token.secret(), "real_token");
     }
 }

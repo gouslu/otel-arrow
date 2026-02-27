@@ -19,8 +19,8 @@ pub mod registry;
 
 // Re-export commonly used types
 pub use registry::{
-    CastFn, ExtensionError, ExtensionRegistry, ExtensionRegistryBuilder, ExtensionTraits, TraitId,
-    raw_to_trait_ref, trait_ref_to_raw,
+    CastFn, CloneFn, ExtensionError, ExtensionRegistry, ExtensionRegistryBuilder, ExtensionTraits,
+    TraitId,
 };
 
 /// Extension traits that components can implement to expose capabilities.
