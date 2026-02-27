@@ -57,9 +57,14 @@ pub trait ExtensionTrait: private::Sealed + Send {}
 impl private::Sealed for dyn BearerTokenProvider {}
 impl ExtensionTrait for dyn BearerTokenProvider {}
 
+impl private::Sealed for dyn BearerTokenProviderSync {}
+impl ExtensionTrait for dyn BearerTokenProviderSync {}
+
 /// Error type for extension operations.
 ///
 /// Thread-safe error type compatible with any `thiserror`-derived error.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub use bearer_token_provider::{BearerToken, BearerTokenProvider, Secret};
+pub use bearer_token_provider::{
+    BearerToken, BearerTokenProvider, BearerTokenProviderSync, Secret,
+};

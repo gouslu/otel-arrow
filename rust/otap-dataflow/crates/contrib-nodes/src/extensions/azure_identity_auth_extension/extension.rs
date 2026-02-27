@@ -9,20 +9,15 @@
 //!
 //! # Architecture
 //!
-//! The extension is split into two cooperating parts:
+//! `AzureIdentityAuthExtension` is a single `Clone` struct that serves both
+//! as the pipeline extension (implementing [`Extension`] and driving the token
+//! refresh loop) and as the registry service (implementing [`BearerTokenProvider`]
+//! and [`BearerTokenProviderSync`]). Consumers retrieve it from the extension
+//! registry via `registry.get_extension::<dyn BearerTokenProvider>("name")`.
 //!
-//! - **`AzureIdentityAuthExtension`** — implements [`Extension`] and drives
-//!   the token refresh loop. It runs as a pipeline extension, periodically
-//!   acquiring new tokens and broadcasting them via `watch::Sender`.
-//!
-//! - **`AzureIdentityAuthService`** — implements [`BearerTokenProvider`] and
-//!   is registered in the [`ExtensionRegistry`]. Consumers (e.g., exporters)
-//!   retrieve it via `registry.get_extension::<dyn BearerTokenProvider>("name")`
-//!   and subscribe to token refreshes.
-//!
-//! Both share state through `Arc`:
+//! State is shared through `Arc`:
 //! - `Arc<dyn TokenCredential>` — the Azure credential provider
-//! - `watch::Sender<Option<BearerToken>>` / `watch::Receiver` — token broadcast
+//! - `Arc<watch::Sender<Option<BearerToken>>>` — token broadcast channel
 
 use async_trait::async_trait;
 use azure_core::credentials::{AccessToken, TokenCredential};
@@ -30,7 +25,7 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extensions::{BearerToken, BearerTokenProvider};
+use otap_df_engine::extensions::{BearerToken, BearerTokenProvider, BearerTokenProviderSync};
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -61,23 +56,77 @@ const MIN_TOKEN_REFRESH_INTERVAL_SECS: u64 = 10;
 /// Retry interval when token refresh fails (in seconds).
 const TOKEN_REFRESH_RETRY_SECS: u64 = 10;
 
-/// The service registered in the extension registry.
+/// Azure Identity Auth Extension.
+///
+/// This is a single `Clone` struct that serves as both the pipeline extension
+/// (implementing [`Extension`] to drive the token refresh loop) and the registry
+/// service (implementing [`BearerTokenProvider`] and [`BearerTokenProviderSync`]).
 ///
 /// Consumers retrieve this via `registry.get_extension::<dyn BearerTokenProvider>("name")`.
-/// It provides token acquisition and refresh subscription. `Clone` is required
-/// by the extension registry's clone-and-box pattern.
+/// `Clone` is required by the extension registry's clone-and-box pattern.
 #[derive(Clone)]
-pub struct AzureIdentityAuthService {
-    /// The Azure credential provider (shared with the extension).
+pub struct AzureIdentityAuthExtension {
+    /// The Azure credential provider.
     credential: Arc<dyn TokenCredential>,
     /// The OAuth scope for token acquisition.
     scope: String,
-    /// Sender for subscribing to token refresh events.
-    /// The service only subscribes (via `sender.subscribe()`); the extension drives sends.
+    /// The authentication method being used.
+    method: AuthMethod,
+    /// Sender for broadcasting / subscribing to token refresh events.
     token_sender: Arc<watch::Sender<Option<BearerToken>>>,
 }
 
-impl AzureIdentityAuthService {
+impl AzureIdentityAuthExtension {
+    /// Creates a new Azure Identity Auth Extension.
+    pub fn new(config: Config) -> Result<Self, Error> {
+        let credential = Self::create_credential(&config)?;
+        let (token_sender, _) = watch::channel(None);
+        let token_sender = Arc::new(token_sender);
+
+        Ok(Self {
+            credential,
+            scope: config.scope,
+            method: config.method,
+            token_sender,
+        })
+    }
+
+    /// Creates a credential provider based on the configuration.
+    fn create_credential(config: &Config) -> Result<Arc<dyn TokenCredential>, Error> {
+        match config.method {
+            AuthMethod::ManagedIdentity => {
+                let mut options = ManagedIdentityCredentialOptions::default();
+
+                if let Some(client_id) = &config.client_id {
+                    otel_info!(
+                        "azure_identity_auth.credential_type",
+                        method = "user_assigned_managed_identity",
+                        client_id = %client_id
+                    );
+                    options.user_assigned_id = Some(UserAssignedId::ClientId(client_id.clone()));
+                } else {
+                    otel_info!(
+                        "azure_identity_auth.credential_type",
+                        method = "system_assigned_managed_identity"
+                    );
+                }
+
+                Ok(ManagedIdentityCredential::new(Some(options))
+                    .map_err(|e| Error::create_credential(AuthMethod::ManagedIdentity, e))?)
+            }
+            AuthMethod::Development => {
+                otel_info!(
+                    "azure_identity_auth.credential_type",
+                    method = "developer_tools"
+                );
+                Ok(
+                    DeveloperToolsCredential::new(Some(DeveloperToolsCredentialOptions::default()))
+                        .map_err(|e| Error::create_credential(AuthMethod::Development, e))?,
+                )
+            }
+        }
+    }
+
     /// Gets a token directly from the credential provider.
     async fn get_token_internal(&self) -> Result<AccessToken, Error> {
         self.credential
@@ -135,160 +184,6 @@ impl AzureIdentityAuthService {
             tokio::time::sleep(delay).await;
         }
     }
-}
-
-#[async_trait]
-impl BearerTokenProvider for AzureIdentityAuthService {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
-        let access_token = self.get_token_with_retry().await?;
-
-        Ok(BearerToken::new(
-            access_token.token.secret().to_string(),
-            access_token.expires_on.unix_timestamp(),
-        ))
-    }
-
-    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
-    }
-}
-
-/// Azure Identity Auth Extension.
-///
-/// This extension manages the token lifecycle — it runs a loop that proactively
-/// refreshes tokens before they expire and broadcasts them to subscribers.
-///
-/// The companion [`AzureIdentityAuthService`] is registered in the extension
-/// registry and provides the [`BearerTokenProvider`] trait to consumers.
-pub struct AzureIdentityAuthExtension {
-    /// The Azure credential provider (shared with the service).
-    credential: Arc<dyn TokenCredential>,
-    /// The OAuth scope for token acquisition.
-    scope: String,
-    /// The authentication method being used.
-    method: AuthMethod,
-    /// Sender for broadcasting token refresh events to subscribers.
-    token_sender: Arc<watch::Sender<Option<BearerToken>>>,
-}
-
-impl AzureIdentityAuthExtension {
-    /// Creates a new Azure Identity Auth Extension and its companion service.
-    ///
-    /// Returns the extension (for lifecycle management) and the service
-    /// (for registration in the extension registry).
-    pub fn new(config: Config) -> Result<(Self, AzureIdentityAuthService), Error> {
-        let credential = Self::create_credential(&config)?;
-        let (token_sender, _) = watch::channel(None);
-        let token_sender = Arc::new(token_sender);
-
-        let service = AzureIdentityAuthService {
-            credential: credential.clone(),
-            scope: config.scope.clone(),
-            token_sender: token_sender.clone(),
-        };
-
-        let extension = Self {
-            credential,
-            scope: config.scope,
-            method: config.method,
-            token_sender,
-        };
-
-        Ok((extension, service))
-    }
-
-    /// Creates a credential provider based on the configuration.
-    fn create_credential(config: &Config) -> Result<Arc<dyn TokenCredential>, Error> {
-        match config.method {
-            AuthMethod::ManagedIdentity => {
-                let mut options = ManagedIdentityCredentialOptions::default();
-
-                if let Some(client_id) = &config.client_id {
-                    otel_info!(
-                        "azure_identity_auth.credential_type",
-                        method = "user_assigned_managed_identity",
-                        client_id = %client_id
-                    );
-                    options.user_assigned_id = Some(UserAssignedId::ClientId(client_id.clone()));
-                } else {
-                    otel_info!(
-                        "azure_identity_auth.credential_type",
-                        method = "system_assigned_managed_identity"
-                    );
-                }
-
-                Ok(ManagedIdentityCredential::new(Some(options))
-                    .map_err(|e| Error::create_credential(AuthMethod::ManagedIdentity, e))?)
-            }
-            AuthMethod::Development => {
-                otel_info!(
-                    "azure_identity_auth.credential_type",
-                    method = "developer_tools"
-                );
-                Ok(
-                    DeveloperToolsCredential::new(Some(DeveloperToolsCredentialOptions::default()))
-                        .map_err(|e| Error::create_credential(AuthMethod::Development, e))?,
-                )
-            }
-        }
-    }
-
-    /// Gets a token directly from the credential provider (for the refresh loop).
-    async fn get_token_internal(&self) -> Result<AccessToken, Error> {
-        self.credential
-            .get_token(
-                &[&self.scope],
-                Some(azure_core::credentials::TokenRequestOptions::default()),
-            )
-            .await
-            .map_err(Error::token_acquisition)
-    }
-
-    /// Gets a token with retry logic and exponential backoff.
-    async fn get_token_with_retry(&self) -> Result<AccessToken, Error> {
-        let mut attempt = 0_i32;
-        loop {
-            attempt += 1;
-
-            match self.get_token_internal().await {
-                Ok(token) => {
-                    otel_info!(
-                        "azure_identity_auth.token_refresh_succeeded",
-                        expires_on = %token.expires_on
-                    );
-                    return Ok(token);
-                }
-                Err(e) => {
-                    otel_warn!(
-                        "azure_identity_auth.token_refresh_failed",
-                        attempt = attempt,
-                        error = %e
-                    );
-                }
-            }
-
-            // Calculate exponential backoff: 5s, 10s, 20s, 30s (capped)
-            let base_delay_secs = MIN_RETRY_DELAY_SECS * 2.0_f64.powi(attempt - 1);
-            let capped_delay_secs = base_delay_secs.min(MAX_RETRY_DELAY_SECS);
-
-            let jitter_range = capped_delay_secs * MAX_RETRY_JITTER_RATIO;
-            let jitter = if jitter_range > 0.0 {
-                let random_factor = rand::random::<f64>() * 2.0 - 1.0;
-                random_factor * jitter_range
-            } else {
-                0.0
-            };
-
-            let delay_secs = (capped_delay_secs + jitter).max(1.0);
-            let delay = tokio::time::Duration::from_secs_f64(delay_secs);
-
-            otel_warn!(
-                "azure_identity_auth.retry_scheduled",
-                delay_secs = %delay_secs
-            );
-            tokio::time::sleep(delay).await;
-        }
-    }
 
     /// Calculates when the next token refresh should occur.
     fn get_next_token_refresh(token: &BearerToken) -> tokio::time::Instant {
@@ -323,6 +218,38 @@ impl AzureIdentityAuthExtension {
     #[must_use]
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+}
+
+#[async_trait]
+impl BearerTokenProvider for AzureIdentityAuthExtension {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+        let access_token = self.get_token_with_retry().await?;
+
+        Ok(BearerToken::new(
+            access_token.token.secret().to_string(),
+            access_token.expires_on.unix_timestamp(),
+        ))
+    }
+
+    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+        self.token_sender.subscribe()
+    }
+}
+
+#[async_trait]
+impl BearerTokenProviderSync for AzureIdentityAuthExtension {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+        let access_token = self.get_token_with_retry().await?;
+
+        Ok(BearerToken::new(
+            access_token.token.secret().to_string(),
+            access_token.expires_on.unix_timestamp(),
+        ))
+    }
+
+    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+        self.token_sender.subscribe()
     }
 }
 
@@ -464,15 +391,16 @@ mod tests {
         }
     }
 
-    /// Creates a test service from a mock credential.
-    fn make_test_service(
+    /// Creates a test extension from a mock credential.
+    fn make_test_extension(
         credential: Arc<dyn TokenCredential>,
         scope: &str,
-    ) -> AzureIdentityAuthService {
+    ) -> AzureIdentityAuthExtension {
         let (token_sender, _) = watch::channel(None);
-        AzureIdentityAuthService {
+        AzureIdentityAuthExtension {
             credential,
             scope: scope.to_string(),
+            method: AuthMethod::ManagedIdentity,
             token_sender: Arc::new(token_sender),
         }
     }
@@ -489,7 +417,7 @@ mod tests {
 
         let result = AzureIdentityAuthExtension::new(config);
         assert!(result.is_ok());
-        let (ext, _service) = result.unwrap();
+        let ext = result.unwrap();
         assert_eq!(ext.scope(), "https://test.scope");
     }
 
@@ -516,7 +444,7 @@ mod tests {
         // May fail if Azure CLI not installed — both outcomes are valid
         let result = AzureIdentityAuthExtension::new(config);
         match result {
-            Ok((ext, _)) => assert_eq!(ext.scope(), "https://test.scope"),
+            Ok(ext) => assert_eq!(ext.scope(), "https://test.scope"),
             Err(Error::Auth {
                 kind: super::super::error::AuthErrorKind::CreateCredential { method },
                 ..
@@ -538,7 +466,7 @@ mod tests {
             call_count.clone(),
         );
 
-        let service = make_test_service(credential, "scope");
+        let service = make_test_extension(credential, "scope");
 
         let token = service.get_token_internal().await.unwrap();
         assert_eq!(token.token.secret(), "test_token");
@@ -554,7 +482,7 @@ mod tests {
             call_count.clone(),
         );
 
-        let service = make_test_service(credential, "scope");
+        let service = make_test_extension(credential, "scope");
 
         let _ = service.get_token_internal().await.unwrap();
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -577,7 +505,7 @@ mod tests {
             call_count.clone(),
         );
 
-        let service = make_test_service(credential, "scope");
+        let service = make_test_extension(credential, "scope");
 
         // Use the BearerTokenProvider trait method
         let token: BearerToken = BearerTokenProvider::get_token(&service).await.unwrap();
@@ -596,14 +524,15 @@ mod tests {
 
         let (token_sender, _) = watch::channel(None);
         let token_sender = Arc::new(token_sender);
-        let service = AzureIdentityAuthService {
+        let service = AzureIdentityAuthExtension {
             credential,
             scope: "scope".to_string(),
+            method: AuthMethod::ManagedIdentity,
             token_sender: token_sender.clone(),
         };
 
         // Get a subscriber
-        let mut rx = service.subscribe_token_refresh();
+        let mut rx = BearerTokenProvider::subscribe_token_refresh(&service);
 
         // Initially should be None
         assert!(rx.borrow().is_none());
@@ -631,15 +560,16 @@ mod tests {
 
         let (token_sender, _) = watch::channel(None);
         let token_sender = Arc::new(token_sender);
-        let service = AzureIdentityAuthService {
+        let service = AzureIdentityAuthExtension {
             credential,
             scope: "scope".to_string(),
+            method: AuthMethod::ManagedIdentity,
             token_sender: token_sender.clone(),
         };
 
         // Create multiple subscribers
-        let mut rx1 = service.subscribe_token_refresh();
-        let mut rx2 = service.subscribe_token_refresh();
+        let mut rx1 = BearerTokenProvider::subscribe_token_refresh(&service);
+        let mut rx2 = BearerTokenProvider::subscribe_token_refresh(&service);
 
         // Broadcast a token
         let token = BearerToken::new("broadcast_token".to_string(), 99999);
@@ -728,5 +658,61 @@ mod tests {
         let tolerance = tokio::time::Duration::from_secs(2);
         assert!(next_refresh >= expected_approx - tolerance);
         assert!(next_refresh <= expected_approx + tolerance);
+    }
+
+    // ==================== BearerTokenProviderSync Trait Tests ====================
+
+    #[tokio::test]
+    async fn test_sync_provider_get_token() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let credential = make_mock_credential(
+            "sync_test_token",
+            azure_core::time::Duration::minutes(60),
+            call_count.clone(),
+        );
+
+        let service = make_test_extension(credential, "scope");
+
+        // Use the BearerTokenProviderSync trait method
+        let token: BearerToken = BearerTokenProviderSync::get_token(&service).await.unwrap();
+        assert_eq!(token.token.secret(), "sync_test_token");
+        assert!(token.expires_on > 0);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_sync_provider_subscribe_matches_async() {
+        let credential = make_mock_credential(
+            "test_token",
+            azure_core::time::Duration::minutes(60),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let (token_sender, _) = watch::channel(None);
+        let token_sender = Arc::new(token_sender);
+        let service = AzureIdentityAuthExtension {
+            credential,
+            scope: "scope".to_string(),
+            method: AuthMethod::ManagedIdentity,
+            token_sender: token_sender.clone(),
+        };
+
+        // Get subscriber from Sync trait
+        let rx_sync: watch::Receiver<Option<BearerToken>> =
+            BearerTokenProviderSync::subscribe_token_refresh(&service);
+
+        // Get subscriber from Async trait
+        let rx_async: watch::Receiver<Option<BearerToken>> =
+            BearerTokenProvider::subscribe_token_refresh(&service);
+
+        // Both should start as None
+        assert!(rx_sync.borrow().is_none());
+        assert!(rx_async.borrow().is_none());
+    }
+
+    #[test]
+    fn test_sync_provider_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AzureIdentityAuthExtension>();
     }
 }

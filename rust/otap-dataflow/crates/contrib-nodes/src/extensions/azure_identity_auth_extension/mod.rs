@@ -21,7 +21,7 @@
 //! ```yaml
 //! extensions:
 //!   azure_auth:
-//!     type: "urn:otel:azureidentityauth:extension"
+//!     type: "urn:microsoft:extension:azure_identity_auth"
 //!     config:
 //!       method: managed_identity
 //!       scope: "https://monitor.azure.com/.default"
@@ -41,6 +41,7 @@ use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
 use otap_df_engine::extensions::BearerTokenProvider;
+use otap_df_engine::extensions::BearerTokenProviderSync;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ExtensionFactory, extension_traits};
 use std::sync::Arc;
@@ -54,10 +55,10 @@ mod extension;
 
 pub use config::{AuthMethod, Config};
 pub use error::Error;
-pub use extension::{AzureIdentityAuthExtension, AzureIdentityAuthService};
+pub use extension::AzureIdentityAuthExtension;
 
 /// URN identifying the Azure Identity Auth Extension in configuration pipelines.
-pub const AZURE_IDENTITY_AUTH_EXTENSION_URN: &str = "urn:otel:azureidentityauth:extension";
+pub const AZURE_IDENTITY_AUTH_EXTENSION_URN: &str = "urn:microsoft:extension:azure_identity_auth";
 
 /// Register Azure Identity Auth Extension with the OTAP extension factory.
 ///
@@ -83,17 +84,17 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory<OtapPdata> = Extensio
                 error: e.to_string(),
             })?;
 
-        // Create the extension and its companion service
-        let (extension, service) = AzureIdentityAuthExtension::new(cfg).map_err(|e| {
+        // Create the extension
+        let extension = AzureIdentityAuthExtension::new(cfg).map_err(|e| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             }
         })?;
 
         Ok(ExtensionWrapper::new(
+            extension.clone(),
             extension,
-            service,
-            extension_traits!(AzureIdentityAuthService => BearerTokenProvider),
+            extension_traits!(AzureIdentityAuthExtension => BearerTokenProvider, BearerTokenProviderSync),
             node,
             node_config,
             extension_config,
@@ -110,7 +111,7 @@ mod tests {
     fn test_extension_urn() {
         assert_eq!(
             AZURE_IDENTITY_AUTH_EXTENSION_URN,
-            "urn:otel:azureidentityauth:extension"
+            "urn:microsoft:extension:azure_identity_auth"
         );
     }
 

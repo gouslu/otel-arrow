@@ -380,7 +380,7 @@ mod tests {
     use crate::control::NodeControlMsg;
     use crate::message::Message;
     use crate::testing::{CtrlMsgCounters, TestMsg, test_node};
-    use otap_df_config::node::{NodeKind, NodeUserConfig};
+    use otap_df_config::node::NodeUserConfig;
     use serde_json::Value;
 
     struct TestExtension {
