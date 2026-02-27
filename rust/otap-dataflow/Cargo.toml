@@ -219,6 +219,9 @@ experimental-tls = ["otap-df-otap/experimental-tls", "dep:rustls"]
 contrib-exporters = ["otap-df-contrib-nodes/contrib-exporters"]
 geneva-exporter = ["otap-df-contrib-nodes/geneva-exporter"]
 azure-monitor-exporter = ["otap-df-contrib-nodes/azure-monitor-exporter"]
+# Contrib extensions (opt-in) - now in contrib-nodes
+contrib-extensions = ["otap-df-contrib-nodes/contrib-extensions"]
+azure-identity-auth-extension = ["otap-df-contrib-nodes/azure-identity-auth-extension"]
 # Contrib processors (opt-in) - now in contrib-nodes
 contrib-processors = ["otap-df-contrib-nodes/contrib-processors"]
 condense-attributes-processor = ["otap-df-contrib-nodes/condense-attributes-processor"]
