@@ -694,9 +694,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             }
         }
         let extension_registry = registry_builder.build();
-        for ext in &mut extensions {
-            ext.set_extension_registry(extension_registry.clone());
-        }
 
         let edges = collect_hyper_edges_runtime_from_connections(&config, &build_state)?;
 
@@ -710,6 +707,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             processors,
             exporters,
             extensions,
+            extension_registry,
             nodes,
             telemetry_policy,
         );

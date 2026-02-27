@@ -19,7 +19,6 @@ use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
-use crate::extensions::ExtensionRegistry;
 use crate::extensions::registry::ExtensionTraits;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message;
@@ -137,48 +136,10 @@ impl<PData> EffectHandler<PData> {
         }
     }
 
-    /// Sets the extension registry for this effect handler.
-    pub fn set_extension_registry(&mut self, registry: ExtensionRegistry) {
-        self.core.set_extension_registry(registry);
-    }
-
     /// Returns the id of the extension associated with this handler.
     #[must_use]
     pub fn extension_id(&self) -> NodeId {
         self.core.node_id()
-    }
-
-    /// Returns a reference to the extension registry.
-    ///
-    /// Returns `None` if no extensions were configured in the pipeline.
-    #[must_use]
-    pub fn extension_registry(&self) -> Option<&ExtensionRegistry> {
-        self.core.extension_registry()
-    }
-
-    /// Retrieves an extension trait by name from the registry.
-    ///
-    /// This is a convenience method that combines registry lookup with
-    /// trait casting.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The trait type to retrieve (e.g., `dyn BearerTokenProvider`)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the registry is not available, or if the extension
-    /// is not found or doesn't implement the requested trait.
-    pub fn get_extension<T: ?Sized + 'static>(
-        &self,
-        name: &str,
-    ) -> Result<&T, crate::extensions::ExtensionError> {
-        self.core
-            .extension_registry()
-            .ok_or_else(|| crate::extensions::ExtensionError::NotFound {
-                name: name.to_string(),
-            })?
-            .get_trait::<T>(name)
     }
 
     /// Print an info message to stdout.
@@ -234,8 +195,6 @@ pub struct ExtensionWrapper<PData> {
     control_receiver: Option<LocalReceiver<NodeControlMsg<PData>>>,
     /// Telemetry guard for node lifecycle cleanup.
     telemetry: Option<NodeTelemetryGuard>,
-    /// Extension registry for accessing extension traits.
-    extension_registry: Option<ExtensionRegistry>,
 }
 
 #[async_trait(?Send)]
@@ -284,13 +243,7 @@ impl<PData> ExtensionWrapper<PData> {
             control_sender: LocalSender::mpsc(control_sender),
             control_receiver: Some(LocalReceiver::mpsc(control_receiver)),
             telemetry: None,
-            extension_registry: None,
         }
-    }
-
-    /// Sets the extension registry for this extension.
-    pub fn set_extension_registry(&mut self, registry: ExtensionRegistry) {
-        self.extension_registry = Some(registry);
     }
 
     /// Takes the extension traits from this wrapper, leaving `None` in its place.
@@ -355,14 +308,10 @@ impl<PData> ExtensionWrapper<PData> {
             node_id,
             extension,
             control_receiver,
-            extension_registry,
             ..
         } = self;
 
         let mut effect_handler = EffectHandler::new(node_id, metrics_reporter);
-        if let Some(registry) = extension_registry {
-            effect_handler.set_extension_registry(registry);
-        }
         effect_handler
             .core
             .set_pipeline_ctrl_msg_sender(pipeline_ctrl_msg_tx);

@@ -35,8 +35,6 @@ impl SourceTagging {
     }
 }
 
-use crate::extensions::ExtensionRegistry;
-
 /// Common implementation of all effect handlers.
 ///
 /// Note: This implementation is `Send`.
@@ -50,8 +48,6 @@ pub(crate) struct EffectHandlerCore<PData> {
     pub(crate) metrics_reporter: MetricsReporter,
     /// The outgoing message source tagging mode.
     pub(crate) source_tag: SourceTagging,
-    /// Extension registry for looking up shared extension services.
-    pub(crate) extension_registry: Option<ExtensionRegistry>,
 }
 
 impl<PData> EffectHandlerCore<PData> {
@@ -62,7 +58,6 @@ impl<PData> EffectHandlerCore<PData> {
             pipeline_ctrl_msg_sender: None,
             metrics_reporter,
             source_tag: SourceTagging::Disabled,
-            extension_registry: None,
         }
     }
 
@@ -89,29 +84,6 @@ impl<PData> EffectHandlerCore<PData> {
     #[must_use]
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id.clone()
-    }
-
-    /// Sets the extension registry for this effect handler.
-    pub(crate) fn set_extension_registry(&mut self, registry: ExtensionRegistry) {
-        self.extension_registry = Some(registry);
-    }
-
-    /// Returns a reference to the extension registry, if one has been set.
-    #[must_use]
-    pub(crate) fn extension_registry(&self) -> Option<&ExtensionRegistry> {
-        self.extension_registry.as_ref()
-    }
-
-    /// Gets a trait reference from a named extension.
-    ///
-    /// # Errors
-    ///
-    /// Returns `None` if no registry is set, the extension doesn't exist,
-    /// or the extension doesn't implement the requested trait.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn get_extension<T: ?Sized + 'static>(&self, name: &str) -> Option<&T> {
-        self.extension_registry.as_ref()?.get_trait::<T>(name).ok()
     }
 
     /// Print an info message to stdout.

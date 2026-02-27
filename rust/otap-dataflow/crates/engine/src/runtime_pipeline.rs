@@ -14,6 +14,7 @@ use crate::node::{Node, NodeDefs, NodeId, NodeType, NodeWithPDataReceiver, NodeW
 use crate::pipeline_ctrl::PipelineCtrlMsgManager;
 use crate::terminal_state::TerminalState;
 use crate::extension::ExtensionWrapper;
+use crate::extensions::ExtensionRegistry;
 use crate::{exporter::ExporterWrapper, processor::ProcessorWrapper, receiver::ReceiverWrapper};
 use otap_df_config::DeployedPipelineKey;
 use otap_df_config::pipeline::PipelineConfig;
@@ -39,6 +40,8 @@ pub struct RuntimePipeline<PData: Debug> {
     exporters: Vec<ExporterWrapper<PData>>,
     /// Extension runtime nodes.
     extensions: Vec<ExtensionWrapper<PData>>,
+    /// Extension registry for passing to receivers and exporters at start.
+    extension_registry: ExtensionRegistry,
 
     /// A precomputed map of all node IDs to their Node trait objects (? @@@) for efficient access
     /// Indexed by NodeIndex
@@ -77,6 +80,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
         processors: Vec<ProcessorWrapper<PData>>,
         exporters: Vec<ExporterWrapper<PData>>,
         extensions: Vec<ExtensionWrapper<PData>>,
+        extension_registry: ExtensionRegistry,
         nodes: NodeDefs<PData, PipeNode>,
         telemetry_policy: TelemetryPolicy,
     ) -> Self {
@@ -86,6 +90,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             processors,
             exporters,
             extensions,
+            extension_registry,
             nodes,
             channel_metrics: Default::default(),
             telemetry_policy,
@@ -127,6 +132,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             processors,
             exporters,
             extensions,
+            extension_registry,
             nodes: _nodes,
             channel_metrics,
             telemetry_policy,
@@ -196,9 +202,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             let pipeline_ctrl_msg_tx = pipeline_ctrl_msg_tx.clone();
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
+            let extension_registry = extension_registry.clone();
             let fut = async move {
                 let result = exporter
-                    .start(pipeline_ctrl_msg_tx, effect_metrics_reporter)
+                    .start(pipeline_ctrl_msg_tx, effect_metrics_reporter, extension_registry)
                     .await
                     .map(|terminal_state| {
                         report_terminal_metrics(&final_metrics_reporter, terminal_state);
@@ -266,9 +273,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             let pipeline_ctrl_msg_tx = pipeline_ctrl_msg_tx.clone();
             let effect_metrics_reporter = metrics_reporter.clone();
             let final_metrics_reporter = metrics_reporter.clone();
+            let extension_registry = extension_registry.clone();
             let fut = async move {
                 let result = receiver
-                    .start(pipeline_ctrl_msg_tx, effect_metrics_reporter)
+                    .start(pipeline_ctrl_msg_tx, effect_metrics_reporter, extension_registry)
                     .await
                     .map(|terminal_state| {
                         report_terminal_metrics(&final_metrics_reporter, terminal_state);
