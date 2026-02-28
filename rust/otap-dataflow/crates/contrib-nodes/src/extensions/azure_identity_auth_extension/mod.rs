@@ -40,7 +40,8 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
-use otap_df_engine::extensions::{local, shared};
+use otap_df_engine::local::extensions as local_ext;
+use otap_df_engine::shared::extensions as shared_ext;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ExtensionFactory, extension_traits};
 use std::sync::Arc;
@@ -93,8 +94,8 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory<OtapPdata> = Extensio
         Ok(ExtensionWrapper::new(
             extension.clone(),
             extension_traits!(extension =>
-                shared(shared::BearerTokenProvider),
-                local(local::BearerTokenProvider),
+                shared(shared_ext::BearerTokenProvider),
+                local(local_ext::BearerTokenProvider),
             ),
             node,
             node_config,

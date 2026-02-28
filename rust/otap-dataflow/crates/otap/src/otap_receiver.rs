@@ -235,7 +235,7 @@ impl shared::Receiver<OtapPdata> for OTAPReceiver {
         mut self: Box<Self>,
         mut ctrl_msg_recv: shared::ControlChannel<OtapPdata>,
         effect_handler: shared::EffectHandler<OtapPdata>,
-        _extension_registry: otap_df_engine::extensions::shared::ExtensionRegistry,
+        _extension_registry: otap_df_engine::shared::extensions::ExtensionRegistry,
     ) -> Result<TerminalState, Error> {
         otap_df_telemetry::otel_info!(
             "receiver.start",

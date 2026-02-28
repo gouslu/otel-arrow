@@ -84,7 +84,7 @@ impl Exporter<OtapPdata> for TopicExporter {
         self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        _extension_registry: otap_df_engine::extensions::local::ExtensionRegistry,
+        _extension_registry: otap_df_engine::local::extensions::ExtensionRegistry,
     ) -> Result<TerminalState, Error> {
         loop {
             match msg_chan.recv().await? {

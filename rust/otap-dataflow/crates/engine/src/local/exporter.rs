@@ -36,7 +36,7 @@
 use crate::control::{AckMsg, NackMsg};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::Error;
-use crate::extensions::local::ExtensionRegistry;
+use crate::local::extensions::ExtensionRegistry;
 use crate::message::MessageChannel;
 use crate::node::NodeId;
 use crate::terminal_state::TerminalState;

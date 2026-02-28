@@ -686,7 +686,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         // Build extension registry from registrar closures.
         // Uses ExtensionRegistry which holds both shared (Arc) and local (Rc)
         // trait entries. Created on the worker thread — never crosses thread boundaries.
-        let mut extension_registry = extensions::local::ExtensionRegistry::new();
+        let mut extension_registry = local::extensions::ExtensionRegistry::new();
         for ext in &mut extensions {
             let name = ext.node_id().name.as_ref().to_string();
             if let Some(registrar) = ext.take_registrar() {

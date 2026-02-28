@@ -19,7 +19,7 @@ use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
-use crate::extensions::registry::ExtensionRegistrar;
+use crate::extensions::ExtensionRegistrar;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message;
 use crate::message::{Receiver, Sender};
