@@ -183,7 +183,7 @@ pub struct ExtensionWrapper<PData> {
     /// extension's trait implementations.
     ///
     /// Produced by the `extension_traits!` macro. Taken during pipeline build
-    /// and invoked once to register `Rc<dyn Trait>` entries.
+    /// and invoked once to register `Arc<dyn Trait>` entries.
     registrar: Option<ExtensionRegistrar>,
     /// A sender for control messages.
     control_sender: LocalSender<NodeControlMsg<PData>>,
@@ -207,7 +207,7 @@ impl<PData> ExtensionWrapper<PData> {
     ///
     /// * `extension` - The extension instance that handles the lifecycle (must be `Send`)
     /// * `registrar` - A registrar closure from `extension_traits!` that will populate
-    ///   the `ExtensionRegistry` with `Rc<dyn Trait>` entries for this extension.
+    ///   the `ExtensionRegistry` with `Arc<dyn Trait>` entries for this extension.
     /// * `node_id` - The node identifier
     /// * `user_config` - The user configuration
     /// * `config` - The extension runtime configuration

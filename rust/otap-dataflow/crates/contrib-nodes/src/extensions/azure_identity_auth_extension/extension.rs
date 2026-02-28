@@ -11,8 +11,8 @@
 //!
 //! `AzureIdentityAuthExtension` is a single `Clone` struct that serves both
 //! as the pipeline extension (implementing [`Extension`] and driving the token
-//! refresh loop) and as the registry service (implementing [`BearerTokenProvider`]
-//! and [`BearerTokenProviderSync`]). Consumers retrieve it from the extension
+//! refresh loop) and as the registry service (implementing [`BearerTokenProvider`]).
+//! Consumers retrieve it from the extension
 //! registry via `registry.get::<dyn BearerTokenProvider>("name")`.
 //!
 //! State is shared through `Arc`:
@@ -25,7 +25,7 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extensions::{BearerToken, BearerTokenProvider, BearerTokenProviderSync};
+use otap_df_engine::extensions::{BearerToken, BearerTokenProvider};
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -60,7 +60,7 @@ const TOKEN_REFRESH_RETRY_SECS: u64 = 10;
 ///
 /// This is a single `Clone` struct that serves as both the pipeline extension
 /// (implementing [`Extension`] to drive the token refresh loop) and the registry
-/// service (implementing [`BearerTokenProvider`] and [`BearerTokenProviderSync`]).
+/// service (implementing [`BearerTokenProvider`]).
 ///
 /// Consumers retrieve this via `registry.get::<dyn BearerTokenProvider>("name")`.
 /// Cheap to clone — all state is behind `Arc`.
@@ -223,22 +223,6 @@ impl AzureIdentityAuthExtension {
 
 #[async_trait]
 impl BearerTokenProvider for AzureIdentityAuthExtension {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
-        let access_token = self.get_token_with_retry().await?;
-
-        Ok(BearerToken::new(
-            access_token.token.secret().to_string(),
-            access_token.expires_on.unix_timestamp(),
-        ))
-    }
-
-    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
-    }
-}
-
-#[async_trait]
-impl BearerTokenProviderSync for AzureIdentityAuthExtension {
     async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
         let access_token = self.get_token_with_retry().await?;
 
@@ -660,58 +644,8 @@ mod tests {
         assert!(next_refresh <= expected_approx + tolerance);
     }
 
-    // ==================== BearerTokenProviderSync Trait Tests ====================
-
-    #[tokio::test]
-    async fn test_sync_provider_get_token() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let credential = make_mock_credential(
-            "sync_test_token",
-            azure_core::time::Duration::minutes(60),
-            call_count.clone(),
-        );
-
-        let service = make_test_extension(credential, "scope");
-
-        // Use the BearerTokenProviderSync trait method
-        let token: BearerToken = BearerTokenProviderSync::get_token(&service).await.unwrap();
-        assert_eq!(token.token.secret(), "sync_test_token");
-        assert!(token.expires_on > 0);
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
     #[test]
-    fn test_sync_provider_subscribe_matches_async() {
-        let credential = make_mock_credential(
-            "test_token",
-            azure_core::time::Duration::minutes(60),
-            Arc::new(AtomicUsize::new(0)),
-        );
-
-        let (token_sender, _) = watch::channel(None);
-        let token_sender = Arc::new(token_sender);
-        let service = AzureIdentityAuthExtension {
-            credential,
-            scope: "scope".to_string(),
-            method: AuthMethod::ManagedIdentity,
-            token_sender: token_sender.clone(),
-        };
-
-        // Get subscriber from Sync trait
-        let rx_sync: watch::Receiver<Option<BearerToken>> =
-            BearerTokenProviderSync::subscribe_token_refresh(&service);
-
-        // Get subscriber from Async trait
-        let rx_async: watch::Receiver<Option<BearerToken>> =
-            BearerTokenProvider::subscribe_token_refresh(&service);
-
-        // Both should start as None
-        assert!(rx_sync.borrow().is_none());
-        assert!(rx_async.borrow().is_none());
-    }
-
-    #[test]
-    fn test_sync_provider_is_send_and_sync() {
+    fn test_provider_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AzureIdentityAuthExtension>();
     }

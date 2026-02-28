@@ -4,7 +4,7 @@
 //! Extension traits and registry for capability-based lookups.
 //!
 //! This module provides:
-//! - [`ExtensionRegistry`](registry::ExtensionRegistry) - An Rc-based registry for extension traits
+//! - [`ExtensionRegistry`](registry::ExtensionRegistry) - An Arc-based registry for extension traits
 //! - Common extension traits like [`BearerTokenProvider`](bearer_token_provider::BearerTokenProvider)
 //!
 //! # Adding New Extension Traits
@@ -43,25 +43,20 @@ mod private {
 ///
 /// # Thread Safety
 ///
-/// Extension traits are `!Send` and `!Sync`. The Rc-based registry is designed for
-/// single-threaded `LocalSet` usage — it never crosses thread boundaries. If a
-/// consumer needs `Send + Sync` (e.g., for tonic), they wrap the `Rc` in
-/// `Arc<Mutex<...>>` themselves.
-pub trait ExtensionTrait: private::Sealed {}
+/// Extension traits require `Send + Sync`. The Arc-based registry is designed for
+/// safe sharing across threads. In practice, the thread-per-core architecture means
+/// most access is single-threaded, but the `Send + Sync` bounds are satisfied
+/// naturally with no performance cost.
+pub trait ExtensionTrait: private::Sealed + Send + Sync {}
 
 // Implement ExtensionTrait for each extension trait's dyn type.
 // This is the ONLY place where ExtensionTrait can be implemented.
 impl private::Sealed for dyn BearerTokenProvider {}
 impl ExtensionTrait for dyn BearerTokenProvider {}
 
-impl private::Sealed for dyn BearerTokenProviderSync {}
-impl ExtensionTrait for dyn BearerTokenProviderSync {}
-
 /// Error type for extension operations.
 ///
 /// Thread-safe error type compatible with any `thiserror`-derived error.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub use bearer_token_provider::{
-    BearerToken, BearerTokenProvider, BearerTokenProviderSync, Secret,
-};
+pub use bearer_token_provider::{BearerToken, BearerTokenProvider, Secret};

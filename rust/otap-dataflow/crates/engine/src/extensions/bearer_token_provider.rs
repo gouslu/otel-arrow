@@ -97,8 +97,9 @@ impl BearerToken {
 ///
 /// # Thread Safety
 ///
-/// - The returned future is `Send` for use with async runtimes like tokio
-/// - The error type is `Send + Sync` for safe propagation across threads
+/// This trait requires `Send + Sync`, making it compatible with the Arc-based
+/// extension registry and any context that needs thread-safe access (e.g.,
+/// tonic interceptors, shared state).
 ///
 /// # Subscribing to Token Refresh Events
 ///
@@ -129,7 +130,7 @@ impl BearerToken {
 /// }
 /// ```
 #[async_trait]
-pub trait BearerTokenProvider: Send {
+pub trait BearerTokenProvider: Send + Sync {
     /// Returns an authentication token.
     ///
     /// # Errors
@@ -161,48 +162,5 @@ pub trait BearerTokenProvider: Send {
     ///     }
     /// }
     /// ```
-    fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
-}
-
-/// Synchronous, thread-safe variant of [`BearerTokenProvider`].
-///
-/// This trait has the same interface as [`BearerTokenProvider`] but adds `Sync`,
-/// making it suitable for use in contexts that require `Send + Sync` (e.g., tonic
-/// interceptors, synchronous middleware, or shared state behind `Arc`).
-///
-/// # When to Use
-///
-/// Use this trait when you need `Sync` access to the provider — for example, in
-/// tonic interceptors or any component shared across threads.
-///
-/// # Example
-///
-/// ```ignore
-/// use otap_df_engine::extensions::BearerTokenProviderSync;
-///
-/// // Inside a tonic interceptor (requires Sync):
-/// let provider: Rc<dyn BearerTokenProviderSync> = registry
-///     .get::<dyn BearerTokenProviderSync>("auth")?;
-///
-/// let token = provider.get_token().await?;
-/// request.metadata_mut().insert(
-///     "authorization",
-///     format!("Bearer {}", token.token.secret()).parse().unwrap(),
-/// );
-/// ```
-#[async_trait]
-pub trait BearerTokenProviderSync: Send + Sync {
-    /// Returns an authentication token.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the token cannot be obtained.
-    async fn get_token(&self) -> Result<BearerToken, super::Error>;
-
-    /// Subscribes to token refresh events.
-    ///
-    /// Identical to [`BearerTokenProvider::subscribe_token_refresh()`] —
-    /// returns a new `watch::Receiver` that is notified whenever the token
-    /// is refreshed by the extension.
     fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
 }

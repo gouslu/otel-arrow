@@ -41,7 +41,6 @@ use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
 use otap_df_engine::extensions::BearerTokenProvider;
-use otap_df_engine::extensions::BearerTokenProviderSync;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ExtensionFactory, extension_traits};
 use std::sync::Arc;
@@ -93,7 +92,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory<OtapPdata> = Extensio
 
         Ok(ExtensionWrapper::new(
             extension.clone(),
-            extension_traits!(extension => BearerTokenProvider, BearerTokenProviderSync),
+            extension_traits!(extension => BearerTokenProvider),
             node,
             node_config,
             extension_config,
