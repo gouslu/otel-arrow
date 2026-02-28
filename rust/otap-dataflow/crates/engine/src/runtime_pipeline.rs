@@ -41,6 +41,7 @@ pub struct RuntimePipeline<PData: Debug> {
     /// Extension runtime nodes.
     extensions: Vec<ExtensionWrapper<PData>>,
     /// Extension registry for passing to receivers and exporters at start.
+    /// Contains both shared (Arc) and local (Rc) extension traits.
     extension_registry: ExtensionRegistry,
 
     /// A precomputed map of all node IDs to their Node trait objects (? @@@) for efficient access

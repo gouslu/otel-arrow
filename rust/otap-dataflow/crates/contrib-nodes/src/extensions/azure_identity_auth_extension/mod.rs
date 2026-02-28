@@ -30,8 +30,8 @@
 //! Consumers retrieve the extension by name from the registry:
 //!
 //! ```ignore
-//! let provider: Rc<dyn BearerTokenProvider> = extension_registry
-//!     .get::<dyn BearerTokenProvider>("azure_auth")?;
+//! let provider: Arc<dyn shared::BearerTokenProvider> = extension_registry
+//!     .get::<dyn shared::BearerTokenProvider>("azure_auth")?;
 //! let mut token_rx = provider.subscribe_token_refresh();
 //! ```
 
@@ -40,7 +40,7 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
-use otap_df_engine::extensions::BearerTokenProvider;
+use otap_df_engine::extensions::{local, shared};
 use otap_df_engine::node::NodeId;
 use otap_df_engine::{ExtensionFactory, extension_traits};
 use std::sync::Arc;
@@ -92,7 +92,10 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory<OtapPdata> = Extensio
 
         Ok(ExtensionWrapper::new(
             extension.clone(),
-            extension_traits!(extension => BearerTokenProvider),
+            extension_traits!(extension =>
+                shared(shared::BearerTokenProvider),
+                local(local::BearerTokenProvider),
+            ),
             node,
             node_config,
             extension_config,

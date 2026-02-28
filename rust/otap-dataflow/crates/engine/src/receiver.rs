@@ -371,7 +371,7 @@ impl<PData> ReceiverWrapper<PData> {
                     metrics_reporter,
                 );
                 effect_handler.set_source_tagging(source_tag);
-                receiver.start(ctrl_msg_chan, effect_handler, extension_registry).await
+                receiver.start(ctrl_msg_chan, effect_handler, extension_registry.into_shared()).await
             }
         }
     }
@@ -466,7 +466,7 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
 #[cfg(test)]
 mod tests {
     use super::ReceiverWrapper;
-    use crate::extensions::ExtensionRegistry;
+    use crate::extensions::{self, ExtensionRegistry};
     use crate::local::receiver as local;
     use crate::receiver::Error;
     use crate::shared::receiver as shared;
@@ -593,7 +593,7 @@ mod tests {
             self: Box<Self>,
             mut ctrl_msg_recv: shared::ControlChannel<TestMsg>,
             effect_handler: shared::EffectHandler<TestMsg>,
-            _extension_registry: ExtensionRegistry,
+            _extension_registry: extensions::shared::ExtensionRegistry,
         ) -> Result<TerminalState, Error> {
             // Bind to an ephemeral port.
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

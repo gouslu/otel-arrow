@@ -319,7 +319,7 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_pipeline_ctrl_msg_sender(pipeline_ctrl_msg_tx);
                 let message_channel = shared::MessageChannel::new(control_receiver, pdata_rx);
-                exporter.start(message_channel, effect_handler, extension_registry).await
+                exporter.start(message_channel, effect_handler, extension_registry.into_shared()).await
             }
         }
     }
@@ -396,7 +396,7 @@ mod tests {
     use crate::control::{AckMsg, NodeControlMsg};
     use crate::error::ExporterErrorKind;
     use crate::exporter::{Error, ExporterWrapper};
-    use crate::extensions::ExtensionRegistry;
+    use crate::extensions::{self, ExtensionRegistry};
     use crate::local::exporter as local;
     use crate::local::message::LocalReceiver;
     use crate::message;
@@ -475,7 +475,7 @@ mod tests {
             self: Box<Self>,
             mut msg_chan: shared::MessageChannel<TestMsg>,
             effect_handler: shared::EffectHandler<TestMsg>,
-            _extension_registry: ExtensionRegistry,
+            _extension_registry: extensions::shared::ExtensionRegistry,
         ) -> Result<TerminalState, Error> {
             // Loop until a Shutdown event is received.
             loop {

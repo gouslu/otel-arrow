@@ -5,15 +5,16 @@
 //!
 //! This extension provides Azure authentication services to the pipeline.
 //! It manages Azure credentials and provides token acquisition capabilities
-//! to consumers (e.g., exporters) via the [`BearerTokenProvider`] trait.
+//! to consumers (e.g., exporters) via the [`shared::BearerTokenProvider`] trait.
 //!
 //! # Architecture
 //!
 //! `AzureIdentityAuthExtension` is a single `Clone` struct that serves both
 //! as the pipeline extension (implementing [`Extension`] and driving the token
-//! refresh loop) and as the registry service (implementing [`BearerTokenProvider`]).
+//! refresh loop) and as the registry service (implementing
+//! [`shared::BearerTokenProvider`] and [`local::BearerTokenProvider`]).
 //! Consumers retrieve it from the extension
-//! registry via `registry.get::<dyn BearerTokenProvider>("name")`.
+//! registry via `registry.get::<dyn shared::BearerTokenProvider>("name")`.
 //!
 //! State is shared through `Arc`:
 //! - `Arc<dyn TokenCredential>` — the Azure credential provider
@@ -25,7 +26,7 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extensions::{BearerToken, BearerTokenProvider};
+use otap_df_engine::extensions::{BearerToken, local, shared};
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -60,9 +61,9 @@ const TOKEN_REFRESH_RETRY_SECS: u64 = 10;
 ///
 /// This is a single `Clone` struct that serves as both the pipeline extension
 /// (implementing [`Extension`] to drive the token refresh loop) and the registry
-/// service (implementing [`BearerTokenProvider`]).
+/// service (implementing [`shared::BearerTokenProvider`]).
 ///
-/// Consumers retrieve this via `registry.get::<dyn BearerTokenProvider>("name")`.
+/// Consumers retrieve this via `registry.get::<dyn shared::BearerTokenProvider>("name")`.
 /// Cheap to clone — all state is behind `Arc`.
 #[derive(Clone)]
 pub struct AzureIdentityAuthExtension {
@@ -222,7 +223,23 @@ impl AzureIdentityAuthExtension {
 }
 
 #[async_trait]
-impl BearerTokenProvider for AzureIdentityAuthExtension {
+impl shared::BearerTokenProvider for AzureIdentityAuthExtension {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+        let access_token = self.get_token_with_retry().await?;
+
+        Ok(BearerToken::new(
+            access_token.token.secret().to_string(),
+            access_token.expires_on.unix_timestamp(),
+        ))
+    }
+
+    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+        self.token_sender.subscribe()
+    }
+}
+
+#[async_trait(?Send)]
+impl local::BearerTokenProvider for AzureIdentityAuthExtension {
     async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
         let access_token = self.get_token_with_retry().await?;
 
@@ -492,7 +509,7 @@ mod tests {
         let service = make_test_extension(credential, "scope");
 
         // Use the BearerTokenProvider trait method
-        let token: BearerToken = BearerTokenProvider::get_token(&service).await.unwrap();
+        let token: BearerToken = shared::BearerTokenProvider::get_token(&service).await.unwrap();
         assert_eq!(token.token.secret(), "bearer_test_token");
         assert!(token.expires_on > 0);
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -516,7 +533,7 @@ mod tests {
         };
 
         // Get a subscriber
-        let mut rx = BearerTokenProvider::subscribe_token_refresh(&service);
+        let mut rx = shared::BearerTokenProvider::subscribe_token_refresh(&service);
 
         // Initially should be None
         assert!(rx.borrow().is_none());
@@ -552,8 +569,8 @@ mod tests {
         };
 
         // Create multiple subscribers
-        let mut rx1 = BearerTokenProvider::subscribe_token_refresh(&service);
-        let mut rx2 = BearerTokenProvider::subscribe_token_refresh(&service);
+        let mut rx1 = shared::BearerTokenProvider::subscribe_token_refresh(&service);
+        let mut rx2 = shared::BearerTokenProvider::subscribe_token_refresh(&service);
 
         // Broadcast a token
         let token = BearerToken::new("broadcast_token".to_string(), 99999);
