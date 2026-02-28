@@ -11,7 +11,7 @@ use crate::control::{
     Controllable, NodeControlMsg, PipelineCtrlMsgReceiver, pipeline_ctrl_msg_channel,
 };
 use crate::error::Error;
-use crate::extensions::ExtensionRegistry;
+use crate::extensions::local::ExtensionRegistry;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message::{Receiver, Sender};
 use crate::node::NodeWithPDataSender;

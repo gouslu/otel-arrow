@@ -14,7 +14,7 @@ use crate::node::{Node, NodeDefs, NodeId, NodeType, NodeWithPDataReceiver, NodeW
 use crate::pipeline_ctrl::PipelineCtrlMsgManager;
 use crate::terminal_state::TerminalState;
 use crate::extension::ExtensionWrapper;
-use crate::extensions::ExtensionRegistry;
+use crate::extensions::local::ExtensionRegistry;
 use crate::{exporter::ExporterWrapper, processor::ProcessorWrapper, receiver::ReceiverWrapper};
 use otap_df_config::DeployedPipelineKey;
 use otap_df_config::pipeline::PipelineConfig;

@@ -436,7 +436,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
         mut self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        extension_registry: otap_df_engine::extensions::ExtensionRegistry,
+        extension_registry: local::ExtensionRegistry,
     ) -> Result<TerminalState, EngineError> {
         effect_handler
             .info(&format!(

@@ -37,7 +37,7 @@ use crate::effect_handler::{
     EffectHandlerCore, SourceTagging, TelemetryTimerCancelHandle, TimerCancelHandle,
 };
 use crate::error::{Error, TypedError};
-use crate::extensions::ExtensionRegistry;
+use crate::extensions::local::ExtensionRegistry;
 use crate::message::Sender;
 use crate::node::NodeId;
 use crate::terminal_state::TerminalState;

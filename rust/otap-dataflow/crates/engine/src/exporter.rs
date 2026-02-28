@@ -14,7 +14,7 @@ use crate::context::PipelineContext;
 use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::{Error, ExporterErrorKind};
-use crate::extensions::ExtensionRegistry;
+use crate::extensions::local::ExtensionRegistry;
 use crate::local::exporter as local;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message;
@@ -396,7 +396,7 @@ mod tests {
     use crate::control::{AckMsg, NodeControlMsg};
     use crate::error::ExporterErrorKind;
     use crate::exporter::{Error, ExporterWrapper};
-    use crate::extensions::{self, ExtensionRegistry};
+    use crate::extensions::{self, local::ExtensionRegistry};
     use crate::local::exporter as local;
     use crate::local::message::LocalReceiver;
     use crate::message;

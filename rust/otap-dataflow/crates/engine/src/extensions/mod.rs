@@ -4,7 +4,7 @@
 //! Extension traits and registry for capability-based lookups.
 //!
 //! This module provides:
-//! - [`ExtensionRegistry`](registry::ExtensionRegistry) - Primary registry (Rc+Arc, `!Send`)
+//! - [`local::ExtensionRegistry`](registry::ExtensionRegistry) - Primary registry (Rc+Arc, `!Send`)
 //! - [`shared::ExtensionRegistry`](registry::SharedExtensionRegistry) - Send+Sync subset (Arc-only)
 //! - Common extension traits like [`shared::BearerTokenProvider`] and [`local::BearerTokenProvider`]
 //!
@@ -31,8 +31,8 @@
 
 pub mod registry;
 
-// Re-export commonly used types
-pub use registry::{ExtensionError, ExtensionRegistrar, ExtensionRegistry};
+// Re-export commonly used types (but NOT the registries — use shared:: or local::)
+pub use registry::{ExtensionError, ExtensionRegistrar};
 
 /// Extension traits that components can implement to expose capabilities.
 pub mod bearer_token_provider;
@@ -222,5 +222,5 @@ pub mod shared {
 /// primary `!Send` registry passed to local components.
 pub mod local {
     pub use super::bearer_token_provider::local::BearerTokenProvider;
-    pub use super::registry::ExtensionRegistry;
+    pub use super::registry::LocalExtensionRegistry as ExtensionRegistry;
 }

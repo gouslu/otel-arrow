@@ -501,7 +501,7 @@ impl Exporter<OtapPdata> for GenevaExporter {
         mut self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        _extension_registry: otap_df_engine::extensions::ExtensionRegistry,
+        _extension_registry: otap_df_engine::extensions::local::ExtensionRegistry,
     ) -> Result<TerminalState, Error> {
         otel_info!(
             "geneva_exporter.start",

@@ -15,7 +15,7 @@ use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::SourceTagging;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::{Error, ReceiverErrorKind};
-use crate::extensions::ExtensionRegistry;
+use crate::extensions::local::ExtensionRegistry;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::local::receiver as local;
 use crate::message::{Receiver, Sender};
@@ -466,7 +466,7 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
 #[cfg(test)]
 mod tests {
     use super::ReceiverWrapper;
-    use crate::extensions::{self, ExtensionRegistry};
+    use crate::extensions::{self, local::ExtensionRegistry};
     use crate::local::receiver as local;
     use crate::receiver::Error;
     use crate::shared::receiver as shared;
