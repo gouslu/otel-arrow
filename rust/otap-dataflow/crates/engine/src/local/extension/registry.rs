@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::extension::ExtensionError;
-use crate::shared::extensions::{SharedExtensionRegistry, SharedExtensionTrait};
+use crate::shared::extension::{SharedExtensionRegistry, SharedExtensionTrait};
 use super::LocalExtensionTrait;
 
 /// Type alias for the registrar closure produced by [`shared_extension_traits!`]
@@ -197,7 +197,7 @@ impl std::fmt::Debug for LocalExtensionRegistry {
 mod tests {
     use super::*;
     use crate::extension::BearerToken;
-    use crate::shared::extensions::BearerTokenProvider as SharedBearerTokenProvider;
+    use crate::shared::extension::BearerTokenProvider as SharedBearerTokenProvider;
     use tokio::sync::watch;
 
     struct TestTokenProvider {

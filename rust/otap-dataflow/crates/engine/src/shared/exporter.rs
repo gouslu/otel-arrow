@@ -35,7 +35,7 @@
 use crate::control::{AckMsg, NackMsg, NodeControlMsg};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::error::Error;
-use crate::shared::extensions::ExtensionRegistry;
+use crate::shared::extension::ExtensionRegistry;
 use crate::message::Message;
 use crate::node::NodeId;
 use crate::shared::message::SharedReceiver;

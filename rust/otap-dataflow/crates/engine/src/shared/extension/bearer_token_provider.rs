@@ -101,7 +101,7 @@ impl BearerToken {
 /// shared receivers).
 ///
 /// For the local variant (no bounds, stored as `Rc`), see
-/// [`crate::local::extensions::BearerTokenProvider`].
+/// [`crate::local::extension::BearerTokenProvider`].
 ///
 /// # Implementing
 ///
@@ -121,10 +121,10 @@ impl BearerToken {
 ///
 /// ```ignore
 /// #[async_trait]
-/// impl otap_df_engine::shared::extensions::BearerTokenProvider for MyExt { ... }
+/// impl otap_df_engine::shared::extension::BearerTokenProvider for MyExt { ... }
 ///
 /// #[async_trait(?Send)]
-/// impl otap_df_engine::local::extensions::BearerTokenProvider for MyExt { ... }
+/// impl otap_df_engine::local::extension::BearerTokenProvider for MyExt { ... }
 /// ```
 #[async_trait::async_trait]
 pub trait BearerTokenProvider: Send + Sync {
@@ -145,4 +145,4 @@ pub trait BearerTokenProvider: Send + Sync {
 }
 
 impl crate::extension::private::Sealed for dyn BearerTokenProvider {}
-impl crate::shared::extensions::SharedExtensionTrait for dyn BearerTokenProvider {}
+impl crate::shared::extension::SharedExtensionTrait for dyn BearerTokenProvider {}

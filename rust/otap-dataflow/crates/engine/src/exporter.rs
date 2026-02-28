@@ -14,7 +14,7 @@ use crate::context::PipelineContext;
 use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::{Error, ExporterErrorKind};
-use crate::local::extensions::ExtensionRegistry;
+use crate::local::extension::ExtensionRegistry;
 use crate::local::exporter as local;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message;
@@ -396,7 +396,7 @@ mod tests {
     use crate::control::{AckMsg, NodeControlMsg};
     use crate::error::ExporterErrorKind;
     use crate::exporter::{Error, ExporterWrapper};
-    use crate::local::extensions::ExtensionRegistry;
+    use crate::local::extension::ExtensionRegistry;
     use crate::local::exporter as local;
     use crate::local::message::LocalReceiver;
     use crate::message;
@@ -475,7 +475,7 @@ mod tests {
             self: Box<Self>,
             mut msg_chan: shared::MessageChannel<TestMsg>,
             effect_handler: shared::EffectHandler<TestMsg>,
-            _extension_registry: crate::shared::extensions::ExtensionRegistry,
+            _extension_registry: crate::shared::extension::ExtensionRegistry,
         ) -> Result<TerminalState, Error> {
             // Loop until a Shutdown event is received.
             loop {

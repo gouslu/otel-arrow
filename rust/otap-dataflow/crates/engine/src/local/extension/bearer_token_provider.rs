@@ -5,9 +5,9 @@
 //!
 //! This is the local variant of the bearer token provider trait.
 //! For the shared variant (`Send + Sync`, stored as `Arc`), see
-//! [`crate::shared::extensions::BearerTokenProvider`].
+//! [`crate::shared::extension::BearerTokenProvider`].
 
-pub use crate::shared::extensions::bearer_token_provider::{BearerToken, Secret};
+pub use crate::shared::extension::bearer_token_provider::{BearerToken, Secret};
 
 /// A trait for components that can provide bearer authentication tokens.
 ///
@@ -16,7 +16,7 @@ pub use crate::shared::extensions::bearer_token_provider::{BearerToken, Secret};
 /// Implementations can use `Rc`, `RefCell`, etc.
 ///
 /// For the shared variant (`Send + Sync`, stored as `Arc`), see
-/// [`crate::shared::extensions::BearerTokenProvider`].
+/// [`crate::shared::extension::BearerTokenProvider`].
 #[async_trait::async_trait(?Send)]
 pub trait BearerTokenProvider {
     /// Returns an authentication token.
@@ -36,4 +36,4 @@ pub trait BearerTokenProvider {
 }
 
 impl crate::extension::private::Sealed for dyn BearerTokenProvider {}
-impl crate::local::extensions::LocalExtensionTrait for dyn BearerTokenProvider {}
+impl crate::local::extension::LocalExtensionTrait for dyn BearerTokenProvider {}

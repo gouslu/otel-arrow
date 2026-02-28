@@ -26,7 +26,7 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extensions::BearerToken;
+use otap_df_engine::extension::BearerToken;
 use otap_df_engine::impl_extension_trait;
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
@@ -225,7 +225,7 @@ impl AzureIdentityAuthExtension {
 
 impl_extension_trait! {
     impl BearerTokenProvider for AzureIdentityAuthExtension {
-        async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+        async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extension::ExtensionOperationError> {
             let access_token = self.get_token_with_retry().await?;
 
             Ok(BearerToken::new(
@@ -341,7 +341,7 @@ mod tests {
     use super::*;
     use azure_core::credentials::TokenRequestOptions;
     use azure_core::time::OffsetDateTime;
-    use otap_df_engine::shared::extensions as shared_ext;
+    use otap_df_engine::shared::extension as shared_ext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]

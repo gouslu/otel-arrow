@@ -8,7 +8,7 @@ use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::local::extensions as local_ext;
+use otap_df_engine::local::extension as local_ext;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;

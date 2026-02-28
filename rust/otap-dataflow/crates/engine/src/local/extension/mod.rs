@@ -16,8 +16,8 @@ pub mod registry;
 pub use bearer_token_provider::BearerTokenProvider;
 pub use registry::{ExtensionRegistrar, LocalExtensionRegistry};
 
-/// Public alias so that `local::extensions::ExtensionRegistry` mirrors
-/// `shared::extensions::ExtensionRegistry`.
+/// Public alias so that `local::extension::ExtensionRegistry` mirrors
+/// `shared::extension::ExtensionRegistry`.
 pub type ExtensionRegistry = LocalExtensionRegistry;
 
 // ── LocalExtensionTrait (marker) ─────────────────────────────────────────────

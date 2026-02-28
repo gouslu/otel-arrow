@@ -15,7 +15,7 @@ use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::SourceTagging;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::{Error, ReceiverErrorKind};
-use crate::local::extensions::ExtensionRegistry;
+use crate::local::extension::ExtensionRegistry;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::local::receiver as local;
 use crate::message::{Receiver, Sender};
@@ -466,7 +466,7 @@ impl<PData> NodeWithPDataSender<PData> for ReceiverWrapper<PData> {
 #[cfg(test)]
 mod tests {
     use super::ReceiverWrapper;
-    use crate::local::extensions::ExtensionRegistry;
+    use crate::local::extension::ExtensionRegistry;
     use crate::local::receiver as local;
     use crate::receiver::Error;
     use crate::shared::receiver as shared;
@@ -593,7 +593,7 @@ mod tests {
             self: Box<Self>,
             mut ctrl_msg_recv: shared::ControlChannel<TestMsg>,
             effect_handler: shared::EffectHandler<TestMsg>,
-            _extension_registry: crate::shared::extensions::ExtensionRegistry,
+            _extension_registry: crate::shared::extension::ExtensionRegistry,
         ) -> Result<TerminalState, Error> {
             // Bind to an ephemeral port.
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
