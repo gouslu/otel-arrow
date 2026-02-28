@@ -8,7 +8,7 @@ use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::local::extension as local_ext;
+use otap_df_engine::local::extension::{BearerTokenProvider, ExtensionRegistry};
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
@@ -436,7 +436,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
         mut self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        extension_registry: local_ext::ExtensionRegistry,
+        extension_registry: ExtensionRegistry,
     ) -> Result<TerminalState, EngineError> {
         effect_handler
             .info(&format!(
@@ -449,7 +449,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
         // Look up the auth extension from the registry
         let auth = extension_registry
-            .get::<dyn local_ext::BearerTokenProvider>(&self.config.auth)
+            .get::<dyn BearerTokenProvider>(&self.config.auth)
             .map_err(|e| {
                 let error = Error::AuthHandlerCreation(Box::new(e));
                 EngineError::InternalError {

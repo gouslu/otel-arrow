@@ -512,7 +512,8 @@ macro_rules! shared_extension_traits {
 /// # Example
 ///
 /// ```ignore
-/// let registrar = local_extension_traits!(rate_limiter => local_ext::RateLimiter);
+/// use otap_df_engine::local::extension::RateLimiter;
+/// let registrar = local_extension_traits!(rate_limiter => RateLimiter);
 /// ```
 #[macro_export]
 macro_rules! local_extension_traits {
@@ -562,10 +563,11 @@ macro_rules! local_extension_traits {
 /// # Example
 ///
 /// ```ignore
-/// use otap_df_engine::{shared::extension as shared_ext, local::extension as local_ext};
+/// use otap_df_engine::shared::extension::BearerTokenProvider as SharedBearerTokenProvider;
+/// use otap_df_engine::local::extension::BearerTokenProvider as LocalBearerTokenProvider;
 /// let registrar = extension_traits!(extension =>
-///     shared(shared_ext::BearerTokenProvider),
-///     local(local_ext::BearerTokenProvider),
+///     shared(SharedBearerTokenProvider),
+///     local(LocalBearerTokenProvider),
 /// );
 /// ```
 #[macro_export]
