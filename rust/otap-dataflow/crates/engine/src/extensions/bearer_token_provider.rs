@@ -108,6 +108,17 @@ impl BearerToken {
 // #[async_trait(?Send)]
 // impl local::BearerTokenProvider for MyExt { ... }
 // ```
+//
+// When both implementations are identical, use `impl_extension_trait!`:
+//
+// ```ignore
+// impl_extension_trait! {
+//     impl BearerTokenProvider for MyExt {
+//         async fn get_token(&self) -> Result<BearerToken, Error> { ... }
+//         fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> { ... }
+//     }
+// }
+// ```
 
 super::define_extension_trait! {
     /// A trait for components that can provide bearer authentication tokens.
@@ -128,21 +139,33 @@ super::define_extension_trait! {
     ///
     /// # Implementing
     ///
+    /// When both implementations are identical (common for `Send + Sync` types),
+    /// use [`impl_extension_trait!`] to avoid duplication:
+    ///
     /// ```ignore
     /// use otap_df_engine::extensions::{shared, local};
     ///
-    /// // Shared variant (requires Send + Sync):
+    /// impl_extension_trait! {
+    ///     impl BearerTokenProvider for MyAuthExtension {
+    ///         async fn get_token(&self) -> Result<BearerToken, Error> { ... }
+    ///         fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> { ... }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Or implement each variant separately when the implementations differ:
+    ///
+    /// ```ignore
+    /// use otap_df_engine::extensions::{shared, local};
+    ///
     /// #[async_trait]
     /// impl shared::BearerTokenProvider for MyAuthExtension {
     ///     async fn get_token(&self) -> Result<BearerToken, Error> { ... }
-    ///     fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> { ... }
     /// }
     ///
-    /// // Local variant (no bounds):
     /// #[async_trait(?Send)]
     /// impl local::BearerTokenProvider for MyAuthExtension {
     ///     async fn get_token(&self) -> Result<BearerToken, Error> { ... }
-    ///     fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> { ... }
     /// }
     /// ```
     pub BearerTokenProvider {

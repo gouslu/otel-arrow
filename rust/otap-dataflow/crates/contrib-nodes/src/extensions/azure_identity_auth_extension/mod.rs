@@ -31,7 +31,7 @@
 //!
 //! ```ignore
 //! let provider: Arc<dyn shared::BearerTokenProvider> = extension_registry
-//!     .get::<dyn shared::BearerTokenProvider>("azure_auth")?;
+//!     .get_shared::<dyn shared::BearerTokenProvider>(\"azure_auth\")?;
 //! let mut token_rx = provider.subscribe_token_refresh();
 //! ```
 

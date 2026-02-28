@@ -37,10 +37,10 @@
 //!     .get::<dyn shared::BearerTokenProvider>("azure_auth")?;
 //!
 //! // Local component (receives ExtensionRegistry):
-//! let provider: Arc<dyn shared::BearerTokenProvider> = registry
-//!     .get::<dyn shared::BearerTokenProvider>("azure_auth")?;
 //! let limiter: Rc<dyn local::RateLimiter> = registry
-//!     .get_local::<dyn local::RateLimiter>("my_limiter")?;
+//!     .get::<dyn local::RateLimiter>("my_limiter")?;
+//! let provider: Arc<dyn shared::BearerTokenProvider> = registry
+//!     .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")?;
 //! ```
 
 use std::any::{Any, TypeId};
@@ -127,7 +127,7 @@ impl SharedExtensionRegistry {
     ///
     /// The trait type is identified by `TypeId::of::<Arc<T>>()` so that
     /// `get::<dyn Trait>()` can look it up.
-    pub fn register<T: ?Sized + Send + Sync + 'static>(&mut self, name: &str, arc: Arc<T>) {
+    pub fn register<T: ?Sized + super::SharedExtensionTrait + 'static>(&mut self, name: &str, arc: Arc<T>) {
         let _ = self.handles.insert(
             (name.to_string(), TypeId::of::<Arc<T>>()),
             Arc::new(arc),
@@ -142,7 +142,7 @@ impl SharedExtensionRegistry {
     ///
     /// Returns `ExtensionError::NotFound` if no extension with that name exists.
     /// Returns `ExtensionError::TraitNotImplemented` if the extension doesn't expose that trait.
-    pub fn get<T: ?Sized + Send + Sync + 'static>(
+    pub fn get<T: ?Sized + super::SharedExtensionTrait + 'static>(
         &self,
         name: &str,
     ) -> Result<Arc<T>, ExtensionError> {
@@ -214,8 +214,8 @@ impl std::fmt::Debug for SharedExtensionRegistry {
 /// `!Send`, `!Sync`, `Clone` (cheap `Rc::clone` / `Arc::clone` per entry).
 ///
 /// The primary registry type — passed to all components. Can access both:
-/// - **Shared traits** via [`get`](Self::get) → `Arc<dyn Trait>` (cold-path)
-/// - **Local traits** via [`get_local`](Self::get_local) → `Rc<dyn Trait>` (hot-path, no atomic overhead)
+/// - **Local traits** via [`get`](Self::get) → `Rc<dyn Trait>` (hot-path, no atomic overhead)
+/// - **Shared traits** via [`get_shared`](Self::get_shared) → `Arc<dyn Trait>` (cold-path)
 ///
 /// Shared components can call [`into_shared`](Self::into_shared) to obtain a
 /// [`SharedExtensionRegistry`] that is `Send + Sync`.
@@ -243,9 +243,9 @@ impl ExtensionRegistry {
 
     /// Register a shared (`Arc`) trait entry.
     ///
-    /// The trait will be accessible by both local components (via `get`)
+    /// The trait will be accessible by both local components (via `get_shared`)
     /// and shared components (via the extracted `SharedExtensionRegistry`).
-    pub fn register<T: ?Sized + Send + Sync + 'static>(
+    pub fn register<T: ?Sized + super::SharedExtensionTrait + 'static>(
         &mut self,
         name: &str,
         arc: Arc<T>,
@@ -255,9 +255,9 @@ impl ExtensionRegistry {
 
     /// Register a local (`Rc`) trait entry.
     ///
-    /// The trait will only be accessible by local components via `get_local`.
+    /// The trait will only be accessible by local components via `get`.
     /// This avoids atomic/mutex overhead for hot-path extensions.
-    pub fn register_local<T: ?Sized + 'static>(&mut self, name: &str, rc: Rc<T>) {
+    pub fn register_local<T: ?Sized + super::LocalExtensionTrait + 'static>(&mut self, name: &str, rc: Rc<T>) {
         let _ = self.local.insert(
             (name.to_string(), TypeId::of::<Rc<T>>()),
             Rc::new(rc),
@@ -267,7 +267,7 @@ impl ExtensionRegistry {
     /// Get a shared trait reference by extension name.
     ///
     /// Returns `Arc<dyn Trait>` — delegates to the inner shared registry.
-    pub fn get<T: ?Sized + Send + Sync + 'static>(
+    pub fn get_shared<T: ?Sized + super::SharedExtensionTrait + 'static>(
         &self,
         name: &str,
     ) -> Result<Arc<T>, ExtensionError> {
@@ -284,7 +284,7 @@ impl ExtensionRegistry {
     /// in either the local or shared maps.
     /// Returns `ExtensionError::TraitNotImplemented` if the extension exists but
     /// doesn't expose this particular local trait.
-    pub fn get_local<T: ?Sized + 'static>(
+    pub fn get<T: ?Sized + super::LocalExtensionTrait + 'static>(
         &self,
         name: &str,
     ) -> Result<Rc<T>, ExtensionError> {
@@ -566,7 +566,7 @@ mod tests {
         registrar(&mut registry, "test_ext");
 
         let result: Result<Arc<dyn shared::BearerTokenProvider>, _> =
-            registry.get::<dyn shared::BearerTokenProvider>("test_ext");
+            registry.get_shared::<dyn shared::BearerTokenProvider>("test_ext");
         assert!(result.is_ok());
     }
 
@@ -581,9 +581,9 @@ mod tests {
         registrar(&mut registry, "ext");
 
         let a: Arc<dyn shared::BearerTokenProvider> =
-            registry.get::<dyn shared::BearerTokenProvider>("ext").unwrap();
+            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
         let b: Arc<dyn shared::BearerTokenProvider> =
-            registry.get::<dyn shared::BearerTokenProvider>("ext").unwrap();
+            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
 
         assert!(Arc::ptr_eq(&a, &b));
     }
@@ -601,9 +601,9 @@ mod tests {
         let cloned = registry.clone();
 
         let from_original: Arc<dyn shared::BearerTokenProvider> =
-            registry.get::<dyn shared::BearerTokenProvider>("ext").unwrap();
+            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
         let from_clone: Arc<dyn shared::BearerTokenProvider> =
-            cloned.get::<dyn shared::BearerTokenProvider>("ext").unwrap();
+            cloned.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
 
         assert!(Arc::ptr_eq(&from_original, &from_clone));
     }
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_shared_not_found() {
         let registry = ExtensionRegistry::new();
-        let result = registry.get::<dyn shared::BearerTokenProvider>("missing");
+        let result = registry.get_shared::<dyn shared::BearerTokenProvider>("missing");
         assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
     }
 
@@ -660,7 +660,7 @@ mod tests {
         let instance = TestLocalImpl { val: 42 };
         registry.register_local::<dyn TestLocalTrait>("limiter", Rc::new(instance));
 
-        let result = registry.get_local::<dyn TestLocalTrait>("limiter");
+        let result = registry.get::<dyn TestLocalTrait>("limiter");
         assert!(result.is_ok());
         assert_eq!(result.unwrap().value(), 42);
     }
@@ -671,8 +671,8 @@ mod tests {
         let instance = TestLocalImpl { val: 99 };
         registry.register_local::<dyn TestLocalTrait>("ext", Rc::new(instance));
 
-        let a = registry.get_local::<dyn TestLocalTrait>("ext").unwrap();
-        let b = registry.get_local::<dyn TestLocalTrait>("ext").unwrap();
+        let a = registry.get::<dyn TestLocalTrait>("ext").unwrap();
+        let b = registry.get::<dyn TestLocalTrait>("ext").unwrap();
 
         assert!(Rc::ptr_eq(&a, &b));
     }
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_local_not_found() {
         let registry = ExtensionRegistry::new();
-        let result = registry.get_local::<dyn TestLocalTrait>("missing");
+        let result = registry.get::<dyn TestLocalTrait>("missing");
         assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
     }
 
@@ -694,7 +694,7 @@ mod tests {
         let mut registry = ExtensionRegistry::new();
         registrar(&mut registry, "auth");
 
-        let result = registry.get_local::<dyn TestLocalTrait>("auth");
+        let result = registry.get::<dyn TestLocalTrait>("auth");
         assert!(matches!(
             result,
             Err(ExtensionError::TraitNotImplemented { .. })
@@ -816,7 +816,7 @@ mod tests {
         registrar(&mut registry, "auth");
 
         let provider: Arc<dyn shared::BearerTokenProvider> =
-            registry.get::<dyn shared::BearerTokenProvider>("auth").unwrap();
+            registry.get_shared::<dyn shared::BearerTokenProvider>("auth").unwrap();
         let token = provider.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "real_token");
     }
@@ -840,10 +840,10 @@ mod tests {
         assert_eq!(registry.len(), 2);
 
         let p1 = registry
-            .get::<dyn shared::BearerTokenProvider>("azure_prod")
+            .get_shared::<dyn shared::BearerTokenProvider>("azure_prod")
             .unwrap();
         let p2 = registry
-            .get::<dyn shared::BearerTokenProvider>("azure_staging")
+            .get_shared::<dyn shared::BearerTokenProvider>("azure_staging")
             .unwrap();
 
         assert!(!Arc::ptr_eq(&p1, &p2));
@@ -867,10 +867,10 @@ mod tests {
         registrar2(&mut registry2, "azure_auth");
 
         let p1: Arc<dyn shared::BearerTokenProvider> = registry1
-            .get::<dyn shared::BearerTokenProvider>("azure_auth")
+            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
             .unwrap();
         let p2: Arc<dyn shared::BearerTokenProvider> = registry2
-            .get::<dyn shared::BearerTokenProvider>("azure_auth")
+            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
             .unwrap();
 
         assert!(
@@ -880,7 +880,7 @@ mod tests {
 
         let registry1_clone = registry1.clone();
         let p1_again: Arc<dyn shared::BearerTokenProvider> = registry1_clone
-            .get::<dyn shared::BearerTokenProvider>("azure_auth")
+            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
             .unwrap();
         assert!(
             Arc::ptr_eq(&p1, &p1_again),
@@ -900,7 +900,7 @@ mod tests {
         registrar(&mut local_reg, "auth");
 
         let from_local: Arc<dyn shared::BearerTokenProvider> = local_reg
-            .get::<dyn shared::BearerTokenProvider>("auth")
+            .get_shared::<dyn shared::BearerTokenProvider>("auth")
             .unwrap();
 
         let shared_reg = local_reg.into_shared();

@@ -155,6 +155,49 @@ macro_rules! define_extension_trait {
 // Make the macro available within the crate
 pub(crate) use define_extension_trait;
 
+/// Generates both `shared` and `local` trait implementations from a single body.
+///
+/// When the `shared::Trait` and `local::Trait` implementations are identical
+/// (as is common for extension types that are inherently `Send + Sync`), this
+/// macro eliminates the duplication by expanding one body into two `impl` blocks:
+///
+/// - `#[async_trait]` `impl shared::Trait for Type { ... }`
+/// - `#[async_trait(?Send)]` `impl local::Trait for Type { ... }`
+///
+/// The caller must have `shared` and `local` modules in scope (e.g.,
+/// `use otap_df_engine::extensions::{shared, local};`).
+///
+/// # Example
+///
+/// ```ignore
+/// use otap_df_engine::extensions::{shared, local, BearerToken};
+///
+/// impl_extension_trait! {
+///     impl BearerTokenProvider for MyExtension {
+///         async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+///             todo!()
+///         }
+///         fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+///             todo!()
+///         }
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_extension_trait {
+    (impl $trait_name:ident for $type:ty { $($body:tt)* }) => {
+        #[async_trait::async_trait]
+        impl $crate::extensions::shared::$trait_name for $type {
+            $($body)*
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl $crate::extensions::local::$trait_name for $type {
+            $($body)*
+        }
+    };
+}
+
 /// Error type for extension operations.
 ///
 /// Thread-safe error type compatible with any `thiserror`-derived error.

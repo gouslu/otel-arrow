@@ -14,7 +14,7 @@
 //! refresh loop) and as the registry service (implementing
 //! [`shared::BearerTokenProvider`] and [`local::BearerTokenProvider`]).
 //! Consumers retrieve it from the extension
-//! registry via `registry.get::<dyn shared::BearerTokenProvider>("name")`.
+//! registry via `registry.get_shared::<dyn shared::BearerTokenProvider>("name")`.
 //!
 //! State is shared through `Arc`:
 //! - `Arc<dyn TokenCredential>` — the Azure credential provider
@@ -26,7 +26,8 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extensions::{BearerToken, local, shared};
+use otap_df_engine::extensions::BearerToken;
+use otap_df_engine::impl_extension_trait;
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -63,7 +64,7 @@ const TOKEN_REFRESH_RETRY_SECS: u64 = 10;
 /// (implementing [`Extension`] to drive the token refresh loop) and the registry
 /// service (implementing [`shared::BearerTokenProvider`]).
 ///
-/// Consumers retrieve this via `registry.get::<dyn shared::BearerTokenProvider>("name")`.
+/// Consumers retrieve this via `registry.get_shared::<dyn shared::BearerTokenProvider>("name")`.
 /// Cheap to clone — all state is behind `Arc`.
 #[derive(Clone)]
 pub struct AzureIdentityAuthExtension {
@@ -222,35 +223,20 @@ impl AzureIdentityAuthExtension {
     }
 }
 
-#[async_trait]
-impl shared::BearerTokenProvider for AzureIdentityAuthExtension {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
-        let access_token = self.get_token_with_retry().await?;
+impl_extension_trait! {
+    impl BearerTokenProvider for AzureIdentityAuthExtension {
+        async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
+            let access_token = self.get_token_with_retry().await?;
 
-        Ok(BearerToken::new(
-            access_token.token.secret().to_string(),
-            access_token.expires_on.unix_timestamp(),
-        ))
-    }
+            Ok(BearerToken::new(
+                access_token.token.secret().to_string(),
+                access_token.expires_on.unix_timestamp(),
+            ))
+        }
 
-    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
-    }
-}
-
-#[async_trait(?Send)]
-impl local::BearerTokenProvider for AzureIdentityAuthExtension {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extensions::Error> {
-        let access_token = self.get_token_with_retry().await?;
-
-        Ok(BearerToken::new(
-            access_token.token.secret().to_string(),
-            access_token.expires_on.unix_timestamp(),
-        ))
-    }
-
-    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
+        fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+            self.token_sender.subscribe()
+        }
     }
 }
 
@@ -355,6 +341,7 @@ mod tests {
     use super::*;
     use azure_core::credentials::TokenRequestOptions;
     use azure_core::time::OffsetDateTime;
+    use otap_df_engine::extensions::shared;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
