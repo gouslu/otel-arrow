@@ -4,8 +4,7 @@
 //! Extension traits and registry for capability-based lookups.
 //!
 //! This module provides:
-//! - [`ExtensionTraits`](registry::ExtensionTraits) - Cast functions for an extension's traits
-//! - [`ExtensionRegistry`](registry::ExtensionRegistry) - A registry to look up extension traits by name
+//! - [`ExtensionRegistry`](registry::ExtensionRegistry) - An Rc-based registry for extension traits
 //! - Common extension traits like [`BearerTokenProvider`](bearer_token_provider::BearerTokenProvider)
 //!
 //! # Adding New Extension Traits
@@ -18,10 +17,7 @@
 pub mod registry;
 
 // Re-export commonly used types
-pub use registry::{
-    CastFn, CloneFn, ExtensionError, ExtensionRegistry, ExtensionRegistryBuilder, ExtensionTraits,
-    TraitId,
-};
+pub use registry::{ExtensionError, ExtensionRegistrar, ExtensionRegistry};
 
 /// Extension traits that components can implement to expose capabilities.
 pub mod bearer_token_provider;
@@ -47,10 +43,11 @@ mod private {
 ///
 /// # Thread Safety
 ///
-/// Extension traits only require `Send`, not `Sync`. The caster-based registry
-/// stores boxed instances and returns borrowed references, avoiding the need for
-/// `Sync` on trait objects.
-pub trait ExtensionTrait: private::Sealed + Send {}
+/// Extension traits are `!Send` and `!Sync`. The Rc-based registry is designed for
+/// single-threaded `LocalSet` usage — it never crosses thread boundaries. If a
+/// consumer needs `Send + Sync` (e.g., for tonic), they wrap the `Rc` in
+/// `Arc<Mutex<...>>` themselves.
+pub trait ExtensionTrait: private::Sealed {}
 
 // Implement ExtensionTrait for each extension trait's dyn type.
 // This is the ONLY place where ExtensionTrait can be implemented.

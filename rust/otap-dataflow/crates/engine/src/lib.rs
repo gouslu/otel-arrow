@@ -683,17 +683,14 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             }
         }
 
-        // Build extension registry from extension traits, then set it on each extension.
-        let mut registry_builder = extensions::registry::ExtensionRegistryBuilder::new();
+        // Build extension registry from registrar closures.
+        let mut extension_registry = extensions::registry::ExtensionRegistry::new();
         for ext in &mut extensions {
             let name = ext.node_id().name.as_ref().to_string();
-            if let (Some(service), Some(traits)) =
-                (ext.take_service(), ext.take_extension_traits())
-            {
-                registry_builder.register_boxed(name, service, traits);
+            if let Some(registrar) = ext.take_registrar() {
+                registrar(&mut extension_registry, &name);
             }
         }
-        let extension_registry = registry_builder.build();
 
         let edges = collect_hyper_edges_runtime_from_connections(&config, &build_state)?;
 

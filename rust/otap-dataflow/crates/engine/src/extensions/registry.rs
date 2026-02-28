@@ -3,49 +3,32 @@
 
 //! Extension registry for storing and retrieving extension trait implementations by name.
 //!
-//! This registry uses a clone-and-box approach: each extension stores a single
-//! concrete instance, along with cast functions that clone the concrete type and
-//! return a `Box<dyn Trait>`. This is entirely safe — no raw pointer manipulation,
-//! no `unsafe impl Sync`, no fat-pointer transmutation.
+//! The registry uses `Rc<dyn Any>` for type-erased storage and `Rc<dyn Trait>` for
+//! trait-based lookups. It is `Clone` (cheap Rc bumps), but intentionally `!Send`
+//! and `!Sync` — consistent with the single-threaded, `LocalSet`-based architecture.
 //!
-//! The concrete service type must implement `Clone`. Typically the clone is cheap
-//! because the service holds `Arc`-wrapped shared state internally (e.g.,
-//! `Arc<Mutex<TokenState>>`).
+//! Extensions are registered during pipeline build using a registrar closure
+//! (produced by the [`extension_traits!`] macro). Each call to `get` returns a
+//! shared `Rc<dyn Trait>` — **no deep copies, single instance per pipeline thread**.
 //!
 //! # Example
 //!
 //! ```ignore
-//! // An extension registers its capabilities using the macro:
-//! let service = MyAuthService::new(...);
-//! let traits = extension_traits!(MyAuthService => BearerTokenProvider);
+//! // Extension factory registers traits using the macro:
+//! let registrar = extension_traits!(extension => BearerTokenProvider);
 //!
-//! // Pass to ExtensionWrapper which builds the registry entry:
-//! ExtensionWrapper::new(extension, service, traits, node_id, config, ...);
+//! // During build the registrar runs:
+//! registrar(&mut registry, "azure_auth");
 //!
-//! // A consumer retrieves a boxed trait object:
-//! let provider: Box<dyn BearerTokenProvider> = registry
-//!     .get_extension::<dyn BearerTokenProvider>("azure_auth")?;
+//! // A consumer retrieves a shared trait reference:
+//! let provider: Rc<dyn BearerTokenProvider> = registry
+//!     .get::<dyn BearerTokenProvider>("azure_auth")?;
 //! provider.get_token().await?;
 //! ```
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-
-/// A cast function that clones the concrete instance and returns it as a
-/// boxed trait object, double-boxed for type-erased storage.
-///
-/// The function:
-/// 1. Downcasts `&dyn Any` to `&ConcreteType`
-/// 2. Clones the concrete instance
-/// 3. Boxes it as `Box<dyn Trait>`
-/// 4. Wraps in another `Box<dyn Any + Send>` for type erasure
-///
-/// Returns `None` if the downcast fails.
-pub type CastFn = fn(&dyn Any) -> Option<Box<dyn Any + Send>>;
-
-/// Marker trait for TypeId lookup of trait types.
-/// Used to get a stable TypeId for `dyn Trait` types.
-pub trait TraitId<T: ?Sized> {}
+use std::rc::Rc;
 
 /// Error when retrieving an extension trait.
 #[derive(Debug)]
@@ -83,303 +66,61 @@ impl std::fmt::Display for ExtensionError {
 
 impl std::error::Error for ExtensionError {}
 
-/// A function that clones the concrete service instance and returns it
-/// as a type-erased `Box<dyn Any + Send>`.
+/// Type alias for the registrar closure produced by [`extension_traits!`].
 ///
-/// This is captured at construction time (monomorphized for the concrete type)
-/// so that type-erased entries can be cloned without knowing the concrete type.
-pub type CloneFn = fn(&dyn Any) -> Box<dyn Any + Send>;
-
-/// Cast functions for an extension's trait implementations.
-///
-/// This is the return type of the [`extension_traits!`] macro. It contains
-/// the mapping from trait TypeIds to cast functions that clone the concrete
-/// instance and return a `Box<dyn Trait>`, plus a clone function for the
-/// concrete instance itself.
-///
-/// # Example
-///
-/// ```ignore
-/// use otap_df_engine::extension_traits;
-/// use otap_df_engine::extensions::BearerTokenProvider;
-///
-/// #[derive(Clone)]
-/// struct MyAuthService { /* ... */ }
-/// impl BearerTokenProvider for MyAuthService { /* ... */ }
-///
-/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
-/// ```
-pub struct ExtensionTraits {
-    casters: HashMap<TypeId, CastFn>,
-    /// Clones the concrete service instance (type-erased).
-    clone_fn: CloneFn,
-}
-
-impl ExtensionTraits {
-    /// Create from casters and a clone function (used by the macro).
-    #[must_use]
-    pub fn from_parts(
-        casters: HashMap<TypeId, CastFn>,
-        clone_fn: CloneFn,
-    ) -> Self {
-        Self { casters, clone_fn }
-    }
-
-    /// Create empty casters for a service type that exposes no traits.
-    ///
-    /// Useful for extensions that participate in the pipeline lifecycle
-    /// but don't expose any capabilities to other components.
-    #[must_use]
-    pub fn for_service<T: Clone + Send + 'static>() -> Self {
-        fn do_clone<S: Clone + Send + 'static>(any: &dyn Any) -> Box<dyn Any + Send> {
-            let val = any
-                .downcast_ref::<S>()
-                .expect("TypeId mismatch in ExtensionTraits clone — this is a bug");
-            Box::new(val.clone())
-        }
-        Self {
-            casters: HashMap::new(),
-            clone_fn: do_clone::<T>,
-        }
-    }
-
-    /// Decompose into the caster map and clone function.
-    #[must_use]
-    pub fn into_parts(self) -> (HashMap<TypeId, CastFn>, CloneFn) {
-        (self.casters, self.clone_fn)
-    }
-
-    /// Check if a trait is registered.
-    #[must_use]
-    pub fn contains<T: ?Sized + 'static>(&self) -> bool {
-        self.casters.contains_key(&TypeId::of::<dyn TraitId<T>>())
-    }
-
-    /// Returns true if no traits are registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.casters.is_empty()
-    }
-
-    /// Returns the number of registered traits.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.casters.len()
-    }
-}
-
-impl std::fmt::Debug for ExtensionTraits {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionTraits")
-            .field("trait_count", &self.casters.len())
-            .finish()
-    }
-}
-
-/// Macro to generate cast functions for an extension's trait implementations.
-///
-/// Each generated cast function clones the concrete service instance and boxes
-/// it as the trait object. The concrete type **must** implement `Clone`.
-///
-/// # Arguments
-///
-/// * First: The concrete type name (must implement `Clone`)
-/// * After `=>`: Comma-separated list of trait names this type implements
-///
-/// Returns an [`ExtensionTraits`] that can be passed to `ExtensionWrapper::new()`.
-///
-/// # Type Safety
-///
-/// Only traits that implement [`crate::extensions::ExtensionTrait`] can be used
-/// with this macro. This is enforced at compile time — attempting to use an
-/// arbitrary trait will result in a compilation error. The macro also verifies
-/// that the concrete type implements `Clone` and each specified trait.
-///
-/// # Example
-///
-/// ```ignore
-/// use otap_df_engine::extension_traits;
-/// use otap_df_engine::extensions::BearerTokenProvider;
-///
-/// #[derive(Clone)]
-/// struct MyAuthService { /* ... */ }
-/// impl BearerTokenProvider for MyAuthService { /* ... */ }
-///
-/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
-/// ExtensionWrapper::new(extension, service, traits, node_id, user_config, config);
-/// ```
-#[macro_export]
-macro_rules! extension_traits {
-    ($concrete_ty:ty => $($trait:ident),* $(,)?) => {{
-        #[allow(unused_mut)]
-        let mut casters: std::collections::HashMap<
-            std::any::TypeId,
-            $crate::extensions::registry::CastFn
-        > = std::collections::HashMap::new();
-        $(
-            {
-                // Compile-time check: ensure the trait is a valid ExtensionTrait.
-                const _: fn() = || {
-                    fn assert_extension_trait<T: ?Sized + $crate::extensions::ExtensionTrait>() {}
-                    assert_extension_trait::<dyn $trait>();
-                };
-
-                // Compile-time check: ensure the concrete type is Clone.
-                const _: fn() = || {
-                    fn assert_clone<T: Clone>() {}
-                    assert_clone::<$concrete_ty>();
-                };
-
-                // Cast function: clone the concrete instance, box as trait, double-box
-                // for type erasure. All safe — no raw pointers, no transmute.
-                fn __cast(any: &dyn std::any::Any) -> Option<Box<dyn std::any::Any + Send>> {
-                    let concrete = any.downcast_ref::<$concrete_ty>()?;
-                    let cloned: $concrete_ty = concrete.clone();
-                    let trait_obj: Box<dyn $trait> = Box::new(cloned);
-                    Some(Box::new(trait_obj))
-                }
-                let _ = casters.insert(
-                    std::any::TypeId::of::<dyn $crate::extensions::registry::TraitId<dyn $trait>>(),
-                    __cast as $crate::extensions::registry::CastFn,
-                );
-            }
-        )*
-        // Clone function for the concrete instance (type-erased).
-        fn __clone_instance(any: &dyn std::any::Any) -> Box<dyn std::any::Any + Send> {
-            let concrete = any
-                .downcast_ref::<$concrete_ty>()
-                .expect("TypeId mismatch in ExtensionEntry clone — this is a bug");
-            Box::new(concrete.clone())
-        }
-        $crate::extensions::registry::ExtensionTraits::from_parts(
-            casters,
-            __clone_instance as $crate::extensions::registry::CloneFn,
-        )
-    }};
-}
-
-/// Internal storage for an extension instance and its cast functions.
-///
-/// This is used internally by the registry to store extensions.
-/// Users should not create this directly — use the [`extension_traits!`] macro
-/// with `ExtensionWrapper::new()`.
-pub struct ExtensionEntry {
-    /// The single concrete instance, type-erased.
-    instance: Box<dyn Any + Send>,
-    /// One cast function per registered trait.
-    casters: HashMap<TypeId, CastFn>,
-    /// Clones the concrete instance inside the box.
-    clone_fn: CloneFn,
-}
-
-impl Clone for ExtensionEntry {
-    fn clone(&self) -> Self {
-        Self {
-            instance: (self.clone_fn)(self.instance.as_ref()),
-            casters: self.casters.clone(),
-            clone_fn: self.clone_fn,
-        }
-    }
-}
-
-impl ExtensionEntry {
-    /// Create a new entry from an instance and casters.
-    pub fn new<T: Send + 'static>(instance: T, casters: ExtensionTraits) -> Self {
-        let (casters, clone_fn) = casters.into_parts();
-        Self {
-            instance: Box::new(instance),
-            casters,
-            clone_fn,
-        }
-    }
-
-    /// Create a new entry from an already-boxed instance and casters.
-    ///
-    /// This is used during pipeline build when the service has been
-    /// type-erased by `ExtensionWrapper`.
-    pub fn from_boxed(instance: Box<dyn Any + Send>, casters: ExtensionTraits) -> Self {
-        let (casters, clone_fn) = casters.into_parts();
-        Self {
-            instance,
-            casters,
-            clone_fn,
-        }
-    }
-
-    /// Get a boxed trait object from the entry.
-    ///
-    /// Clones the concrete instance and returns it as `Box<dyn Trait>`.
-    pub fn get<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
-        let cast = self.casters.get(&TypeId::of::<dyn TraitId<T>>())?;
-        let boxed_any: Box<dyn Any + Send> = cast(self.instance.as_ref())?;
-        // The cast function produced Box<Box<dyn T>> erased as Box<dyn Any + Send>.
-        // Downcast to Box<Box<T>> then unwrap the outer Box.
-        let boxed_trait: Box<Box<T>> = boxed_any.downcast().ok()?;
-        Some(*boxed_trait)
-    }
-
-    /// Check if the entry contains a trait implementation.
-    #[must_use]
-    pub fn contains<T: ?Sized + 'static>(&self) -> bool {
-        self.casters.contains_key(&TypeId::of::<dyn TraitId<T>>())
-    }
-
-    /// Returns the number of trait implementations.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.casters.len()
-    }
-
-    /// Returns true if no traits are registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.casters.is_empty()
-    }
-}
-
-impl std::fmt::Debug for ExtensionEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionEntry")
-            .field("trait_count", &self.casters.len())
-            .finish()
-    }
-}
+/// The closure captures an `Rc<ConcreteType>` and registers `Rc<dyn Trait>`
+/// entries into the registry for the given extension name.
+pub type ExtensionRegistrar = Box<dyn FnOnce(&mut ExtensionRegistry, &str)>;
 
 /// Registry for extension trait implementations.
 ///
 /// Extensions register themselves here during pipeline build so other components
-/// can look them up by name and retrieve boxed trait objects.
+/// can look them up by name and retrieve `Rc<dyn Trait>` references.
 ///
-/// The registry is `Clone + Send` — each pipeline component receives its own
-/// clone at startup. `Sync` is intentionally **not** implemented, consistent
-/// with the shared-nothing, single-threaded `LocalSet` architecture.
+/// The registry is `Clone` (cheap `Rc::clone` per entry) but intentionally
+/// `!Send` and `!Sync`, consistent with the shared-nothing, single-threaded
+/// `LocalSet` architecture. It is created on the worker thread and never
+/// crosses thread boundaries.
 ///
-/// Each `get_extension` call clones the concrete service instance (typically
-/// cheap since services hold `Arc` state) and returns an owned `Box<dyn Trait>`.
+/// Each `get` call returns a shared `Rc<dyn Trait>` — no deep copies. All nodes
+/// on the same pipeline thread share the same extension instance.
 #[derive(Default, Clone)]
 pub struct ExtensionRegistry {
-    extensions: HashMap<String, ExtensionEntry>,
+    /// (extension_name, TypeId of Rc<dyn Trait>) → Rc<Rc<dyn Trait>> erased as Rc<dyn Any>
+    handles: HashMap<(String, TypeId), Rc<dyn Any>>,
 }
+
+// SAFETY: ExtensionRegistry is only used within single-threaded LocalSet tasks
+// spawned via `spawn_local()`. The `Rc` contents are never actually sent across
+// threads. This `Send` impl is required because shared component trait
+// definitions (e.g. `shared::Exporter`, `shared::Receiver`) use `#[async_trait]`
+// which generates futures bounded by `Send`, even though all tasks ultimately
+// run on the `LocalSet`. Without this, passing the registry as a parameter to
+// those trait methods would fail to compile.
+#[allow(unsafe_code)]
+unsafe impl Send for ExtensionRegistry {}
 
 impl ExtensionRegistry {
     /// Create a new empty registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            extensions: HashMap::new(),
+            handles: HashMap::new(),
         }
     }
 
-    /// Create a registry from a map of extension entries.
-    #[must_use]
-    pub fn from_map(extensions: HashMap<String, ExtensionEntry>) -> Self {
-        Self { extensions }
+    /// Register an `Rc<dyn Trait>` for a named extension.
+    ///
+    /// The trait type is identified by `TypeId::of::<Rc<T>>()` so that
+    /// `get::<dyn Trait>()` can look it up.
+    pub fn register<T: ?Sized + 'static>(&mut self, name: &str, rc: Rc<T>) {
+        let _ = self.handles
+            .insert((name.to_string(), TypeId::of::<Rc<T>>()), Rc::new(rc));
     }
 
-    /// Get a boxed trait object by extension name.
+    /// Get a shared trait reference by extension name.
     ///
-    /// Clones the concrete service instance and returns it as `Box<dyn Trait>`.
-    /// The clone is typically cheap since services hold `Arc`-wrapped shared state.
+    /// Returns `Rc<dyn Trait>` — same instance shared by all consumers on this thread.
     ///
     /// # Type Parameters
     ///
@@ -388,136 +129,134 @@ impl ExtensionRegistry {
     /// # Errors
     ///
     /// Returns `ExtensionError::NotFound` if no extension with that name exists.
-    /// Returns `ExtensionError::TraitNotImplemented` if the extension doesn't implement the trait.
+    /// Returns `ExtensionError::TraitNotImplemented` if the extension doesn't expose that trait.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let provider: Box<dyn BearerTokenProvider> = registry
-    ///     .get_extension::<dyn BearerTokenProvider>("azure_auth")?;
+    /// let provider: Rc<dyn BearerTokenProvider> = registry
+    ///     .get::<dyn BearerTokenProvider>("azure_auth")?;
     /// provider.get_token().await?;
     /// ```
-    pub fn get_extension<T: ?Sized + 'static>(
-        &self,
-        name: &str,
-    ) -> Result<Box<T>, ExtensionError> {
-        let entry = self
-            .extensions
-            .get(name)
-            .ok_or_else(|| ExtensionError::NotFound {
-                name: name.to_string(),
-            })?;
+    pub fn get<T: ?Sized + 'static>(&self, name: &str) -> Result<Rc<T>, ExtensionError> {
+        let key = (name.to_string(), TypeId::of::<Rc<T>>());
+        let erased = self.handles.get(&key).ok_or_else(|| {
+            // Distinguish "extension not found" from "trait not implemented"
+            let has_any = self.handles.keys().any(|(n, _)| n == name);
+            if has_any {
+                ExtensionError::TraitNotImplemented {
+                    name: name.to_string(),
+                    expected: std::any::type_name::<T>(),
+                }
+            } else {
+                ExtensionError::NotFound {
+                    name: name.to_string(),
+                }
+            }
+        })?;
 
-        entry
-            .get::<T>()
-            .ok_or_else(|| ExtensionError::TraitNotImplemented {
-                name: name.to_string(),
-                expected: std::any::type_name::<T>(),
-            })
+        let rc = erased
+            .downcast_ref::<Rc<T>>()
+            .expect("TypeId matched but downcast failed — this is a bug");
+
+        Ok(Rc::clone(rc))
     }
 
     /// Check if an extension exists by name.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.extensions.contains_key(name)
+        self.handles.keys().any(|(n, _)| n == name)
     }
 
-    /// Returns the number of registered extensions.
+    /// Returns the number of registered extensions (unique names).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.extensions.len()
+        let mut names: Vec<&String> = self.handles.keys().map(|(n, _)| n).collect();
+        names.sort();
+        names.dedup();
+        names.len()
     }
 
     /// Returns true if no extensions are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.extensions.is_empty()
+        self.handles.is_empty()
     }
 
-    /// Returns an iterator over extension names.
+    /// Returns an iterator over unique extension names.
     pub fn names(&self) -> impl Iterator<Item = &String> {
-        self.extensions.keys()
+        // Deduplicate — an extension can have multiple trait entries
+        let mut names: Vec<&String> = self.handles.keys().map(|(n, _)| n).collect();
+        names.sort();
+        names.dedup();
+        names.into_iter()
     }
 }
 
 impl std::fmt::Debug for ExtensionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&String> = self.names().collect();
         f.debug_struct("ExtensionRegistry")
-            .field("extensions", &self.extensions.keys().collect::<Vec<_>>())
+            .field("extensions", &names)
             .finish()
     }
 }
 
-/// Builder for constructing an [`ExtensionRegistry`].
+/// Macro to generate a registrar closure that registers `Rc<dyn Trait>` entries
+/// for each listed trait.
 ///
-/// Use this to register extension entries before creating the immutable registry.
+/// The macro wraps the instance in a single `Rc`, then for each trait, coerces
+/// `Rc<ConcreteType>` to `Rc<dyn Trait>` and registers it in the registry.
+///
+/// No deep copies. No `Clone` requirement. No function pointers.
+///
+/// # Arguments
+///
+/// * First: The concrete instance expression
+/// * After `=>`: Comma-separated list of trait names this instance implements
+///
+/// Returns an [`ExtensionRegistrar`] closure.
+///
+/// # Type Safety
+///
+/// The macro verifies at compile time that each trait implements
+/// [`ExtensionTrait`](crate::extensions::ExtensionTrait) (sealed). If the concrete
+/// type doesn't implement a listed trait, the Rc coercion will fail at compile time.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let mut builder = ExtensionRegistryBuilder::new();
+/// use otap_df_engine::extension_traits;
+/// use otap_df_engine::extensions::BearerTokenProvider;
+///
+/// struct MyAuthService { /* ... */ }
+/// impl BearerTokenProvider for MyAuthService { /* ... */ }
 ///
 /// let service = MyAuthService::new(...);
-/// let traits = extension_traits!(MyAuthService => BearerTokenProvider);
-/// builder.register("azure_auth", service, traits);
-///
-/// let registry = builder.build();
+/// let registrar = extension_traits!(service => BearerTokenProvider);
 /// ```
-#[derive(Default)]
-pub struct ExtensionRegistryBuilder {
-    /// The map of extension names to entries being built.
-    pub extensions: HashMap<String, ExtensionEntry>,
-}
-
-impl ExtensionRegistryBuilder {
-    /// Create a new empty builder.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            extensions: HashMap::new(),
-        }
-    }
-
-    /// Register an extension with a name, instance, and casters.
-    pub fn register<T: Send + 'static>(
-        &mut self,
-        name: String,
-        instance: T,
-        casters: ExtensionTraits,
-    ) {
-        let _ = self
-            .extensions
-            .insert(name, ExtensionEntry::new(instance, casters));
-    }
-
-    /// Register an extension from a pre-boxed service instance and casters.
-    ///
-    /// Used during pipeline build when the service has been type-erased
-    /// by `ExtensionWrapper`.
-    pub fn register_boxed(
-        &mut self,
-        name: String,
-        instance: Box<dyn Any + Send>,
-        casters: ExtensionTraits,
-    ) {
-        let _ = self
-            .extensions
-            .insert(name, ExtensionEntry::from_boxed(instance, casters));
-    }
-
-    /// Build the immutable registry.
-    #[must_use]
-    pub fn build(self) -> ExtensionRegistry {
-        ExtensionRegistry::from_map(self.extensions)
-    }
-}
-
-impl std::fmt::Debug for ExtensionRegistryBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionRegistryBuilder")
-            .field("extensions", &self.extensions.keys().collect::<Vec<_>>())
-            .finish()
-    }
+#[macro_export]
+macro_rules! extension_traits {
+    ($instance:expr => $($trait:ident),* $(,)?) => {{
+        let __rc = std::rc::Rc::new($instance);
+        let __registrar: $crate::extensions::registry::ExtensionRegistrar = Box::new({
+            let rc = __rc.clone();
+            move |registry: &mut $crate::extensions::registry::ExtensionRegistry, name: &str| {
+                $(
+                    {
+                        // Compile-time check: ensure the trait is a valid ExtensionTrait.
+                        const _: fn() = || {
+                            fn assert_extension_trait<T: ?Sized + $crate::extensions::ExtensionTrait>() {}
+                            assert_extension_trait::<dyn $trait>();
+                        };
+                        // Coerce Rc<ConcreteType> → Rc<dyn Trait> (zero-cost)
+                        registry.register::<dyn $trait>(name, rc.clone() as std::rc::Rc<dyn $trait>);
+                    }
+                )*
+            }
+        });
+        __registrar
+    }};
 }
 
 #[cfg(test)]
@@ -527,7 +266,6 @@ mod tests {
     use crate::extensions::BearerTokenProvider;
     use tokio::sync::watch;
 
-    #[derive(Clone)]
     struct TestTokenProvider {
         token: String,
     }
@@ -546,84 +284,84 @@ mod tests {
     }
 
     #[test]
-    fn test_extension_casters() {
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
-        assert_eq!(casters.len(), 1);
-        assert!(casters.contains::<dyn BearerTokenProvider>());
-    }
-
-    #[test]
-    fn test_extension_entry() {
+    fn test_register_and_get() {
         let instance = TestTokenProvider {
             token: "test_token".to_string(),
         };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
-        let entry = ExtensionEntry::new(instance, casters);
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
 
-        assert_eq!(entry.len(), 1);
-        assert!(entry.contains::<dyn BearerTokenProvider>());
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "test_ext");
 
-        let provider: Box<dyn BearerTokenProvider> = entry.get().unwrap();
-        drop(provider);
-    }
-
-    #[test]
-    fn test_registry_get_extension() {
-        let instance = TestTokenProvider {
-            token: "test_token".to_string(),
-        };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
-        let entry = ExtensionEntry::new(instance, casters);
-
-        let mut map = HashMap::new();
-        let _ = map.insert("test_ext".to_string(), entry);
-
-        let registry = ExtensionRegistry::from_map(map);
-
-        let result: Result<Box<dyn BearerTokenProvider>, _> =
-            registry.get_extension("test_ext");
+        let result: Result<Rc<dyn BearerTokenProvider>, _> =
+            registry.get::<dyn BearerTokenProvider>("test_ext");
         assert!(result.is_ok());
-
-        let not_found: Result<Box<dyn BearerTokenProvider>, _> =
-            registry.get_extension("missing");
-        assert!(matches!(not_found, Err(ExtensionError::NotFound { .. })));
     }
 
     #[test]
-    fn test_registry_builder() {
-        let mut builder = ExtensionRegistryBuilder::new();
-        assert!(builder.extensions.is_empty());
-
+    fn test_get_returns_shared_rc() {
         let instance = TestTokenProvider {
-            token: "builder_test".to_string(),
+            token: "shared_test".to_string(),
         };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
 
-        builder.register("my_extension".to_string(), instance, casters);
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "ext");
 
-        let registry = builder.build();
-        assert_eq!(registry.len(), 1);
-        assert!(registry.contains("my_extension"));
-        let _: Box<dyn BearerTokenProvider> =
-            registry.get_extension("my_extension").unwrap();
+        let a: Rc<dyn BearerTokenProvider> =
+            registry.get::<dyn BearerTokenProvider>("ext").unwrap();
+        let b: Rc<dyn BearerTokenProvider> =
+            registry.get::<dyn BearerTokenProvider>("ext").unwrap();
+
+        // Both point to the same allocation
+        assert!(Rc::ptr_eq(&a, &b));
     }
 
     #[test]
-    fn test_get_extension_returns_independent_clones() {
+    fn test_registry_clone_shares_instances() {
         let instance = TestTokenProvider {
             token: "clone_test".to_string(),
         };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
-        let entry = ExtensionEntry::new(instance, casters);
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
 
-        let registry =
-            ExtensionRegistry::from_map(HashMap::from([("ext".to_string(), entry)]));
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "ext");
 
-        // Each call returns an independent clone
-        let a: Box<dyn BearerTokenProvider> = registry.get_extension("ext").unwrap();
-        let b: Box<dyn BearerTokenProvider> = registry.get_extension("ext").unwrap();
-        drop(a);
-        drop(b);
+        let cloned = registry.clone();
+
+        let from_original: Rc<dyn BearerTokenProvider> =
+            registry.get::<dyn BearerTokenProvider>("ext").unwrap();
+        let from_clone: Rc<dyn BearerTokenProvider> =
+            cloned.get::<dyn BearerTokenProvider>("ext").unwrap();
+
+        // Same instance shared across registry clones
+        assert!(Rc::ptr_eq(&from_original, &from_clone));
+    }
+
+    #[test]
+    fn test_not_found() {
+        let registry = ExtensionRegistry::new();
+        let result = registry.get::<dyn BearerTokenProvider>("missing");
+        assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_trait_not_implemented() {
+        // Register an extension but ask for a trait it doesn't expose
+        let instance = TestTokenProvider {
+            token: "test".to_string(),
+        };
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
+
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "my_ext");
+
+        // BearerTokenProviderSync was not registered
+        let result = registry.get::<dyn crate::extensions::BearerTokenProviderSync>("my_ext");
+        assert!(matches!(
+            result,
+            Err(ExtensionError::TraitNotImplemented { .. })
+        ));
     }
 
     #[test]
@@ -649,14 +387,31 @@ mod tests {
         let instance = TestTokenProvider {
             token: "test".to_string(),
         };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
-        let entry = ExtensionEntry::new(instance, casters);
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
 
-        let registry =
-            ExtensionRegistry::from_map(HashMap::from([("test_ext".to_string(), entry)]));
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "test_ext");
+
         let debug_str = format!("{:?}", registry);
         assert!(debug_str.contains("ExtensionRegistry"));
         assert!(debug_str.contains("test_ext"));
+    }
+
+    #[test]
+    fn test_contains_and_len() {
+        let instance = TestTokenProvider {
+            token: "test".to_string(),
+        };
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
+
+        let mut registry = ExtensionRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+
+        registrar(&mut registry, "ext");
+        assert!(registry.contains("ext"));
+        assert!(!registry.contains("missing"));
+        assert_eq!(registry.len(), 1);
     }
 
     #[tokio::test]
@@ -664,15 +419,39 @@ mod tests {
         let instance = TestTokenProvider {
             token: "real_token".to_string(),
         };
-        let casters = crate::extension_traits!(TestTokenProvider => BearerTokenProvider);
+        let registrar = crate::extension_traits!(instance => BearerTokenProvider);
 
-        let mut builder = ExtensionRegistryBuilder::new();
-        builder.register("auth".to_string(), instance, casters);
-        let registry = builder.build();
+        let mut registry = ExtensionRegistry::new();
+        registrar(&mut registry, "auth");
 
-        let provider: Box<dyn BearerTokenProvider> =
-            registry.get_extension("auth").unwrap();
+        let provider: Rc<dyn BearerTokenProvider> =
+            registry.get::<dyn BearerTokenProvider>("auth").unwrap();
         let token = provider.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "real_token");
+    }
+
+    #[test]
+    fn test_multiple_extensions_same_trait() {
+        let prod = TestTokenProvider {
+            token: "prod_token".to_string(),
+        };
+        let staging = TestTokenProvider {
+            token: "staging_token".to_string(),
+        };
+
+        let reg_prod = crate::extension_traits!(prod => BearerTokenProvider);
+        let reg_staging = crate::extension_traits!(staging => BearerTokenProvider);
+
+        let mut registry = ExtensionRegistry::new();
+        reg_prod(&mut registry, "azure_prod");
+        reg_staging(&mut registry, "azure_staging");
+
+        assert_eq!(registry.len(), 2);
+
+        let p1 = registry.get::<dyn BearerTokenProvider>("azure_prod").unwrap();
+        let p2 = registry.get::<dyn BearerTokenProvider>("azure_staging").unwrap();
+
+        // Different instances for different names
+        assert!(!Rc::ptr_eq(&p1, &p2));
     }
 }

@@ -30,8 +30,8 @@
 //! Consumers retrieve the extension by name from the registry:
 //!
 //! ```ignore
-//! let provider: Box<dyn BearerTokenProvider> = extension_registry
-//!     .get_extension::<dyn BearerTokenProvider>("azure_auth")?;
+//! let provider: Rc<dyn BearerTokenProvider> = extension_registry
+//!     .get::<dyn BearerTokenProvider>("azure_auth")?;
 //! let mut token_rx = provider.subscribe_token_refresh();
 //! ```
 
@@ -93,8 +93,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory<OtapPdata> = Extensio
 
         Ok(ExtensionWrapper::new(
             extension.clone(),
-            extension,
-            extension_traits!(AzureIdentityAuthExtension => BearerTokenProvider, BearerTokenProviderSync),
+            extension_traits!(extension => BearerTokenProvider, BearerTokenProviderSync),
             node,
             node_config,
             extension_config,

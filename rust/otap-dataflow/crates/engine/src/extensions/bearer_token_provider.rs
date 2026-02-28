@@ -147,7 +147,7 @@ pub trait BearerTokenProvider: Send {
     /// # Example
     ///
     /// ```ignore
-    /// let auth = effect_handler.get_extension::<dyn BearerTokenProvider>("auth")?;
+    /// let auth = extension_registry.get::<dyn BearerTokenProvider>("auth")?;
     /// let mut token_rx = auth.subscribe_token_refresh();
     ///
     /// loop {
@@ -181,8 +181,8 @@ pub trait BearerTokenProvider: Send {
 /// use otap_df_engine::extensions::BearerTokenProviderSync;
 ///
 /// // Inside a tonic interceptor (requires Sync):
-/// let provider: Box<dyn BearerTokenProviderSync> = registry
-///     .get_extension::<dyn BearerTokenProviderSync>("auth")?;
+/// let provider: Rc<dyn BearerTokenProviderSync> = registry
+///     .get::<dyn BearerTokenProviderSync>("auth")?;
 ///
 /// let token = provider.get_token().await?;
 /// request.metadata_mut().insert(

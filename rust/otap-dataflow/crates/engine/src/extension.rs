@@ -19,7 +19,7 @@ use crate::control::{Controllable, NodeControlMsg, PipelineCtrlMsgSender};
 use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
-use crate::extensions::registry::ExtensionTraits;
+use crate::extensions::registry::ExtensionRegistrar;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message;
 use crate::message::{Receiver, Sender};
@@ -30,7 +30,6 @@ use otap_df_channel::error::SendError;
 use otap_df_channel::mpsc;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_telemetry::reporter::MetricsReporter;
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -180,15 +179,12 @@ pub struct ExtensionWrapper<PData> {
     runtime_config: ExtensionConfig,
     /// The extension instance.
     extension: Box<dyn Extension<PData>>,
-    /// The service instance that implements extension traits (e.g. `BearerTokenProvider`).
+    /// Registrar closure that populates the `ExtensionRegistry` with this
+    /// extension's trait implementations.
     ///
-    /// This is a type-erased concrete instance whose cast functions are stored in
-    /// `extension_traits`. During pipeline build, both this service and the traits
-    /// are moved into the central `ExtensionRegistry`.
-    service: Option<Box<dyn Any + Send>>,
-    /// Cast functions for this extension's trait implementations.
-    /// Taken during pipeline initialization to build the central registry.
-    extension_traits: Option<ExtensionTraits>,
+    /// Produced by the `extension_traits!` macro. Taken during pipeline build
+    /// and invoked once to register `Rc<dyn Trait>` entries.
+    registrar: Option<ExtensionRegistrar>,
     /// A sender for control messages.
     control_sender: LocalSender<NodeControlMsg<PData>>,
     /// A receiver for control messages.
@@ -205,30 +201,25 @@ impl<PData> Controllable<PData> for ExtensionWrapper<PData> {
 }
 
 impl<PData> ExtensionWrapper<PData> {
-    /// Creates a new `ExtensionWrapper` with the given extension, service, and configuration.
+    /// Creates a new `ExtensionWrapper` with the given extension, registrar, and configuration.
     ///
     /// # Arguments
     ///
     /// * `extension` - The extension instance that handles the lifecycle (must be `Send`)
-    /// * `service` - The service instance that implements extension traits and will be
-    ///   registered in the `ExtensionRegistry`. Typically shares state with `extension`
-    ///   via `Arc` so that other components can access the service while the extension
-    ///   manages its lifecycle.
-    /// * `extension_traits` - The extension's trait cast functions from `extension_traits!` macro
+    /// * `registrar` - A registrar closure from `extension_traits!` that will populate
+    ///   the `ExtensionRegistry` with `Rc<dyn Trait>` entries for this extension.
     /// * `node_id` - The node identifier
     /// * `user_config` - The user configuration
     /// * `config` - The extension runtime configuration
-    pub fn new<E, S>(
+    pub fn new<E>(
         extension: E,
-        service: S,
-        extension_traits: ExtensionTraits,
+        registrar: ExtensionRegistrar,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
         config: &ExtensionConfig,
     ) -> Self
     where
         E: Extension<PData> + 'static,
-        S: Send + 'static,
     {
         let (control_sender, control_receiver) =
             mpsc::Channel::new(config.control_channel.capacity);
@@ -238,28 +229,19 @@ impl<PData> ExtensionWrapper<PData> {
             user_config,
             runtime_config: config.clone(),
             extension: Box::new(extension),
-            service: Some(Box::new(service)),
-            extension_traits: Some(extension_traits),
+            registrar: Some(registrar),
             control_sender: LocalSender::mpsc(control_sender),
             control_receiver: Some(LocalReceiver::mpsc(control_receiver)),
             telemetry: None,
         }
     }
 
-    /// Takes the extension traits from this wrapper, leaving `None` in its place.
+    /// Takes the registrar closure from this wrapper, leaving `None` in its place.
     ///
-    /// This is called during pipeline initialization to collect all extension traits
-    /// into the central registry.
-    pub fn take_extension_traits(&mut self) -> Option<ExtensionTraits> {
-        self.extension_traits.take()
-    }
-
-    /// Takes the service instance from this wrapper, leaving `None` in its place.
-    ///
-    /// This is called during pipeline initialization to move the service into
-    /// the central `ExtensionRegistry`.
-    pub fn take_service(&mut self) -> Option<Box<dyn Any + Send>> {
-        self.service.take()
+    /// This is called during pipeline initialization to register the extension's
+    /// trait implementations in the central `ExtensionRegistry`.
+    pub fn take_registrar(&mut self) -> Option<ExtensionRegistrar> {
+        self.registrar.take()
     }
 
     pub(crate) fn with_node_telemetry_guard(mut self, guard: NodeTelemetryGuard) -> Self {
@@ -434,11 +416,11 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        // Use () as a no-op service and empty extension traits.
+        // Use a no-op registrar that registers nothing.
+        let registrar: ExtensionRegistrar = Box::new(|_registry, _name| {});
         let wrapper = ExtensionWrapper::new(
             extension,
-            (),
-            ExtensionTraits::for_service::<()>(),
+            registrar,
             node_id,
             user_config,
             &config,

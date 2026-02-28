@@ -13,7 +13,7 @@
 //! as the pipeline extension (implementing [`Extension`] and driving the token
 //! refresh loop) and as the registry service (implementing [`BearerTokenProvider`]
 //! and [`BearerTokenProviderSync`]). Consumers retrieve it from the extension
-//! registry via `registry.get_extension::<dyn BearerTokenProvider>("name")`.
+//! registry via `registry.get::<dyn BearerTokenProvider>("name")`.
 //!
 //! State is shared through `Arc`:
 //! - `Arc<dyn TokenCredential>` — the Azure credential provider
@@ -62,8 +62,8 @@ const TOKEN_REFRESH_RETRY_SECS: u64 = 10;
 /// (implementing [`Extension`] to drive the token refresh loop) and the registry
 /// service (implementing [`BearerTokenProvider`] and [`BearerTokenProviderSync`]).
 ///
-/// Consumers retrieve this via `registry.get_extension::<dyn BearerTokenProvider>("name")`.
-/// `Clone` is required by the extension registry's clone-and-box pattern.
+/// Consumers retrieve this via `registry.get::<dyn BearerTokenProvider>("name")`.
+/// Cheap to clone — all state is behind `Arc`.
 #[derive(Clone)]
 pub struct AzureIdentityAuthExtension {
     /// The Azure credential provider.

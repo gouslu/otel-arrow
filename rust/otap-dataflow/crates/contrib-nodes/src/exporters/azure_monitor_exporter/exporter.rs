@@ -449,7 +449,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
         // Look up the auth extension from the registry
         let auth = extension_registry
-            .get_extension::<dyn BearerTokenProvider>(&self.config.auth)
+            .get::<dyn BearerTokenProvider>(&self.config.auth)
             .map_err(|e| {
                 let error = Error::AuthHandlerCreation(Box::new(e));
                 EngineError::InternalError {
