@@ -58,7 +58,10 @@ pub mod registry;
 pub mod bearer_token_provider;
 
 // Re-export commonly used types.
-pub use registry::{ExtensionError, ExtensionRegistrar, ExtensionRegistry, ExtensionRegistryBuilder};
+pub use registry::{
+    ExtensionError, ExtensionHandle, ExtensionRegistrar, ExtensionRegistry,
+    ExtensionRegistryBuilder,
+};
 
 /// Error type for extension operations.
 ///

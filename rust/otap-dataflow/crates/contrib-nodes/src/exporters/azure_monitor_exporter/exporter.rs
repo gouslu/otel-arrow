@@ -448,10 +448,17 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
         let mut msg_id = 0;
 
         // Look up the auth extension from the registry.
-        let mut token_rx = extension_registry
-            .with_extension::<dyn BearerTokenProvider, _>(&self.config.auth, |auth| {
-                auth.subscribe_token_refresh()
-            })
+        let auth = extension_registry
+            .handle::<dyn BearerTokenProvider>(&self.config.auth)
+            .map_err(|e| {
+                let error = Error::AuthHandlerCreation(Box::new(e));
+                EngineError::InternalError {
+                    message: error.to_string(),
+                }
+            })?;
+
+        let mut token_rx = auth
+            .with(|a| a.subscribe_token_refresh())
             .map_err(|e| {
                 let error = Error::AuthHandlerCreation(Box::new(e));
                 EngineError::InternalError {

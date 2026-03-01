@@ -349,6 +349,47 @@ impl ExtensionRegistry {
     }
 
     /// Check if an extension exists by name (regardless of trait).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let auth = registry.handle::<dyn BearerTokenProvider>("auth")?;
+    /// let mut token_rx = auth.with(|a| a.subscribe_token_refresh())?;
+    /// let token = auth.with(|a| a.get_token())?.await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionError::NotFound`] if no extension with that name exists.
+    /// Returns [`ExtensionError::TraitNotImplemented`] if the extension exists
+    /// but does not expose the requested trait.
+    pub fn handle<T: ?Sized + 'static>(
+        &self,
+        name: &str,
+    ) -> Result<ExtensionHandle<'_, T>, ExtensionError> {
+        let key = (name.to_string(), TypeId::of::<Box<T>>());
+        let mutex = self.entries.get(&key).ok_or_else(|| {
+            let has_any = self.entries.keys().any(|(n, _)| n == name);
+            if has_any {
+                ExtensionError::TraitNotImplemented {
+                    name: name.to_string(),
+                    expected: std::any::type_name::<T>(),
+                }
+            } else {
+                ExtensionError::NotFound {
+                    name: name.to_string(),
+                }
+            }
+        })?;
+
+        Ok(ExtensionHandle {
+            mutex,
+            name: name.to_string(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    /// Check if an extension exists by name (regardless of trait).
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.entries.keys().any(|(n, _)| n == name)
@@ -384,6 +425,57 @@ impl std::fmt::Debug for ExtensionRegistry {
         f.debug_struct("ExtensionRegistry")
             .field("extensions", &names)
             .finish()
+    }
+}
+
+// ── ExtensionHandle ──────────────────────────────────────────────────────────
+
+/// A lightweight handle to a specific extension trait in the registry.
+///
+/// Created by [`ExtensionRegistry::handle`]. Captures the registry reference,
+/// extension name, and trait type so callers don't repeat them on every access.
+///
+/// # Example
+///
+/// ```ignore
+/// // Create handle once — specifies trait + name:
+/// let auth = extension_registry.handle::<dyn BearerTokenProvider>("azure_auth")?;
+///
+/// // Use repeatedly — concise closure API:
+/// let mut token_rx = auth.with(|a| a.subscribe_token_refresh())?;
+/// let token = auth.with(|a| a.get_token())?.await?;
+/// ```
+pub struct ExtensionHandle<'a, T: ?Sized + 'static> {
+    mutex: &'a Mutex<Box<dyn Any + Send>>,
+    name: String,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: ?Sized + 'static> ExtensionHandle<'a, T> {
+    /// Access the extension via a scoped closure.
+    ///
+    /// Acquires the per-entry Mutex lock, downcasts to `&T`, calls the
+    /// closure, and releases the lock. Extract owned values (futures,
+    /// receivers, etc.) — don't `.await` inside the closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionError::AlreadyBorrowed`] if the same (name, trait)
+    /// pair is already locked (re-entrant access from within another `with`
+    /// call on the same handle).
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, ExtensionError> {
+        let guard = self
+            .mutex
+            .try_lock()
+            .ok_or_else(|| ExtensionError::AlreadyBorrowed {
+                name: self.name.clone(),
+            })?;
+
+        let boxed_trait: &Box<T> = guard
+            .downcast_ref::<Box<T>>()
+            .expect("TypeId matched but downcast failed — this is a bug");
+
+        Ok(f(boxed_trait.as_ref()))
     }
 }
 
@@ -936,5 +1028,71 @@ mod tests {
             .with_extension::<dyn Counter, _>("counter", |c| c.count())
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    // ── ExtensionHandle ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_handle_basic_usage() {
+        let ext = CellCounter {
+            count: std::cell::Cell::new(0),
+        };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => Counter);
+        registrar(&mut builder, "counter");
+
+        let registry = builder.build();
+
+        // Get handle once, use multiple times
+        let handle = registry.handle::<dyn Counter>("counter").unwrap();
+        handle.with(|c| c.increment()).unwrap();
+        handle.with(|c| c.increment()).unwrap();
+        handle.with(|c| c.increment()).unwrap();
+        assert_eq!(handle.with(|c| c.count()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_handle_not_found() {
+        let registry = ExtensionRegistryBuilder::new().build();
+        let result = registry.handle::<dyn Counter>("missing");
+        assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_handle_trait_not_implemented() {
+        let ext = TestExtension {
+            value: 1,
+            name: "x".to_string(),
+        };
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "ext");
+
+        let registry = builder.build();
+        let result = registry.handle::<dyn Counter>("ext");
+        assert!(matches!(
+            result,
+            Err(ExtensionError::TraitNotImplemented { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_subscription_pattern() {
+        let (tx, _rx) = watch::channel(0);
+        let ext = WatchExtension { tx: tx.clone() };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => Subscribable);
+        registrar(&mut builder, "watch_ext");
+
+        let registry = builder.build();
+
+        let handle = registry.handle::<dyn Subscribable>("watch_ext").unwrap();
+        let mut rx = handle.with(|s| s.subscribe()).unwrap();
+
+        tx.send(99).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 99);
     }
 }
