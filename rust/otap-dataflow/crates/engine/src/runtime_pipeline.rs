@@ -14,7 +14,7 @@ use crate::node::{Node, NodeDefs, NodeId, NodeType, NodeWithPDataReceiver, NodeW
 use crate::pipeline_ctrl::PipelineCtrlMsgManager;
 use crate::terminal_state::TerminalState;
 use crate::extension::ExtensionWrapper;
-use crate::extensions::local::ExtensionRegistry;
+use crate::extensions::ExtensionRegistryBuilder;
 use crate::{exporter::ExporterWrapper, processor::ProcessorWrapper, receiver::ReceiverWrapper};
 use otap_df_config::DeployedPipelineKey;
 use otap_df_config::pipeline::PipelineConfig;
@@ -40,9 +40,9 @@ pub struct RuntimePipeline<PData: Debug> {
     exporters: Vec<ExporterWrapper<PData>>,
     /// Extension runtime nodes.
     extensions: Vec<ExtensionWrapper<PData>>,
-    /// Extension registry for passing to receivers and exporters at start.
-    /// Contains both shared (Arc) and local (Rc) extension traits.
-    extension_registry: ExtensionRegistry,
+    /// Extension registry builder for creating the shared registry.
+    /// Call `builder.build()` once, then clone the result for each component.
+    extension_registry_builder: ExtensionRegistryBuilder,
 
     /// A precomputed map of all node IDs to their Node trait objects (? @@@) for efficient access
     /// Indexed by NodeIndex
@@ -81,7 +81,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
         processors: Vec<ProcessorWrapper<PData>>,
         exporters: Vec<ExporterWrapper<PData>>,
         extensions: Vec<ExtensionWrapper<PData>>,
-        extension_registry: ExtensionRegistry,
+        extension_registry_builder: ExtensionRegistryBuilder,
         nodes: NodeDefs<PData, PipeNode>,
         telemetry_policy: TelemetryPolicy,
     ) -> Self {
@@ -91,7 +91,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             processors,
             exporters,
             extensions,
-            extension_registry,
+            extension_registry_builder,
             nodes,
             channel_metrics: Default::default(),
             telemetry_policy,
@@ -133,7 +133,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             processors,
             exporters,
             extensions,
-            extension_registry,
+            extension_registry_builder,
             nodes: _nodes,
             channel_metrics,
             telemetry_policy,
@@ -187,6 +187,10 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
                 futures.push(local_tasks.spawn_local(fut));
             }
         }
+
+        // Build shared extension registry once — all components share the same
+        // Arc-backed instance (true single instance, per-entry Mutex access).
+        let extension_registry = extension_registry_builder.build();
 
         // Spawn node tasks and register their control senders, scoping telemetry where available.
         for exporter in exporters {

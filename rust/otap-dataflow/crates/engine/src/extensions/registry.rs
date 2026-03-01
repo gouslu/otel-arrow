@@ -1,154 +1,330 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Extension registry for storing and retrieving extension trait implementations.
+//! Extension registry — true single instance shared via `Arc<Mutex>`.
 //!
-//! Provides two registry types following the engine's local/shared pattern:
+//! # Architecture
 //!
-//! - [`SharedExtensionRegistry`] — `Arc`-based, `Send + Sync`. Passed to **shared**
-//!   components. Holds cold-path extension traits that require thread-safety
-//!   (e.g., auth token providers).
+//! The extension system uses a two-phase approach:
 //!
-//! - [`LocalExtensionRegistry`] — Wraps a `SharedExtensionRegistry` plus an `Rc`-based
-//!   map. `!Send`, `!Sync`. Passed to **local** components. Can access both shared
-//!   (`Arc`) and local (`Rc`) traits. Hot-path extensions (rate limiters, quotas)
-//!   register here to avoid atomic/mutex overhead.
+//! 1. **Build phase** ([`ExtensionRegistryBuilder`]): Accumulates extension
+//!    trait objects from registrar closures. Each extension is boxed as
+//!    `Box<dyn Trait>` and type-erased as `Box<dyn Any + Send>`. The builder
+//!    is `Send` so it can cross thread boundaries.
 //!
-//! This follows the same performance pattern as channel metrics:
-//! `Rc<RefCell<...>>` for local hot-path, `Arc<Mutex<...>>` for shared.
+//! 2. **Run phase** ([`ExtensionRegistry`]): An `Arc`-backed, cheaply `Clone`-able
+//!    registry. All components share the **same** extension instances — true
+//!    single instance, no cloning. Access is via [`ExtensionRegistry::with_extension`],
+//!    which acquires a `parking_lot::Mutex` lock and passes `&T` to a closure.
 //!
-//! # Registration
+//! # Mutex-based access
 //!
-//! Extension factories produce a registrar closure via macros:
+//! Access uses `parking_lot::Mutex` — a fast, uncontended lock (~2-3ns on
+//! single-threaded runtimes). The closure-based API ensures the lock is held
+//! for the minimum duration and automatically released.
 //!
-//! ```ignore
-//! // Cold-path: uses Arc, accessible by both local and shared components
-//! let registrar = shared_extension_traits!(extension => shared::BearerTokenProvider);
+//! - [`with_extension`](ExtensionRegistry::with_extension) acquires the lock,
+//!   downcasts to `&T`, calls your closure, and releases the lock.
+//! - The lock is **not** held across `.await` — extract owned values (futures,
+//!   receivers, etc.) from the closure and await them outside.
+//! - Re-entrant access to *different* extensions is fine (separate mutex per
+//!   entry). Accessing the *same* extension while already holding its lock
+//!   will return `Err(AlreadyBorrowed)` (via `try_lock`).
 //!
-//! // Hot-path: uses Rc, accessible only by local components
-//! let registrar = local_extension_traits!(extension => local::RateLimiter);
-//! ```
+//! # Why Mutex instead of lock-free?
 //!
-//! # Retrieval
+//! `Arc` requires `T: Sync` to be `Send`. Extension trait objects are
+//! `dyn Any + Send` (not `Sync`). A lock-free design would require
+//! `unsafe impl Sync` — which is fragile if the registry is ever passed to
+//! `tokio::spawn`, tonic, or any multi-threaded context. The `parking_lot`
+//! Mutex is effectively zero-cost on single-threaded runtimes and remains
+//! sound regardless of runtime configuration.
 //!
-//! ```ignore
-//! // Shared component (receives SharedExtensionRegistry):
-//! let provider: Arc<dyn shared::BearerTokenProvider> = registry
-//!     .get::<dyn shared::BearerTokenProvider>("azure_auth")?;
+//! # Interior mutability
 //!
-//! // Local component (receives LocalExtensionRegistry):
-//! let limiter: Rc<dyn local::RateLimiter> = registry
-//!     .get::<dyn local::RateLimiter>("my_limiter")?;
-//! let provider: Arc<dyn shared::BearerTokenProvider> = registry
-//!     .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")?;
-//! ```
+//! Extensions are accessed via `&T` inside the closure. For mutation,
+//! extensions can use `Cell`, `RefCell`, or other single-threaded interior
+//! mutability primitives — `parking_lot::Mutex` only requires `T: Send`
+//! (not `T: Sync`), and `Cell<T>`/`RefCell<T>` are `Send` when `T: Send`.
+//!
+//! # Type Erasure
+//!
+//! Trait objects are double-boxed:
+//! - Inner: `Box<dyn BearerTokenProvider>` (the actual trait object)
+//! - Outer: `Box<dyn Any + Send>` (type-erased storage)
+//!
+//! The `TypeId` key is `TypeId::of::<Box<dyn Trait>>()` — note that `Box<dyn Trait>`
+//! is `Sized`, so it has a valid `TypeId` and supports `Any::downcast_ref`.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
-/// Error when retrieving an extension trait.
-#[derive(Debug)]
+use parking_lot::Mutex;
+use thiserror::Error;
+
+// ── Error Types ──────────────────────────────────────────────────────────────
+
+/// Errors that can occur when retrieving extensions from the registry.
+#[derive(Debug, Error, Clone)]
 pub enum ExtensionError {
-    /// Extension not found by name.
+    /// The named extension was not found in the registry.
+    #[error("extension '{name}' not found")]
     NotFound {
-        /// The name of the extension that was not found.
+        /// Name of the extension.
         name: String,
     },
-    /// Extension found but doesn't implement the requested trait.
+
+    /// The extension exists but does not expose the requested trait.
+    #[error("extension '{name}' does not implement trait '{expected}'")]
     TraitNotImplemented {
-        /// The name of the extension.
+        /// Name of the extension.
         name: String,
-        /// The expected trait name.
+        /// Expected trait name.
         expected: &'static str,
+    },
+
+    /// The extension is currently borrowed by another caller.
+    ///
+    /// This happens when `with_extension` is called re-entrantly for the
+    /// *same* (name, trait) pair. Access to *different* extensions or
+    /// different traits of the same extension is always fine.
+    #[error("extension '{name}' is already borrowed")]
+    AlreadyBorrowed {
+        /// Name of the extension.
+        name: String,
     },
 }
 
-impl std::fmt::Display for ExtensionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExtensionError::NotFound { name } => {
-                write!(f, "extension '{}' not found", name)
-            }
-            ExtensionError::TraitNotImplemented { name, expected } => {
-                write!(
-                    f,
-                    "extension '{}' does not implement trait {}",
-                    name, expected
-                )
-            }
-        }
+// ── ExtensionRegistrar ───────────────────────────────────────────────────────
+
+/// A closure produced by the [`extension_traits!`] macro that registers an
+/// extension's trait objects with the [`ExtensionRegistryBuilder`].
+///
+/// Called once per extension during pipeline build. The closure captures the
+/// concrete extension instance and registers boxed trait objects for each trait
+/// the extension exposes.
+///
+/// Must be `Send` because the extension instance is created on the main thread
+/// and consumed on the worker thread.
+pub type ExtensionRegistrar = Box<dyn FnOnce(&mut ExtensionRegistryBuilder, &str) + Send>;
+
+// ── ExtensionRegistryBuilder ─────────────────────────────────────────────────
+
+/// Accumulates extension trait objects during pipeline build.
+///
+/// Each extension contributes one or more trait objects via its registrar closure
+/// (produced by the [`extension_traits!`] macro). Call [`build`](Self::build) to
+/// create a shared [`ExtensionRegistry`] backed by `Arc`.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut builder = ExtensionRegistryBuilder::new();
+/// for ext in &mut extensions {
+///     let name = ext.node_id().name.to_string();
+///     if let Some(registrar) = ext.take_registrar() {
+///         registrar(&mut builder, &name);
+///     }
+/// }
+/// // Build once — all components share the same registry (Arc clone):
+/// let registry = builder.build();
+/// let reg_for_exporter = registry.clone(); // cheap Arc clone
+/// ```
+pub struct ExtensionRegistryBuilder {
+    entries: HashMap<(String, TypeId), Box<dyn Any + Send>>,
+}
+
+impl Default for ExtensionRegistryBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl std::error::Error for ExtensionError {}
-
-/// Type alias for the registrar closure produced by [`shared_extension_traits!`]
-/// and [`local_extension_traits!`].
-///
-/// The closure captures a concrete extension instance (`Send`) and registers
-/// trait entries into the [`LocalExtensionRegistry`] for the given extension name.
-/// It receives `&mut LocalExtensionRegistry` so it can register both shared
-/// (`Arc`) and local (`Rc`) traits.
-///
-/// Although `LocalExtensionRegistry` is `!Send` (it contains `Rc`), the closure
-/// only receives it as a borrow parameter — the closure itself is `Send` because
-/// it only captures `Send` data.
-pub type ExtensionRegistrar = Box<dyn FnOnce(&mut LocalExtensionRegistry, &str) + Send>;
-
-// ── SharedExtensionRegistry (shared, Arc-based) ────────────────────────────────────
-
-/// Registry for shared extension trait implementations.
-///
-/// `Send + Sync`, `Clone`. Contains only `Arc<dyn Trait>` entries.
-///
-/// Passed to **shared components** (those using `#[async_trait]` with Send futures).
-/// Shared components can only access shared (thread-safe) extension traits.
-///
-/// Each `get` call returns a shared `Arc<dyn Trait>` — no deep copies. All nodes
-/// on the same pipeline thread share the same extension instance.
-#[derive(Default, Clone)]
-pub struct SharedExtensionRegistry {
-    /// (extension_name, TypeId of Arc<dyn Trait>) → Arc<Arc<dyn Trait>> erased as Arc<dyn Any + Send + Sync>
-    handles: HashMap<(String, TypeId), Arc<dyn Any + Send + Sync>>,
-}
-
-impl SharedExtensionRegistry {
-    /// Create a new empty shared registry.
+impl ExtensionRegistryBuilder {
+    /// Creates a new empty builder.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            handles: HashMap::new(),
+            entries: HashMap::new(),
         }
     }
 
-    /// Register an `Arc<dyn Trait>` for a named extension.
+    /// Registers a trait object for the given extension name and trait type.
     ///
-    /// The trait type is identified by `TypeId::of::<Arc<T>>()` so that
-    /// `get::<dyn Trait>()` can look it up.
-    pub fn register<T: ?Sized + super::SharedExtensionTrait + 'static>(&mut self, name: &str, arc: Arc<T>) {
-        let _ = self.handles.insert(
-            (name.to_string(), TypeId::of::<Arc<T>>()),
-            Arc::new(arc),
-        );
+    /// This is called by the [`extension_traits!`] macro. Each call registers
+    /// one (name, trait) pair. Multiple traits per extension result in multiple
+    /// calls with the same `name` but different `trait_type_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` — Extension instance name (e.g., "azure_identity_auth")
+    /// * `trait_type_id` — `TypeId::of::<Box<dyn Trait>>()` identifying the trait
+    /// * `instance` — `Box<Box<dyn Trait>>` erased as `Box<dyn Any + Send>`
+    pub fn register(
+        &mut self,
+        name: &str,
+        trait_type_id: TypeId,
+        instance: Box<dyn Any + Send>,
+    ) {
+        let _ = self
+            .entries
+            .insert((name.to_string(), trait_type_id), instance);
     }
 
-    /// Get a shared trait reference by extension name.
+    /// Creates a shared [`ExtensionRegistry`] backed by `Arc<Mutex>`.
     ///
-    /// Returns `Arc<dyn Trait>` — same instance shared by all consumers.
+    /// Each entry is wrapped in its own `Mutex` so different extensions can
+    /// be accessed concurrently without contention.
+    ///
+    /// Consumes the builder since the data is moved into the registry.
+    #[must_use]
+    pub fn build(self) -> ExtensionRegistry {
+        let entries = self
+            .entries
+            .into_iter()
+            .map(|(key, boxed)| (key, Mutex::new(boxed)))
+            .collect();
+        ExtensionRegistry {
+            entries: Arc::new(entries),
+        }
+    }
+
+    /// Returns `true` if no extensions have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the number of unique extension names registered.
+    #[must_use]
+    pub fn extension_count(&self) -> usize {
+        let mut names: Vec<&str> = self.entries.keys().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        names.dedup();
+        names.len()
+    }
+
+    /// Returns an iterator over unique extension names.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        let mut names: Vec<&str> = self.entries.keys().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        names.dedup();
+        names.into_iter()
+    }
+}
+
+impl std::fmt::Debug for ExtensionRegistryBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.names().collect();
+        f.debug_struct("ExtensionRegistryBuilder")
+            .field("extensions", &names)
+            .finish()
+    }
+}
+
+// ── ExtensionRegistry ────────────────────────────────────────────────────────
+
+/// Shared extension registry — true single instance across all components.
+///
+/// Created by [`ExtensionRegistryBuilder::build`] and cheaply cloned via `Arc`.
+/// All components share the same extension instances. Access is via
+/// [`with_extension`](Self::with_extension), which acquires a per-entry
+/// `parking_lot::Mutex` lock and passes `&T` to a closure.
+///
+/// # Usage pattern
+///
+/// Extract owned values from the closure — don't hold the lock across `.await`:
+///
+/// ```ignore
+/// // Get an owned future (lock released before await):
+/// let token_future = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
+///     "azure_identity_auth",
+///     |auth| auth.get_token(),
+/// )?;
+/// let token = token_future.await?;
+///
+/// // Get an owned subscription handle:
+/// let mut token_rx = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
+///     "azure_identity_auth",
+///     |auth| auth.subscribe_token_refresh(),
+/// )?;
+/// ```
+///
+/// # Concurrency
+///
+/// Each (name, trait) pair has its own `Mutex`. Accessing different extensions
+/// or different traits of the same extension is never blocked. Re-entrant
+/// access to the *same* (name, trait) pair returns `Err(AlreadyBorrowed)`.
+#[derive(Clone)]
+pub struct ExtensionRegistry {
+    /// `(extension_name, TypeId::of::<Box<dyn Trait>>())` → `Mutex<Box<dyn Any + Send>>`
+    ///
+    /// The `Box<dyn Any + Send>` contains a `Box<dyn Trait>` that can be recovered
+    /// via `downcast_ref::<Box<dyn Trait>>()`.
+    ///
+    /// Each entry has its own `Mutex` for fine-grained locking.
+    entries: Arc<HashMap<(String, TypeId), Mutex<Box<dyn Any + Send>>>>,
+}
+
+impl Default for ExtensionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtensionRegistry {
+    /// Creates a new empty registry.
+    ///
+    /// Prefer using [`ExtensionRegistryBuilder::build`] to create registries
+    /// from registered extensions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Access an extension trait by name via a scoped closure.
+    ///
+    /// Acquires the per-entry `Mutex` lock (via `try_lock` to prevent
+    /// deadlocks), downcasts to `&T`, calls the closure, and releases
+    /// the lock. The closure receives `&T` and can extract owned values
+    /// (futures, receivers, cloned data, etc.).
+    ///
+    /// # Important
+    ///
+    /// Do **not** `.await` inside the closure — the lock would be held
+    /// across the await point. Instead, extract an owned future and await
+    /// it outside:
+    ///
+    /// ```ignore
+    /// let future = registry.with_extension::<dyn MyTrait, _>("name", |ext| {
+    ///     ext.get_async_result()  // returns BoxFuture<'static, ...>
+    /// })?;
+    /// let result = future.await?;  // lock already released
+    /// ```
+    ///
+    /// # Type Parameter
+    ///
+    /// `T` is the **trait object type**, e.g., `dyn BearerTokenProvider`. The trait
+    /// must be `'static` (required for `TypeId`).
     ///
     /// # Errors
     ///
-    /// Returns `ExtensionError::NotFound` if no extension with that name exists.
-    /// Returns `ExtensionError::TraitNotImplemented` if the extension doesn't expose that trait.
-    pub fn get<T: ?Sized + super::SharedExtensionTrait + 'static>(
+    /// Returns [`ExtensionError::NotFound`] if no extension with that name exists.
+    /// Returns [`ExtensionError::TraitNotImplemented`] if the extension exists
+    /// but does not expose the requested trait.
+    /// Returns [`ExtensionError::AlreadyBorrowed`] if the same (name, trait)
+    /// pair is already locked (re-entrant access).
+    pub fn with_extension<T: ?Sized + 'static, R>(
         &self,
         name: &str,
-    ) -> Result<Arc<T>, ExtensionError> {
-        let key = (name.to_string(), TypeId::of::<Arc<T>>());
-        let erased = self.handles.get(&key).ok_or_else(|| {
-            let has_any = self.handles.keys().any(|(n, _)| n == name);
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, ExtensionError> {
+        let key = (name.to_string(), TypeId::of::<Box<T>>());
+        let mutex = self.entries.get(&key).ok_or_else(|| {
+            let has_any = self.entries.keys().any(|(n, _)| n == name);
             if has_any {
                 ExtensionError::TraitNotImplemented {
                     name: name.to_string(),
@@ -161,753 +337,604 @@ impl SharedExtensionRegistry {
             }
         })?;
 
-        let arc = erased
-            .downcast_ref::<Arc<T>>()
+        let guard = mutex.try_lock().ok_or_else(|| ExtensionError::AlreadyBorrowed {
+            name: name.to_string(),
+        })?;
+
+        let boxed_trait: &Box<T> = guard
+            .downcast_ref::<Box<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
 
-        Ok(Arc::clone(arc))
+        Ok(f(boxed_trait.as_ref()))
     }
 
-    /// Check if an extension exists by name.
+    /// Check if an extension exists by name (regardless of trait).
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.handles.keys().any(|(n, _)| n == name)
+        self.entries.keys().any(|(n, _)| n == name)
     }
 
-    /// Returns the number of registered extensions (unique names).
+    /// Returns the number of unique extension names in the registry.
     #[must_use]
-    pub fn len(&self) -> usize {
-        let mut names: Vec<&String> = self.handles.keys().map(|(n, _)| n).collect();
+    pub fn extension_count(&self) -> usize {
+        let mut names: Vec<&String> = self.entries.keys().map(|(n, _)| n).collect();
         names.sort();
         names.dedup();
         names.len()
     }
 
-    /// Returns true if no extensions are registered.
+    /// Returns `true` if no extensions are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.handles.is_empty()
+        self.entries.is_empty()
     }
 
     /// Returns an iterator over unique extension names.
     pub fn names(&self) -> impl Iterator<Item = &String> {
-        let mut names: Vec<&String> = self.handles.keys().map(|(n, _)| n).collect();
+        let mut names: Vec<&String> = self.entries.keys().map(|(n, _)| n).collect();
         names.sort();
         names.dedup();
         names.into_iter()
     }
 }
 
-impl std::fmt::Debug for SharedExtensionRegistry {
+impl std::fmt::Debug for ExtensionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&String> = self.names().collect();
-        f.debug_struct("SharedExtensionRegistry")
+        f.debug_struct("ExtensionRegistry")
             .field("extensions", &names)
             .finish()
     }
 }
 
-// ── LocalExtensionRegistry (local, Rc + Arc) ────────────────────────────────
+// ── Registration Macros ──────────────────────────────────────────────────────
 
-/// Registry for extension trait implementations.
+/// Creates a registrar closure that registers extension trait objects.
 ///
-/// `!Send`, `!Sync`, `Clone` (cheap `Rc::clone` / `Arc::clone` per entry).
+/// The macro captures the concrete extension instance and registers boxed
+/// trait objects for each listed trait. The instance is cloned once per trait
+/// (to produce independent trait objects for multi-trait extensions).
 ///
-/// The primary registry type — passed to all components. Can access both:
-/// - **Local traits** via [`get`](Self::get) → `Rc<dyn Trait>` (hot-path, no atomic overhead)
-/// - **Shared traits** via [`get_shared`](Self::get_shared) → `Arc<dyn Trait>` (cold-path)
-///
-/// Shared components can call [`into_shared`](Self::into_shared) to obtain a
-/// [`SharedExtensionRegistry`] that is `Send + Sync`.
-///
-/// This follows the same performance pattern as channel metrics:
-/// `Rc<RefCell<...>>` for local hot-path vs `Arc<Mutex<...>>` for shared.
-#[derive(Default, Clone)]
-pub struct LocalExtensionRegistry {
-    /// Shared (Arc) registry — accessible by both local and shared components.
-    shared: SharedExtensionRegistry,
-    /// Local (Rc) entries — only accessible by local components.
-    /// (extension_name, TypeId of Rc<dyn Trait>) → Rc<Rc<dyn Trait>> erased as Rc<dyn Any>
-    local: HashMap<(String, TypeId), Rc<dyn Any>>,
-}
-
-impl LocalExtensionRegistry {
-    /// Create a new empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            shared: SharedExtensionRegistry::new(),
-            local: HashMap::new(),
-        }
-    }
-
-    /// Register a shared (`Arc`) trait entry.
-    ///
-    /// The trait will be accessible by both local components (via `get_shared`)
-    /// and shared components (via the extracted `SharedExtensionRegistry`).
-    pub fn register<T: ?Sized + super::SharedExtensionTrait + 'static>(
-        &mut self,
-        name: &str,
-        arc: Arc<T>,
-    ) {
-        self.shared.register(name, arc);
-    }
-
-    /// Register a local (`Rc`) trait entry.
-    ///
-    /// The trait will only be accessible by local components via `get`.
-    /// This avoids atomic/mutex overhead for hot-path extensions.
-    pub fn register_local<T: ?Sized + super::LocalExtensionTrait + 'static>(&mut self, name: &str, rc: Rc<T>) {
-        let _ = self.local.insert(
-            (name.to_string(), TypeId::of::<Rc<T>>()),
-            Rc::new(rc),
-        );
-    }
-
-    /// Get a shared trait reference by extension name.
-    ///
-    /// Returns `Arc<dyn Trait>` — delegates to the inner shared registry.
-    pub fn get_shared<T: ?Sized + super::SharedExtensionTrait + 'static>(
-        &self,
-        name: &str,
-    ) -> Result<Arc<T>, ExtensionError> {
-        self.shared.get(name)
-    }
-
-    /// Get a local trait reference by extension name.
-    ///
-    /// Returns `Rc<dyn Trait>` — no atomic overhead, ideal for hot-path extensions.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ExtensionError::NotFound` if no extension with that name exists
-    /// in either the local or shared maps.
-    /// Returns `ExtensionError::TraitNotImplemented` if the extension exists but
-    /// doesn't expose this particular local trait.
-    pub fn get<T: ?Sized + super::LocalExtensionTrait + 'static>(
-        &self,
-        name: &str,
-    ) -> Result<Rc<T>, ExtensionError> {
-        let key = (name.to_string(), TypeId::of::<Rc<T>>());
-        let erased = self.local.get(&key).ok_or_else(|| {
-            // Check both local and shared maps for error differentiation
-            let has_any = self.local.keys().any(|(n, _)| n == name)
-                || self.shared.contains(name);
-            if has_any {
-                ExtensionError::TraitNotImplemented {
-                    name: name.to_string(),
-                    expected: std::any::type_name::<T>(),
-                }
-            } else {
-                ExtensionError::NotFound {
-                    name: name.to_string(),
-                }
-            }
-        })?;
-
-        let rc = erased
-            .downcast_ref::<Rc<T>>()
-            .expect("TypeId matched but downcast failed — this is a bug");
-
-        Ok(Rc::clone(rc))
-    }
-
-    /// Returns a reference to the inner shared registry.
-    #[must_use]
-    pub fn shared(&self) -> &SharedExtensionRegistry {
-        &self.shared
-    }
-
-    /// Extracts the shared registry, consuming this local registry.
-    ///
-    /// Used by the engine to pass the shared registry to shared components.
-    #[must_use]
-    pub fn into_shared(self) -> SharedExtensionRegistry {
-        self.shared
-    }
-
-    /// Check if an extension exists by name in either map.
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.shared.contains(name) || self.local.keys().any(|(n, _)| n == name)
-    }
-
-    /// Returns the number of registered extensions (unique names across both maps).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        let mut names: Vec<&String> = self
-            .shared
-            .handles
-            .keys()
-            .chain(self.local.keys())
-            .map(|(n, _)| n)
-            .collect();
-        names.sort();
-        names.dedup();
-        names.len()
-    }
-
-    /// Returns true if no extensions are registered in either map.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.shared.is_empty() && self.local.is_empty()
-    }
-
-    /// Returns an iterator over unique extension names from both maps.
-    pub fn names(&self) -> impl Iterator<Item = &String> {
-        let mut names: Vec<&String> = self
-            .shared
-            .handles
-            .keys()
-            .chain(self.local.keys())
-            .map(|(n, _)| n)
-            .collect();
-        names.sort();
-        names.dedup();
-        names.into_iter()
-    }
-}
-
-impl std::fmt::Debug for LocalExtensionRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&String> = self.names().collect();
-        f.debug_struct("LocalExtensionRegistry")
-            .field("extensions", &names)
-            .finish()
-    }
-}
-
-// ── Macros ───────────────────────────────────────────────────────────────────
-
-/// Generates a registrar closure that registers **shared** `Arc<dyn Trait>` entries.
-///
-/// The instance is wrapped in `Arc` — accessible by both local and shared components.
-/// Use this for cold-path traits (auth, service discovery) where thread-safety
-/// overhead is negligible.
-///
-/// For registering both shared and local traits on the same instance, prefer
-/// [`extension_traits!`] instead.
-///
-/// # Example
-///
-/// ```ignore
-/// use otap_df_engine::extensions::shared;
-/// let registrar = shared_extension_traits!(auth_service => shared::BearerTokenProvider);
-/// ```
-#[macro_export]
-macro_rules! shared_extension_traits {
-    ($instance:expr => $($trait:path),* $(,)?) => {{
-        let __arc = std::sync::Arc::new($instance);
-        let __registrar: $crate::extensions::registry::ExtensionRegistrar = Box::new({
-            move |registry: &mut $crate::extensions::registry::LocalExtensionRegistry, name: &str| {
-                $(
-                    {
-                        // Compile-time check: ensure the trait is a valid SharedExtensionTrait.
-                        const _: fn() = || {
-                            fn assert_shared_trait<T: ?Sized + $crate::extensions::SharedExtensionTrait>() {}
-                            assert_shared_trait::<dyn $trait>();
-                        };
-                        // Coerce Arc<ConcreteType> → Arc<dyn Trait> (zero-cost)
-                        registry.register::<dyn $trait>(name, __arc.clone() as std::sync::Arc<dyn $trait>);
-                    }
-                )*
-            }
-        });
-        __registrar
-    }};
-}
-
-/// Generates a registrar closure that registers **local** `Rc<dyn Trait>` entries.
-///
-/// The instance is captured by value (`Send`) and wrapped in `Rc` on the worker
-/// thread — never crosses a thread boundary. Accessible only by local components.
-/// Use this for hot-path traits (rate limiters, quotas) where atomic/mutex
-/// overhead matters.
-///
-/// For registering both shared and local traits on the same instance, prefer
-/// [`extension_traits!`] instead.
-///
-/// # Example
-///
-/// ```ignore
-/// let registrar = local_extension_traits!(rate_limiter => local::RateLimiter);
-/// ```
-#[macro_export]
-macro_rules! local_extension_traits {
-    ($instance:expr => $($trait:path),* $(,)?) => {{
-        let __registrar: $crate::extensions::registry::ExtensionRegistrar = Box::new({
-            let __instance = $instance;
-            move |registry: &mut $crate::extensions::registry::LocalExtensionRegistry, name: &str| {
-                // Wrap in Rc on the worker thread (never crosses thread boundary)
-                let __rc = std::rc::Rc::new(__instance);
-                $(
-                    {
-                        // Compile-time check: ensure the trait is a valid LocalExtensionTrait.
-                        const _: fn() = || {
-                            fn assert_local_trait<T: ?Sized + $crate::extensions::LocalExtensionTrait>() {}
-                            assert_local_trait::<dyn $trait>();
-                        };
-                        // Coerce Rc<ConcreteType> → Rc<dyn Trait> (zero-cost)
-                        registry.register_local::<dyn $trait>(name, __rc.clone() as std::rc::Rc<dyn $trait>);
-                    }
-                )*
-            }
-        });
-        __registrar
-    }};
-}
-
-/// Generates a registrar closure that registers both **shared** and **local** traits
-/// on the same extension instance.
-///
-/// This is the preferred macro when an extension exposes traits for both shared
-/// components (`Arc<dyn Trait>`) and local components (`Rc<dyn Trait>`). The
-/// instance is cloned once — wrapped in `Arc` for shared traits and captured
-/// by value for local traits (wrapped in `Rc` on the worker thread).
+/// The instance type must implement `Clone + Send + 'static` and all listed traits.
 ///
 /// # Syntax
 ///
 /// ```ignore
-/// extension_traits!(instance =>
-///     shared(SharedTrait1, SharedTrait2),
-///     local(LocalTrait1, LocalTrait2),
-/// )
+/// let registrar = extension_traits!(instance => Trait1, Trait2);
 /// ```
-///
-/// Either `shared(...)` or `local(...)` may be omitted if only one kind is needed,
-/// but prefer [`shared_extension_traits!`] or [`local_extension_traits!`] in that case.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use otap_df_engine::extensions::{shared, local};
-/// let registrar = extension_traits!(extension =>
-///     shared(shared::BearerTokenProvider),
-///     local(local::BearerTokenProvider),
+/// use otap_df_engine::extensions::BearerTokenProvider;
+///
+/// let registrar = extension_traits!(my_auth_extension =>
+///     BearerTokenProvider,
 /// );
 /// ```
+///
+/// # Compile-Time Checks
+///
+/// The macro verifies at compile time that each trait is `Send + 'static` and
+/// that the concrete type implements the trait.
 #[macro_export]
 macro_rules! extension_traits {
-    // shared + local
-    ($instance:expr => shared($($shared_trait:path),* $(,)?), local($($local_trait:path),* $(,)?) $(,)?) => {{
+    ($instance:expr => $($trait:path),* $(,)?) => {{
         let __instance = $instance;
-        let __arc = std::sync::Arc::new(__instance.clone());
-        let __registrar: $crate::extensions::registry::ExtensionRegistrar = Box::new({
-            move |registry: &mut $crate::extensions::registry::LocalExtensionRegistry, name: &str| {
-                // Register shared (Arc) traits
+        let __registrar: $crate::extensions::ExtensionRegistrar = Box::new({
+            move |builder: &mut $crate::extensions::ExtensionRegistryBuilder, name: &str| {
                 $(
                     {
+                        // Compile-time check: the trait must be Send + 'static
                         const _: fn() = || {
-                            fn assert_shared<T: ?Sized + $crate::extensions::SharedExtensionTrait>() {}
-                            assert_shared::<dyn $shared_trait>();
+                            fn assert_send_static<T: ?Sized + Send + 'static>() {}
+                            assert_send_static::<dyn $trait>();
                         };
-                        registry.register::<dyn $shared_trait>(name, __arc.clone() as std::sync::Arc<dyn $shared_trait>);
-                    }
-                )*
-                // Register local (Rc) traits
-                let __rc = std::rc::Rc::new(__instance);
-                $(
-                    {
-                        const _: fn() = || {
-                            fn assert_local<T: ?Sized + $crate::extensions::LocalExtensionTrait>() {}
-                            assert_local::<dyn $local_trait>();
-                        };
-                        registry.register_local::<dyn $local_trait>(name, __rc.clone() as std::rc::Rc<dyn $local_trait>);
+
+                        // Clone the instance for this trait registration
+                        let __inst = __instance.clone();
+                        let trait_obj: Box<dyn $trait> = Box::new(__inst);
+                        builder.register(
+                            name,
+                            std::any::TypeId::of::<Box<dyn $trait>>(),
+                            Box::new(trait_obj) as Box<dyn std::any::Any + Send>,
+                        );
                     }
                 )*
             }
         });
         __registrar
     }};
-    // shared only (forwarded)
-    ($instance:expr => shared($($shared_trait:path),* $(,)?) $(,)?) => {
-        $crate::shared_extension_traits!($instance => $($shared_trait),*)
-    };
-    // local only (forwarded)
-    ($instance:expr => local($($local_trait:path),* $(,)?) $(,)?) => {
-        $crate::local_extension_traits!($instance => $($local_trait),*)
-    };
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::BearerToken;
-    use crate::extensions::shared;
+    use futures::future::BoxFuture;
     use tokio::sync::watch;
 
-    struct TestTokenProvider {
-        token: String,
+    // ── Test trait ───────────────────────────────────────────────────────
+
+    trait TestCapability: Send + 'static {
+        fn get_value(&self) -> i32;
     }
 
-    #[async_trait::async_trait]
-    impl shared::BearerTokenProvider for TestTokenProvider {
-        async fn get_token(&self) -> Result<BearerToken, crate::extensions::Error> {
-            Ok(BearerToken::new(self.token.clone(), 0))
-        }
-
-        fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-            let (tx, rx) = watch::channel(None);
-            drop(tx);
-            rx
-        }
+    trait AnotherCapability: Send + 'static {
+        fn get_name(&self) -> String;
     }
 
-    // ── Shared registry tests ────────────────────────────────────────────────
+    // ── Test extension ──────────────────────────────────────────────────
 
-    #[test]
-    fn test_shared_register_and_get() {
-        let instance = TestTokenProvider {
-            token: "test_token".to_string(),
-        };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
-
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "test_ext");
-
-        let result: Result<Arc<dyn shared::BearerTokenProvider>, _> =
-            registry.get_shared::<dyn shared::BearerTokenProvider>("test_ext");
-        assert!(result.is_ok());
+    #[derive(Clone)]
+    struct TestExtension {
+        value: i32,
+        name: String,
     }
 
-    #[test]
-    fn test_shared_get_returns_shared_arc() {
-        let instance = TestTokenProvider {
-            token: "shared_test".to_string(),
-        };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
-
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "ext");
-
-        let a: Arc<dyn shared::BearerTokenProvider> =
-            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
-        let b: Arc<dyn shared::BearerTokenProvider> =
-            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
-
-        assert!(Arc::ptr_eq(&a, &b));
-    }
-
-    #[test]
-    fn test_shared_registry_clone_shares_instances() {
-        let instance = TestTokenProvider {
-            token: "clone_test".to_string(),
-        };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
-
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "ext");
-
-        let cloned = registry.clone();
-
-        let from_original: Arc<dyn shared::BearerTokenProvider> =
-            registry.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
-        let from_clone: Arc<dyn shared::BearerTokenProvider> =
-            cloned.get_shared::<dyn shared::BearerTokenProvider>("ext").unwrap();
-
-        assert!(Arc::ptr_eq(&from_original, &from_clone));
-    }
-
-    #[test]
-    fn test_shared_not_found() {
-        let registry = LocalExtensionRegistry::new();
-        let result = registry.get_shared::<dyn shared::BearerTokenProvider>("missing");
-        assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
-    }
-
-    #[test]
-    fn test_shared_trait_not_implemented() {
-        let instance = TestTokenProvider {
-            token: "test".to_string(),
-        };
-        let mut registry = SharedExtensionRegistry::new();
-        registry.register::<dyn shared::BearerTokenProvider>(
-            "my_ext",
-            Arc::new(instance) as Arc<dyn shared::BearerTokenProvider>,
-        );
-
-        let key = (
-            "my_ext".to_string(),
-            TypeId::of::<Arc<dyn std::fmt::Display + Send + Sync>>(),
-        );
-        assert!(registry.handles.get(&key).is_none());
-        assert!(registry.contains("my_ext"));
-    }
-
-    // ── Local registry tests ─────────────────────────────────────────────────
-
-    trait TestLocalTrait {
-        fn value(&self) -> u64;
-    }
-
-    struct TestLocalImpl {
-        val: u64,
-    }
-
-    impl TestLocalTrait for TestLocalImpl {
-        fn value(&self) -> u64 {
-            self.val
+    impl TestCapability for TestExtension {
+        fn get_value(&self) -> i32 {
+            self.value
         }
     }
 
-    // Seal the test-only local trait.
-    impl crate::extensions::private::Sealed for dyn TestLocalTrait {}
-    impl crate::extensions::LocalExtensionTrait for dyn TestLocalTrait {}
+    impl AnotherCapability for TestExtension {
+        fn get_name(&self) -> String {
+            self.name.clone()
+        }
+    }
+
+    // ── Basic tests ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_local_register_and_get() {
-        let mut registry = LocalExtensionRegistry::new();
-        let instance = TestLocalImpl { val: 42 };
-        registry.register_local::<dyn TestLocalTrait>("limiter", Rc::new(instance));
+    fn test_empty_builder() {
+        let builder = ExtensionRegistryBuilder::new();
+        assert!(builder.is_empty());
+        assert_eq!(builder.extension_count(), 0);
 
-        let result = registry.get::<dyn TestLocalTrait>("limiter");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().value(), 42);
+        let registry = builder.build();
+        assert!(registry.is_empty());
     }
 
     #[test]
-    fn test_local_get_returns_shared_rc() {
-        let mut registry = LocalExtensionRegistry::new();
-        let instance = TestLocalImpl { val: 99 };
-        registry.register_local::<dyn TestLocalTrait>("ext", Rc::new(instance));
-
-        let a = registry.get::<dyn TestLocalTrait>("ext").unwrap();
-        let b = registry.get::<dyn TestLocalTrait>("ext").unwrap();
-
-        assert!(Rc::ptr_eq(&a, &b));
-    }
-
-    #[test]
-    fn test_local_not_found() {
-        let registry = LocalExtensionRegistry::new();
-        let result = registry.get::<dyn TestLocalTrait>("missing");
-        assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
-    }
-
-    #[test]
-    fn test_local_trait_not_implemented_when_only_shared_exists() {
-        let instance = TestTokenProvider {
-            token: "t".to_string(),
+    fn test_register_and_retrieve_single_trait() {
+        let ext = TestExtension {
+            value: 42,
+            name: "test".to_string(),
         };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
 
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "auth");
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "my_ext");
 
-        let result = registry.get::<dyn TestLocalTrait>("auth");
+        assert_eq!(builder.extension_count(), 1);
+
+        let registry = builder.build();
+        let value = registry
+            .with_extension::<dyn TestCapability, _>("my_ext", |ext| ext.get_value())
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn test_register_multiple_traits() {
+        let ext = TestExtension {
+            value: 99,
+            name: "hello".to_string(),
+        };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability, AnotherCapability);
+        registrar(&mut builder, "multi_ext");
+
+        let registry = builder.build();
+        let value = registry
+            .with_extension::<dyn TestCapability, _>("multi_ext", |ext| ext.get_value())
+            .unwrap();
+        let name = registry
+            .with_extension::<dyn AnotherCapability, _>("multi_ext", |ext| ext.get_name())
+            .unwrap();
+        assert_eq!(value, 99);
+        assert_eq!(name, "hello");
+    }
+
+    #[test]
+    fn test_not_found_error() {
+        let registry = ExtensionRegistry::new();
+        let result = registry.with_extension::<dyn TestCapability, _>("nonexistent", |_| ());
         assert!(matches!(
             result,
-            Err(ExtensionError::TraitNotImplemented { .. })
+            Err(ExtensionError::NotFound { name }) if name == "nonexistent"
         ));
     }
 
-    // ── Mixed registry tests ─────────────────────────────────────────────────
-
     #[test]
-    fn test_contains_checks_both_maps() {
-        let instance = TestTokenProvider {
-            token: "t".to_string(),
+    fn test_trait_not_implemented_error() {
+        let ext = TestExtension {
+            value: 1,
+            name: "x".to_string(),
         };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
 
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "shared_ext");
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "partial_ext");
 
-        let local_impl = TestLocalImpl { val: 1 };
-        registry.register_local::<dyn TestLocalTrait>("local_ext", Rc::new(local_impl));
-
-        assert!(registry.contains("shared_ext"));
-        assert!(registry.contains("local_ext"));
-        assert!(!registry.contains("missing"));
+        let registry = builder.build();
+        let result =
+            registry.with_extension::<dyn AnotherCapability, _>("partial_ext", |_| ());
+        assert!(matches!(
+            result,
+            Err(ExtensionError::TraitNotImplemented { name, .. }) if name == "partial_ext"
+        ));
     }
 
     #[test]
-    fn test_len_counts_unique_names_across_maps() {
-        let instance = TestTokenProvider {
-            token: "t".to_string(),
+    fn test_shared_instance_via_clone() {
+        // All clones share the same extension instances (Arc-backed).
+        let ext = TestExtension {
+            value: 10,
+            name: "shared".to_string(),
         };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
 
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "ext_a");
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "ext");
 
-        let local_impl = TestLocalImpl { val: 1 };
-        registry.register_local::<dyn TestLocalTrait>("ext_b", Rc::new(local_impl));
+        let registry = builder.build();
+        let clone1 = registry.clone();
+        let clone2 = registry.clone();
 
-        assert_eq!(registry.len(), 2);
-        assert!(!registry.is_empty());
-    }
+        // All clones access the same instance
+        let v1 = clone1
+            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
+            .unwrap();
+        let v2 = clone2
+            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
+            .unwrap();
+        assert_eq!(v1, 10);
+        assert_eq!(v2, 10);
 
-    // ── Error display ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_extension_error_display() {
-        let not_found = ExtensionError::NotFound {
-            name: "missing_ext".to_string(),
-        };
-        let display = format!("{}", not_found);
-        assert!(display.contains("missing_ext"));
-        assert!(display.contains("not found"));
-
-        let not_impl = ExtensionError::TraitNotImplemented {
-            name: "my_ext".to_string(),
-            expected: "BearerTokenProvider",
-        };
-        let display = format!("{}", not_impl);
-        assert!(display.contains("my_ext"));
-        assert!(display.contains("BearerTokenProvider"));
-    }
-
-    // ── Debug ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_local_registry_debug() {
-        let instance = TestTokenProvider {
-            token: "test".to_string(),
-        };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
-
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "test_ext");
-
-        let debug_str = format!("{:?}", registry);
-        assert!(debug_str.contains("LocalExtensionRegistry"));
-        assert!(debug_str.contains("test_ext"));
+        // Verify they share the same Arc
+        assert!(Arc::ptr_eq(&registry.entries, &clone1.entries));
+        assert!(Arc::ptr_eq(&registry.entries, &clone2.entries));
     }
 
     #[test]
-    fn test_shared_registry_debug() {
-        let instance = TestTokenProvider {
-            token: "test".to_string(),
+    fn test_multiple_extensions() {
+        let auth = TestExtension {
+            value: 1,
+            name: "auth".to_string(),
         };
-        let mut registry = SharedExtensionRegistry::new();
-        registry.register::<dyn shared::BearerTokenProvider>(
-            "ext",
-            Arc::new(instance) as Arc<dyn shared::BearerTokenProvider>,
-        );
+        let rate = TestExtension {
+            value: 2,
+            name: "rate".to_string(),
+        };
 
-        let debug_str = format!("{:?}", registry);
-        assert!(debug_str.contains("SharedExtensionRegistry"));
-        assert!(debug_str.contains("ext"));
+        let mut builder = ExtensionRegistryBuilder::new();
+        let r1 = extension_traits!(auth => TestCapability, AnotherCapability);
+        r1(&mut builder, "auth");
+        let r2 = extension_traits!(rate => TestCapability, AnotherCapability);
+        r2(&mut builder, "rate");
+
+        assert_eq!(builder.extension_count(), 2);
+
+        let registry = builder.build();
+        let auth_val = registry
+            .with_extension::<dyn TestCapability, _>("auth", |ext| ext.get_value())
+            .unwrap();
+        let rate_val = registry
+            .with_extension::<dyn TestCapability, _>("rate", |ext| ext.get_value())
+            .unwrap();
+        assert_eq!(auth_val, 1);
+        assert_eq!(rate_val, 2);
     }
-
-    // ── Send/Sync assertions ─────────────────────────────────────────────────
 
     #[test]
-    fn test_shared_registry_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SharedExtensionRegistry>();
+    fn test_contains() {
+        let ext = TestExtension {
+            value: 0,
+            name: "".to_string(),
+        };
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "exists");
+
+        let registry = builder.build();
+        assert!(registry.contains("exists"));
+        assert!(!registry.contains("nope"));
     }
 
-    // LocalExtensionRegistry is intentionally !Send and !Sync (contains Rc).
-    // This is verified by the compiler — any attempt to send it across threads
-    // will fail to compile, just like Rc<RefCell<...>> for local channel metrics.
+    #[test]
+    fn test_extension_count() {
+        let ext = TestExtension {
+            value: 0,
+            name: "".to_string(),
+        };
+        let mut builder = ExtensionRegistryBuilder::new();
+        let r1 = extension_traits!(ext.clone() => TestCapability, AnotherCapability);
+        r1(&mut builder, "a");
+        let r2 = extension_traits!(ext => TestCapability);
+        r2(&mut builder, "b");
 
-    // ── Functional tests ─────────────────────────────────────────────────────
+        let registry = builder.build();
+        assert_eq!(registry.extension_count(), 2);
+    }
+
+    #[test]
+    fn test_debug_formatting() {
+        let ext = TestExtension {
+            value: 0,
+            name: "".to_string(),
+        };
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "debug_ext");
+
+        let debug = format!("{:?}", builder);
+        assert!(debug.contains("debug_ext"));
+
+        let registry = builder.build();
+        let debug = format!("{:?}", registry);
+        assert!(debug.contains("debug_ext"));
+    }
+
+    // ── Send / Clone assertions ─────────────────────────────────────────
+
+    #[test]
+    fn test_builder_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ExtensionRegistryBuilder>();
+    }
+
+    #[test]
+    fn test_registry_is_send_and_clone() {
+        fn assert_send_clone<T: Send + Clone>() {}
+        assert_send_clone::<ExtensionRegistry>();
+    }
+
+    #[test]
+    fn test_registrar_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ExtensionRegistrar>();
+    }
+
+    // ── Sequential access (no deadlock) ─────────────────────────────────
+
+    #[test]
+    fn test_sequential_access_same_extension() {
+        let ext = TestExtension {
+            value: 42,
+            name: "multi".to_string(),
+        };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "ext");
+
+        let registry = builder.build();
+
+        // Sequential access is fine — lock released between calls
+        let v1 = registry
+            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
+            .unwrap();
+        let v2 = registry
+            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
+            .unwrap();
+        assert_eq!(v1, 42);
+        assert_eq!(v2, 42);
+    }
+
+    #[test]
+    fn test_different_traits_same_extension_concurrent() {
+        // Different traits of the same extension have separate mutexes
+        let ext = TestExtension {
+            value: 42,
+            name: "test".to_string(),
+        };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability, AnotherCapability);
+        registrar(&mut builder, "ext");
+
+        let registry = builder.build();
+
+        // Access different traits — each has its own mutex, no contention
+        let value = registry
+            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
+            .unwrap();
+        let name = registry
+            .with_extension::<dyn AnotherCapability, _>("ext", |ext| ext.get_name())
+            .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(name, "test");
+    }
+
+    // ── Async trait pattern test ────────────────────────────────────────
+
+    trait AsyncCapability: Send + 'static {
+        fn do_work(
+            &self,
+        ) -> BoxFuture<'static, Result<String, Box<dyn std::error::Error + Send + Sync>>>;
+    }
+
+    #[derive(Clone)]
+    struct AsyncExtension {
+        prefix: String,
+    }
+
+    impl AsyncCapability for AsyncExtension {
+        fn do_work(
+            &self,
+        ) -> BoxFuture<'static, Result<String, Box<dyn std::error::Error + Send + Sync>>>
+        {
+            let prefix = self.prefix.clone();
+            Box::pin(async move { Ok(format!("{prefix}_done")) })
+        }
+    }
 
     #[tokio::test]
-    async fn test_get_extension_actually_works() {
-        let instance = TestTokenProvider {
-            token: "real_token".to_string(),
+    async fn test_async_extension_pattern() {
+        let ext = AsyncExtension {
+            prefix: "test".to_string(),
         };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
 
-        let mut registry = LocalExtensionRegistry::new();
-        registrar(&mut registry, "auth");
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => AsyncCapability);
+        registrar(&mut builder, "async_ext");
 
-        let provider: Arc<dyn shared::BearerTokenProvider> =
-            registry.get_shared::<dyn shared::BearerTokenProvider>("auth").unwrap();
-        let token = provider.get_token().await.unwrap();
-        assert_eq!(token.token.secret(), "real_token");
+        let registry = builder.build();
+
+        // Get the future inside the closure, await outside (lock released)
+        let fut = registry
+            .with_extension::<dyn AsyncCapability, _>("async_ext", |ext| ext.do_work())
+            .unwrap();
+        let result = fut.await.unwrap();
+        assert_eq!(result, "test_done");
+    }
+
+    // ── Reactive subscription pattern test ──────────────────────────────
+
+    trait Subscribable: Send + 'static {
+        fn subscribe(&self) -> watch::Receiver<i32>;
+    }
+
+    #[derive(Clone)]
+    struct WatchExtension {
+        tx: watch::Sender<i32>,
+    }
+
+    impl Subscribable for WatchExtension {
+        fn subscribe(&self) -> watch::Receiver<i32> {
+            self.tx.subscribe()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscription_pattern() {
+        let (tx, _rx) = watch::channel(0);
+        let ext = WatchExtension { tx: tx.clone() };
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => Subscribable);
+        registrar(&mut builder, "watch_ext");
+
+        let registry = builder.build();
+
+        // Get subscription handle inside closure, use outside
+        let mut rx = registry
+            .with_extension::<dyn Subscribable, _>("watch_ext", |ext| ext.subscribe())
+            .unwrap();
+
+        // Send a value and verify receipt
+        tx.send(42).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 42);
+    }
+
+    // ── Clone shares state ──────────────────────────────────────────────
+
+    #[test]
+    fn test_clone_shares_same_arc() {
+        let ext = TestExtension {
+            value: 0,
+            name: "".to_string(),
+        };
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => TestCapability);
+        registrar(&mut builder, "ext");
+
+        let registry = builder.build();
+        let clone = registry.clone();
+
+        // Both point to the same Arc
+        assert!(Arc::ptr_eq(&registry.entries, &clone.entries));
+    }
+
+    // ── Re-entrant access returns AlreadyBorrowed ───────────────────────
+
+    #[test]
+    fn test_reentrant_access_returns_error() {
+        // Re-entrant access to the SAME (name, trait) pair returns AlreadyBorrowed
+        trait ReentrantCapability: Send + 'static {
+            fn try_reenter(&self, registry: &ExtensionRegistry) -> Result<(), ExtensionError>;
+        }
+
+        #[derive(Clone)]
+        struct ReentrantExt;
+
+        impl ReentrantCapability for ReentrantExt {
+            fn try_reenter(&self, registry: &ExtensionRegistry) -> Result<(), ExtensionError> {
+                // Try to access the same extension while it's already locked
+                registry.with_extension::<dyn ReentrantCapability, _>("ext", |_| ())
+            }
+        }
+
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ReentrantExt => ReentrantCapability);
+        registrar(&mut builder, "ext");
+
+        let registry = builder.build();
+
+        // The outer call succeeds, but the inner re-entrant call returns AlreadyBorrowed
+        let result = registry
+            .with_extension::<dyn ReentrantCapability, _>("ext", |ext| {
+                ext.try_reenter(&registry)
+            })
+            .unwrap();
+        assert!(matches!(result, Err(ExtensionError::AlreadyBorrowed { .. })));
+    }
+
+    // ── Interior mutability with Cell ──────────────────────────────────
+
+    trait Counter: Send + 'static {
+        fn increment(&self);
+        fn count(&self) -> u64;
+    }
+
+    #[derive(Clone)]
+    struct CellCounter {
+        count: std::cell::Cell<u64>,
+    }
+
+    impl Counter for CellCounter {
+        fn increment(&self) {
+            self.count.set(self.count.get() + 1);
+        }
+
+        fn count(&self) -> u64 {
+            self.count.get()
+        }
     }
 
     #[test]
-    fn test_multiple_extensions_same_trait() {
-        let prod = TestTokenProvider {
-            token: "prod_token".to_string(),
-        };
-        let staging = TestTokenProvider {
-            token: "staging_token".to_string(),
+    fn test_interior_mutability_with_cell() {
+        let ext = CellCounter {
+            count: std::cell::Cell::new(0),
         };
 
-        let reg_prod = crate::shared_extension_traits!(prod => shared::BearerTokenProvider);
-        let reg_staging = crate::shared_extension_traits!(staging => shared::BearerTokenProvider);
+        let mut builder = ExtensionRegistryBuilder::new();
+        let registrar = extension_traits!(ext => Counter);
+        registrar(&mut builder, "counter");
 
-        let mut registry = LocalExtensionRegistry::new();
-        reg_prod(&mut registry, "azure_prod");
-        reg_staging(&mut registry, "azure_staging");
+        let registry = builder.build();
 
-        assert_eq!(registry.len(), 2);
-
-        let p1 = registry
-            .get_shared::<dyn shared::BearerTokenProvider>("azure_prod")
-            .unwrap();
-        let p2 = registry
-            .get_shared::<dyn shared::BearerTokenProvider>("azure_staging")
-            .unwrap();
-
-        assert!(!Arc::ptr_eq(&p1, &p2));
-    }
-
-    /// Proves each pipeline gets its own extension instance.
-    #[test]
-    fn test_separate_pipelines_get_separate_instances() {
-        let instance1 = TestTokenProvider {
-            token: "pipeline1_token".to_string(),
-        };
-        let registrar1 = crate::shared_extension_traits!(instance1 => shared::BearerTokenProvider);
-        let mut registry1 = LocalExtensionRegistry::new();
-        registrar1(&mut registry1, "azure_auth");
-
-        let instance2 = TestTokenProvider {
-            token: "pipeline2_token".to_string(),
-        };
-        let registrar2 = crate::shared_extension_traits!(instance2 => shared::BearerTokenProvider);
-        let mut registry2 = LocalExtensionRegistry::new();
-        registrar2(&mut registry2, "azure_auth");
-
-        let p1: Arc<dyn shared::BearerTokenProvider> = registry1
-            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
-            .unwrap();
-        let p2: Arc<dyn shared::BearerTokenProvider> = registry2
-            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
+        // Mutate through shared reference — Cell works because Mutex
+        // only requires T: Send (not T: Sync), and Cell<u64> is Send.
+        registry
+            .with_extension::<dyn Counter, _>("counter", |c| {
+                assert_eq!(c.count(), 0);
+                c.increment();
+                c.increment();
+                c.increment();
+                assert_eq!(c.count(), 3);
+            })
             .unwrap();
 
-        assert!(
-            !Arc::ptr_eq(&p1, &p2),
-            "separate pipelines must have separate extension instances"
-        );
-
-        let registry1_clone = registry1.clone();
-        let p1_again: Arc<dyn shared::BearerTokenProvider> = registry1_clone
-            .get_shared::<dyn shared::BearerTokenProvider>("azure_auth")
+        // State persists across calls
+        let count = registry
+            .with_extension::<dyn Counter, _>("counter", |c| c.count())
             .unwrap();
-        assert!(
-            Arc::ptr_eq(&p1, &p1_again),
-            "same pipeline must share the same extension instance"
-        );
-    }
-
-    /// Proves that extracting the shared registry preserves Arc identity.
-    #[test]
-    fn test_into_shared_preserves_arc_identity() {
-        let instance = TestTokenProvider {
-            token: "test".to_string(),
-        };
-        let registrar = crate::shared_extension_traits!(instance => shared::BearerTokenProvider);
-
-        let mut local_reg = LocalExtensionRegistry::new();
-        registrar(&mut local_reg, "auth");
-
-        let from_local: Arc<dyn shared::BearerTokenProvider> = local_reg
-            .get_shared::<dyn shared::BearerTokenProvider>("auth")
-            .unwrap();
-
-        let shared_reg = local_reg.into_shared();
-        let from_shared: Arc<dyn shared::BearerTokenProvider> = shared_reg
-            .get::<dyn shared::BearerTokenProvider>("auth")
-            .unwrap();
-
-        assert!(Arc::ptr_eq(&from_local, &from_shared));
+        assert_eq!(count, 3);
     }
 }

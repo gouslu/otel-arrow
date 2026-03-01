@@ -8,7 +8,7 @@ use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::extensions::local;
+use otap_df_engine::extensions::{BearerTokenProvider, ExtensionRegistry};
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
@@ -436,7 +436,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
         mut self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        extension_registry: local::ExtensionRegistry,
+        extension_registry: ExtensionRegistry,
     ) -> Result<TerminalState, EngineError> {
         effect_handler
             .info(&format!(
@@ -447,9 +447,11 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
         let mut msg_id = 0;
 
-        // Look up the auth extension from the registry
-        let auth = extension_registry
-            .get::<dyn local::BearerTokenProvider>(&self.config.auth)
+        // Look up the auth extension from the registry.
+        let mut token_rx = extension_registry
+            .with_extension::<dyn BearerTokenProvider, _>(&self.config.auth, |auth| {
+                auth.subscribe_token_refresh()
+            })
             .map_err(|e| {
                 let error = Error::AuthHandlerCreation(Box::new(e));
                 EngineError::InternalError {
@@ -466,9 +468,6 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                     message: error.to_string(),
                 }
             })?;
-
-        // Subscribe to token refresh events from the auth extension
-        let mut token_rx = auth.subscribe_token_refresh();
 
         // Wait for the initial token — blocks until the auth extension provides one
         otel_info!("azure_monitor_exporter.auth.waiting_for_initial_token");

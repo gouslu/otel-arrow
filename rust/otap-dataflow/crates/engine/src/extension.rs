@@ -179,12 +179,12 @@ pub struct ExtensionWrapper<PData> {
     runtime_config: ExtensionConfig,
     /// The extension instance.
     extension: Box<dyn Extension<PData>>,
-    /// Registrar closure that populates the `ExtensionRegistry` with this
-    /// extension's trait implementations.
+    /// Registrar closure that populates the `ExtensionRegistryBuilder` with
+    /// this extension's trait factories.
     ///
-    /// Produced by the `shared_extension_traits!` or `local_extension_traits!`
-    /// macro. Taken during pipeline build and invoked once to register
-    /// `Arc<dyn Trait>` (shared) or `Rc<dyn Trait>` (local) entries.
+    /// Produced by the [`extension_traits!`] macro. Taken during pipeline
+    /// build and invoked once to register factory closures that clone the
+    /// extension instance and wrap it as `Box<dyn Trait>`.
     registrar: Option<ExtensionRegistrar>,
     /// A sender for control messages.
     control_sender: LocalSender<NodeControlMsg<PData>>,
@@ -207,9 +207,8 @@ impl<PData> ExtensionWrapper<PData> {
     /// # Arguments
     ///
     /// * `extension` - The extension instance that handles the lifecycle (must be `Send`)
-    /// * `registrar` - A registrar closure from `shared_extension_traits!` or
-    ///   `local_extension_traits!` that will populate the `ExtensionRegistry`
-    ///   with trait entries for this extension.
+    /// * `registrar` - A registrar closure from [`extension_traits!`] that will
+    ///   populate the `ExtensionRegistryBuilder` with trait factories for this extension.
     /// * `node_id` - The node identifier
     /// * `user_config` - The user configuration
     /// * `config` - The extension runtime configuration
@@ -241,7 +240,7 @@ impl<PData> ExtensionWrapper<PData> {
     /// Takes the registrar closure from this wrapper, leaving `None` in its place.
     ///
     /// This is called during pipeline initialization to register the extension's
-    /// trait implementations in the central `ExtensionRegistry`.
+    /// trait factories in the `ExtensionRegistryBuilder`.
     pub fn take_registrar(&mut self) -> Option<ExtensionRegistrar> {
         self.registrar.take()
     }

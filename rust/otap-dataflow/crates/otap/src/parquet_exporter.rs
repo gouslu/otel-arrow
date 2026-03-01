@@ -153,7 +153,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
         mut self: Box<Self>,
         mut msg_chan: MessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
-        _extension_registry: otap_df_engine::extensions::local::ExtensionRegistry,
+        _extension_registry: otap_df_engine::extensions::ExtensionRegistry,
     ) -> Result<TerminalState, Error> {
         let exporter_id = effect_handler.exporter_id();
         let object_store =
@@ -921,7 +921,7 @@ mod test {
             let (_metrics_rx, metrics_reporter) =
                 otap_df_telemetry::reporter::MetricsReporter::create_new_and_receiver(1);
             exporter
-                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::local::ExtensionRegistry::new())
+                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::ExtensionRegistryBuilder::new().build())
                 .await
                 .map(|_| ())
         }
@@ -1071,7 +1071,7 @@ mod test {
             let (_metrics_rx, metrics_reporter) =
                 otap_df_telemetry::reporter::MetricsReporter::create_new_and_receiver(1);
             exporter
-                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::local::ExtensionRegistry::new())
+                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::ExtensionRegistryBuilder::new().build())
                 .await
                 .map(|_| ())
         }
@@ -1219,7 +1219,7 @@ mod test {
             let (_metrics_rx, metrics_reporter) =
                 otap_df_telemetry::reporter::MetricsReporter::create_new_and_receiver(1);
             exporter
-                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::local::ExtensionRegistry::new())
+                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::ExtensionRegistryBuilder::new().build())
                 .await
                 .map(|_| ())
         }
@@ -1462,7 +1462,7 @@ mod test {
             metrics_reporter: otap_df_telemetry::reporter::MetricsReporter,
         ) -> Result<(), Error> {
             exporter
-                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::local::ExtensionRegistry::new())
+                .start(pipeline_ctrl_msg_tx, metrics_reporter, otap_df_engine::extensions::ExtensionRegistryBuilder::new().build())
                 .await
                 .map(|_| ())
         }

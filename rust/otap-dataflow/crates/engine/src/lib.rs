@@ -683,14 +683,15 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             }
         }
 
-        // Build extension registry from registrar closures.
-        // Uses ExtensionRegistry which holds both shared (Arc) and local (Rc)
-        // trait entries. Created on the worker thread — never crosses thread boundaries.
-        let mut extension_registry = extensions::local::ExtensionRegistry::new();
+        // Build extension registry builder from registrar closures.
+        // Each registrar registers boxed trait objects for the concrete extension.
+        // The builder is consumed by .build() to create a shared Arc-backed registry
+        // that all components share via cheap cloning.
+        let mut extension_registry_builder = extensions::ExtensionRegistryBuilder::new();
         for ext in &mut extensions {
             let name = ext.node_id().name.as_ref().to_string();
             if let Some(registrar) = ext.take_registrar() {
-                registrar(&mut extension_registry, &name);
+                registrar(&mut extension_registry_builder, &name);
             }
         }
 
@@ -706,7 +707,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             processors,
             exporters,
             extensions,
-            extension_registry,
+            extension_registry_builder,
             nodes,
             telemetry_policy,
         );
