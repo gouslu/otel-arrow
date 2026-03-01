@@ -30,10 +30,8 @@
 //! Consumers retrieve the extension by name from the registry:
 //!
 //! ```ignore
-/// let mut token_rx = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
-///     "azure_auth",
-///     |auth| auth.subscribe_token_refresh(),
-/// )?;
+/// let auth = extension_registry.handle::<dyn BearerTokenProvider>("azure_auth")?;
+/// let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
 /// ```
 
 use linkme::distributed_slice;

@@ -14,22 +14,24 @@
 //!
 //! 2. **Run phase** ([`ExtensionRegistry`]): An `Arc`-backed, cheaply `Clone`-able
 //!    registry. All components share the **same** extension instances — true
-//!    single instance, no cloning. Access is via [`ExtensionRegistry::with_extension`],
-//!    which acquires a `parking_lot::Mutex` lock and passes `&T` to a closure.
+//!    single instance, no cloning. Access is via [`ExtensionRegistry::handle`],
+//!    which returns an [`ExtensionHandle`] for acquiring a `parking_lot::Mutex` lock.
 //!
 //! # Mutex-based access
 //!
 //! Access uses `parking_lot::Mutex` — a fast, uncontended lock (~2-3ns on
-//! single-threaded runtimes). The closure-based API ensures the lock is held
-//! for the minimum duration and automatically released.
+//! single-threaded runtimes). The handle + closure-based API ensures the lock
+//! is held for the minimum duration and automatically released.
 //!
-//! - [`with_extension`](ExtensionRegistry::with_extension) acquires the lock,
-//!   downcasts to `&T`, calls your closure, and releases the lock.
+//! - [`handle`](ExtensionRegistry::handle) returns an [`ExtensionHandle`] that
+//!   captures the mutex reference. [`ExtensionHandle::lock`] acquires the lock
+//!   (blocking), downcasts to `&T`, calls your closure, and releases the lock.
 //! - The lock is **not** held across `.await` — extract owned values (futures,
 //!   receivers, etc.) from the closure and await them outside.
-//! - Re-entrant access to *different* extensions is fine (separate mutex per
-//!   entry). Accessing the *same* extension while already holding its lock
-//!   will return `Err(AlreadyBorrowed)` (via `try_lock`).
+//! - Accessing *different* extensions or different traits of the same extension
+//!   is never blocked (separate mutex per entry).
+//! - In debug builds, re-entrant access to the *same* (name, trait) pair on the
+//!   same thread panics with a clear message. In release builds it would deadlock.
 //!
 //! # Why Mutex instead of lock-free?
 //!
@@ -39,6 +41,11 @@
 //! `tokio::spawn`, tonic, or any multi-threaded context. The `parking_lot`
 //! Mutex is effectively zero-cost on single-threaded runtimes and remains
 //! sound regardless of runtime configuration.
+//!
+//! The lock uses `Mutex::lock()` (blocking) rather than `try_lock()` so it
+//! works correctly in multi-threaded contexts (e.g., tonic gRPC handlers)
+//! where brief cross-thread contention is normal. Re-entrancy bugs are
+//! caught via `debug_assert!` in debug builds.
 //!
 //! # Interior mutability
 //!
@@ -63,6 +70,48 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use thiserror::Error;
 
+// ── Nesting detection (debug builds only) ────────────────────────────────────
+
+// Thread-local counter tracking how many extension locks are currently held on
+// this thread. Any nesting (same key or different keys) is banned to prevent
+// both re-entrant deadlocks and ABBA deadlocks. Zero cost in release builds.
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static HELD_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// In debug builds, assert that no extension lock is currently held on this
+/// thread. Panics if nesting is detected — this catches both same-key
+/// re-entrancy and ABBA (different-key, opposite-order) deadlock patterns.
+#[cfg(debug_assertions)]
+fn assert_no_nesting(name: &str) {
+    HELD_COUNT.with(|count| {
+        assert!(
+            count.get() == 0,
+            "Nested extension access detected while accessing '{}': another extension lock is \
+             already held on this thread. This risks deadlock. Extract values from the `lock` \
+             closure instead of nesting calls.",
+            name
+        );
+    });
+}
+
+/// In debug builds, increment the held lock count.
+#[cfg(debug_assertions)]
+fn mark_held() {
+    HELD_COUNT.with(|count| {
+        count.set(count.get() + 1);
+    });
+}
+
+/// In debug builds, decrement the held lock count.
+#[cfg(debug_assertions)]
+fn unmark_held() {
+    HELD_COUNT.with(|count| {
+        count.set(count.get() - 1);
+    });
+}
+
 // ── Error Types ──────────────────────────────────────────────────────────────
 
 /// Errors that can occur when retrieving extensions from the registry.
@@ -84,16 +133,6 @@ pub enum ExtensionError {
         expected: &'static str,
     },
 
-    /// The extension is currently borrowed by another caller.
-    ///
-    /// This happens when `with_extension` is called re-entrantly for the
-    /// *same* (name, trait) pair. Access to *different* extensions or
-    /// different traits of the same extension is always fine.
-    #[error("extension '{name}' is already borrowed")]
-    AlreadyBorrowed {
-        /// Name of the extension.
-        name: String,
-    },
 }
 
 // ── ExtensionRegistrar ───────────────────────────────────────────────────────
@@ -229,33 +268,39 @@ impl std::fmt::Debug for ExtensionRegistryBuilder {
 ///
 /// Created by [`ExtensionRegistryBuilder::build`] and cheaply cloned via `Arc`.
 /// All components share the same extension instances. Access is via
-/// [`with_extension`](Self::with_extension), which acquires a per-entry
-/// `parking_lot::Mutex` lock and passes `&T` to a closure.
+/// [`handle`](Self::handle), which returns an [`ExtensionHandle`] that can be
+/// used to acquire a per-entry `parking_lot::Mutex` lock.
 ///
 /// # Usage pattern
 ///
+/// Obtain a handle once during initialization, then use it repeatedly.
 /// Extract owned values from the closure — don't hold the lock across `.await`:
 ///
 /// ```ignore
+/// // Get handle once:
+/// let auth = extension_registry.handle::<dyn BearerTokenProvider>("azure_identity_auth")?;
+///
 /// // Get an owned future (lock released before await):
-/// let token_future = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
-///     "azure_identity_auth",
-///     |auth| auth.get_token(),
-/// )?;
-/// let token = token_future.await?;
+/// let token = auth.lock(|a| a.get_token()).await?;
 ///
 /// // Get an owned subscription handle:
-/// let mut token_rx = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
-///     "azure_identity_auth",
-///     |auth| auth.subscribe_token_refresh(),
-/// )?;
+/// let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
 /// ```
 ///
 /// # Concurrency
 ///
 /// Each (name, trait) pair has its own `Mutex`. Accessing different extensions
-/// or different traits of the same extension is never blocked. Re-entrant
-/// access to the *same* (name, trait) pair returns `Err(AlreadyBorrowed)`.
+/// or different traits of the same extension is never blocked. The lock is
+/// acquired via `Mutex::lock()` (blocking), which is safe for both single-
+/// threaded and multi-threaded (tonic) contexts.
+///
+/// # Re-entrancy detection (debug builds only)
+///
+/// In debug builds, a thread-local counter detects nested `lock`
+/// calls and panics with a clear message. This catches both same-key re-entrancy
+/// and ABBA (different-key, opposite-order) deadlock patterns. In release builds,
+/// nesting would silently deadlock. Always extract values from the closure
+/// instead of nesting calls.
 #[derive(Clone)]
 pub struct ExtensionRegistry {
     /// `(extension_name, TypeId::of::<Box<dyn Trait>>())` → `Mutex<Box<dyn Any + Send>>`
@@ -285,78 +330,24 @@ impl ExtensionRegistry {
         }
     }
 
-    /// Access an extension trait by name via a scoped closure.
+    /// Obtain a lightweight handle for repeated access to an extension trait.
     ///
-    /// Acquires the per-entry `Mutex` lock (via `try_lock` to prevent
-    /// deadlocks), downcasts to `&T`, calls the closure, and releases
-    /// the lock. The closure receives `&T` and can extract owned values
-    /// (futures, receivers, cloned data, etc.).
+    /// The handle captures the mutex reference, extension name, and trait type
+    /// so callers don't repeat them on every access. Use [`ExtensionHandle::lock`]
+    /// to acquire the lock and access the extension.
     ///
-    /// # Important
-    ///
-    /// Do **not** `.await` inside the closure — the lock would be held
-    /// across the await point. Instead, extract an owned future and await
-    /// it outside:
+    /// # Example
     ///
     /// ```ignore
-    /// let future = registry.with_extension::<dyn MyTrait, _>("name", |ext| {
-    ///     ext.get_async_result()  // returns BoxFuture<'static, ...>
-    /// })?;
-    /// let result = future.await?;  // lock already released
+    /// let auth = registry.handle::<dyn BearerTokenProvider>("auth")?;
+    /// let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
+    /// let token = auth.lock(|a| a.get_token()).await?;
     /// ```
     ///
     /// # Type Parameter
     ///
     /// `T` is the **trait object type**, e.g., `dyn BearerTokenProvider`. The trait
     /// must be `'static` (required for `TypeId`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExtensionError::NotFound`] if no extension with that name exists.
-    /// Returns [`ExtensionError::TraitNotImplemented`] if the extension exists
-    /// but does not expose the requested trait.
-    /// Returns [`ExtensionError::AlreadyBorrowed`] if the same (name, trait)
-    /// pair is already locked (re-entrant access).
-    pub fn with_extension<T: ?Sized + 'static, R>(
-        &self,
-        name: &str,
-        f: impl FnOnce(&T) -> R,
-    ) -> Result<R, ExtensionError> {
-        let key = (name.to_string(), TypeId::of::<Box<T>>());
-        let mutex = self.entries.get(&key).ok_or_else(|| {
-            let has_any = self.entries.keys().any(|(n, _)| n == name);
-            if has_any {
-                ExtensionError::TraitNotImplemented {
-                    name: name.to_string(),
-                    expected: std::any::type_name::<T>(),
-                }
-            } else {
-                ExtensionError::NotFound {
-                    name: name.to_string(),
-                }
-            }
-        })?;
-
-        let guard = mutex.try_lock().ok_or_else(|| ExtensionError::AlreadyBorrowed {
-            name: name.to_string(),
-        })?;
-
-        let boxed_trait: &Box<T> = guard
-            .downcast_ref::<Box<T>>()
-            .expect("TypeId matched but downcast failed — this is a bug");
-
-        Ok(f(boxed_trait.as_ref()))
-    }
-
-    /// Check if an extension exists by name (regardless of trait).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let auth = registry.handle::<dyn BearerTokenProvider>("auth")?;
-    /// let mut token_rx = auth.with(|a| a.subscribe_token_refresh())?;
-    /// let token = auth.with(|a| a.get_token())?.await?;
-    /// ```
     ///
     /// # Errors
     ///
@@ -442,8 +433,8 @@ impl std::fmt::Debug for ExtensionRegistry {
 /// let auth = extension_registry.handle::<dyn BearerTokenProvider>("azure_auth")?;
 ///
 /// // Use repeatedly — concise closure API:
-/// let mut token_rx = auth.with(|a| a.subscribe_token_refresh())?;
-/// let token = auth.with(|a| a.get_token())?.await?;
+/// let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
+/// let token = auth.lock(|a| a.get_token()).await?;
 /// ```
 pub struct ExtensionHandle<'a, T: ?Sized + 'static> {
     mutex: &'a Mutex<Box<dyn Any + Send>>,
@@ -454,28 +445,33 @@ pub struct ExtensionHandle<'a, T: ?Sized + 'static> {
 impl<'a, T: ?Sized + 'static> ExtensionHandle<'a, T> {
     /// Access the extension via a scoped closure.
     ///
-    /// Acquires the per-entry Mutex lock, downcasts to `&T`, calls the
-    /// closure, and releases the lock. Extract owned values (futures,
+    /// Acquires the per-entry Mutex lock (blocking), downcasts to `&T`, calls
+    /// the closure, and releases the lock. Extract owned values (futures,
     /// receivers, etc.) — don't `.await` inside the closure.
     ///
-    /// # Errors
+    /// # Panics (debug builds only)
     ///
-    /// Returns [`ExtensionError::AlreadyBorrowed`] if the same (name, trait)
-    /// pair is already locked (re-entrant access from within another `with`
-    /// call on the same handle).
-    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, ExtensionError> {
-        let guard = self
-            .mutex
-            .try_lock()
-            .ok_or_else(|| ExtensionError::AlreadyBorrowed {
-                name: self.name.clone(),
-            })?;
+    /// Panics if any extension lock is already held on the current thread
+    /// (nesting detected). In release builds, nesting would deadlock.
+    pub fn lock<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        #[cfg(debug_assertions)]
+        assert_no_nesting(&self.name);
+        #[cfg(debug_assertions)]
+        mark_held();
+
+        let guard = self.mutex.lock();
 
         let boxed_trait: &Box<T> = guard
             .downcast_ref::<Box<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
 
-        Ok(f(boxed_trait.as_ref()))
+        let result = f(boxed_trait.as_ref());
+
+        drop(guard);
+        #[cfg(debug_assertions)]
+        unmark_held();
+
+        result
     }
 }
 
@@ -603,9 +599,8 @@ mod tests {
         assert_eq!(builder.extension_count(), 1);
 
         let registry = builder.build();
-        let value = registry
-            .with_extension::<dyn TestCapability, _>("my_ext", |ext| ext.get_value())
-            .unwrap();
+        let handle = registry.handle::<dyn TestCapability>("my_ext").unwrap();
+        let value = handle.lock(|ext| ext.get_value());
         assert_eq!(value, 42);
     }
 
@@ -621,20 +616,16 @@ mod tests {
         registrar(&mut builder, "multi_ext");
 
         let registry = builder.build();
-        let value = registry
-            .with_extension::<dyn TestCapability, _>("multi_ext", |ext| ext.get_value())
-            .unwrap();
-        let name = registry
-            .with_extension::<dyn AnotherCapability, _>("multi_ext", |ext| ext.get_name())
-            .unwrap();
-        assert_eq!(value, 99);
-        assert_eq!(name, "hello");
+        let cap = registry.handle::<dyn TestCapability>("multi_ext").unwrap();
+        let another = registry.handle::<dyn AnotherCapability>("multi_ext").unwrap();
+        assert_eq!(cap.lock(|ext| ext.get_value()), 99);
+        assert_eq!(another.lock(|ext| ext.get_name()), "hello");
     }
 
     #[test]
     fn test_not_found_error() {
         let registry = ExtensionRegistry::new();
-        let result = registry.with_extension::<dyn TestCapability, _>("nonexistent", |_| ());
+        let result = registry.handle::<dyn TestCapability>("nonexistent");
         assert!(matches!(
             result,
             Err(ExtensionError::NotFound { name }) if name == "nonexistent"
@@ -653,8 +644,7 @@ mod tests {
         registrar(&mut builder, "partial_ext");
 
         let registry = builder.build();
-        let result =
-            registry.with_extension::<dyn AnotherCapability, _>("partial_ext", |_| ());
+        let result = registry.handle::<dyn AnotherCapability>("partial_ext");
         assert!(matches!(
             result,
             Err(ExtensionError::TraitNotImplemented { name, .. }) if name == "partial_ext"
@@ -678,14 +668,10 @@ mod tests {
         let clone2 = registry.clone();
 
         // All clones access the same instance
-        let v1 = clone1
-            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
-            .unwrap();
-        let v2 = clone2
-            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
-            .unwrap();
-        assert_eq!(v1, 10);
-        assert_eq!(v2, 10);
+        let h1 = clone1.handle::<dyn TestCapability>("ext").unwrap();
+        let h2 = clone2.handle::<dyn TestCapability>("ext").unwrap();
+        assert_eq!(h1.lock(|ext| ext.get_value()), 10);
+        assert_eq!(h2.lock(|ext| ext.get_value()), 10);
 
         // Verify they share the same Arc
         assert!(Arc::ptr_eq(&registry.entries, &clone1.entries));
@@ -712,14 +698,10 @@ mod tests {
         assert_eq!(builder.extension_count(), 2);
 
         let registry = builder.build();
-        let auth_val = registry
-            .with_extension::<dyn TestCapability, _>("auth", |ext| ext.get_value())
-            .unwrap();
-        let rate_val = registry
-            .with_extension::<dyn TestCapability, _>("rate", |ext| ext.get_value())
-            .unwrap();
-        assert_eq!(auth_val, 1);
-        assert_eq!(rate_val, 2);
+        let auth_h = registry.handle::<dyn TestCapability>("auth").unwrap();
+        let rate_h = registry.handle::<dyn TestCapability>("rate").unwrap();
+        assert_eq!(auth_h.lock(|ext| ext.get_value()), 1);
+        assert_eq!(rate_h.lock(|ext| ext.get_value()), 2);
     }
 
     #[test]
@@ -807,12 +789,9 @@ mod tests {
         let registry = builder.build();
 
         // Sequential access is fine — lock released between calls
-        let v1 = registry
-            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
-            .unwrap();
-        let v2 = registry
-            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
-            .unwrap();
+        let handle = registry.handle::<dyn TestCapability>("ext").unwrap();
+        let v1 = handle.lock(|ext| ext.get_value());
+        let v2 = handle.lock(|ext| ext.get_value());
         assert_eq!(v1, 42);
         assert_eq!(v2, 42);
     }
@@ -832,14 +811,10 @@ mod tests {
         let registry = builder.build();
 
         // Access different traits — each has its own mutex, no contention
-        let value = registry
-            .with_extension::<dyn TestCapability, _>("ext", |ext| ext.get_value())
-            .unwrap();
-        let name = registry
-            .with_extension::<dyn AnotherCapability, _>("ext", |ext| ext.get_name())
-            .unwrap();
-        assert_eq!(value, 42);
-        assert_eq!(name, "test");
+        let cap = registry.handle::<dyn TestCapability>("ext").unwrap();
+        let another = registry.handle::<dyn AnotherCapability>("ext").unwrap();
+        assert_eq!(cap.lock(|ext| ext.get_value()), 42);
+        assert_eq!(another.lock(|ext| ext.get_name()), "test");
     }
 
     // ── Async trait pattern test ────────────────────────────────────────
@@ -878,9 +853,8 @@ mod tests {
         let registry = builder.build();
 
         // Get the future inside the closure, await outside (lock released)
-        let fut = registry
-            .with_extension::<dyn AsyncCapability, _>("async_ext", |ext| ext.do_work())
-            .unwrap();
+        let handle = registry.handle::<dyn AsyncCapability>("async_ext").unwrap();
+        let fut = handle.lock(|ext| ext.do_work());
         let result = fut.await.unwrap();
         assert_eq!(result, "test_done");
     }
@@ -914,9 +888,8 @@ mod tests {
         let registry = builder.build();
 
         // Get subscription handle inside closure, use outside
-        let mut rx = registry
-            .with_extension::<dyn Subscribable, _>("watch_ext", |ext| ext.subscribe())
-            .unwrap();
+        let handle = registry.handle::<dyn Subscribable>("watch_ext").unwrap();
+        let mut rx = handle.lock(|ext| ext.subscribe());
 
         // Send a value and verify receipt
         tx.send(42).unwrap();
@@ -943,22 +916,25 @@ mod tests {
         assert!(Arc::ptr_eq(&registry.entries, &clone.entries));
     }
 
-    // ── Re-entrant access returns AlreadyBorrowed ───────────────────────
+    // ── Re-entrant access panics in debug builds ──────────────────────
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn test_reentrant_access_returns_error() {
-        // Re-entrant access to the SAME (name, trait) pair returns AlreadyBorrowed
+    #[should_panic(expected = "Nested extension access detected")]
+    fn test_reentrant_access_panics_in_debug() {
+        // Nested access to the SAME (name, trait) pair panics in debug builds
         trait ReentrantCapability: Send + 'static {
-            fn try_reenter(&self, registry: &ExtensionRegistry) -> Result<(), ExtensionError>;
+            fn try_reenter(&self, registry: &ExtensionRegistry);
         }
 
         #[derive(Clone)]
         struct ReentrantExt;
 
         impl ReentrantCapability for ReentrantExt {
-            fn try_reenter(&self, registry: &ExtensionRegistry) -> Result<(), ExtensionError> {
-                // Try to access the same extension while it's already locked
-                registry.with_extension::<dyn ReentrantCapability, _>("ext", |_| ())
+            fn try_reenter(&self, registry: &ExtensionRegistry) {
+                // Try to access the same extension while it's already locked — panics
+                let handle = registry.handle::<dyn ReentrantCapability>("ext").unwrap();
+                handle.lock(|_| ());
             }
         }
 
@@ -968,13 +944,11 @@ mod tests {
 
         let registry = builder.build();
 
-        // The outer call succeeds, but the inner re-entrant call returns AlreadyBorrowed
-        let result = registry
-            .with_extension::<dyn ReentrantCapability, _>("ext", |ext| {
-                ext.try_reenter(&registry)
-            })
-            .unwrap();
-        assert!(matches!(result, Err(ExtensionError::AlreadyBorrowed { .. })));
+        // The outer call triggers the inner re-entrant call which panics
+        let handle = registry.handle::<dyn ReentrantCapability>("ext").unwrap();
+        handle.lock(|ext| {
+            ext.try_reenter(&registry);
+        });
     }
 
     // ── Interior mutability with Cell ──────────────────────────────────
@@ -1013,20 +987,17 @@ mod tests {
 
         // Mutate through shared reference — Cell works because Mutex
         // only requires T: Send (not T: Sync), and Cell<u64> is Send.
-        registry
-            .with_extension::<dyn Counter, _>("counter", |c| {
-                assert_eq!(c.count(), 0);
-                c.increment();
-                c.increment();
-                c.increment();
-                assert_eq!(c.count(), 3);
-            })
-            .unwrap();
+        let handle = registry.handle::<dyn Counter>("counter").unwrap();
+        handle.lock(|c| {
+            assert_eq!(c.count(), 0);
+            c.increment();
+            c.increment();
+            c.increment();
+            assert_eq!(c.count(), 3);
+        });
 
         // State persists across calls
-        let count = registry
-            .with_extension::<dyn Counter, _>("counter", |c| c.count())
-            .unwrap();
+        let count = handle.lock(|c| c.count());
         assert_eq!(count, 3);
     }
 
@@ -1046,10 +1017,10 @@ mod tests {
 
         // Get handle once, use multiple times
         let handle = registry.handle::<dyn Counter>("counter").unwrap();
-        handle.with(|c| c.increment()).unwrap();
-        handle.with(|c| c.increment()).unwrap();
-        handle.with(|c| c.increment()).unwrap();
-        assert_eq!(handle.with(|c| c.count()).unwrap(), 3);
+        handle.lock(|c| c.increment());
+        handle.lock(|c| c.increment());
+        handle.lock(|c| c.increment());
+        assert_eq!(handle.lock(|c| c.count()), 3);
     }
 
     #[test]
@@ -1089,7 +1060,7 @@ mod tests {
         let registry = builder.build();
 
         let handle = registry.handle::<dyn Subscribable>("watch_ext").unwrap();
-        let mut rx = handle.with(|s| s.subscribe()).unwrap();
+        let mut rx = handle.lock(|s| s.subscribe());
 
         tx.send(99).unwrap();
         rx.changed().await.unwrap();

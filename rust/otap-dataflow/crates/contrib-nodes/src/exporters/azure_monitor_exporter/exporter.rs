@@ -457,14 +457,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                 }
             })?;
 
-        let mut token_rx = auth
-            .with(|a| a.subscribe_token_refresh())
-            .map_err(|e| {
-                let error = Error::AuthHandlerCreation(Box::new(e));
-                EngineError::InternalError {
-                    message: error.to_string(),
-                }
-            })?;
+        let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
 
         self.client_pool
             .initialize(&self.config.api)

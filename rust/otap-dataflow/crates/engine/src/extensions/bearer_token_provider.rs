@@ -136,22 +136,18 @@ impl BearerToken {
 ///
 /// # Consuming
 ///
-/// Access via [`with_extension`](crate::extensions::ExtensionRegistry::with_extension).
+/// Access via [`handle`](crate::extensions::ExtensionRegistry::handle) +
+/// [`lock`](crate::extensions::ExtensionHandle::lock).
 /// Extract owned values from the closure — don't `.await` inside it:
 ///
 /// ```ignore
+/// let auth = extension_registry.handle::<dyn BearerTokenProvider>("azure_identity_auth")?;
+///
 /// // Get a token subscription:
-/// let mut token_rx = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
-///     "azure_identity_auth",
-///     |auth| auth.subscribe_token_refresh(),
-/// )?;
+/// let mut token_rx = auth.lock(|a| a.subscribe_token_refresh());
 ///
 /// // Or get a token future (await it OUTSIDE the closure):
-/// let token = extension_registry.with_extension::<dyn BearerTokenProvider, _>(
-///     "azure_identity_auth",
-///     |auth| auth.get_token(),
-/// )?
-/// .await?;
+/// let token = auth.lock(|a| a.get_token()).await?;
 /// ```
 pub trait BearerTokenProvider: Send + 'static {
     /// Returns an authentication token.

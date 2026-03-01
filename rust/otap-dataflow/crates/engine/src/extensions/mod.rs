@@ -5,7 +5,7 @@
 //!
 //! This module provides:
 //! - [`ExtensionRegistryBuilder`] — accumulates extension registrations during pipeline build.
-//! - [`ExtensionRegistry`] — shared, `Clone`-able registry with [`with_extension`](ExtensionRegistry::with_extension) API.
+//! - [`ExtensionRegistry`] — shared, `Clone`-able registry with [`handle`](ExtensionRegistry::handle) + [`lock`](ExtensionHandle::lock) API.
 //! - Extension traits like [`BearerTokenProvider`] — `Send + 'static` (for builder phase).
 //!
 //! # Design
@@ -14,9 +14,10 @@
 //! accumulates extension trait objects during pipeline build, then [`build`](ExtensionRegistryBuilder::build)
 //! wraps each in a `parking_lot::Mutex`. Each component receives a cheap `Arc` clone.
 //!
-//! Access is via [`with_extension`](ExtensionRegistry::with_extension), which acquires
-//! a per-entry mutex lock and passes `&T` to a closure. The lock is fast (~2-3ns
-//! uncontended) and sound regardless of runtime configuration.
+//! Access is via [`handle`](ExtensionRegistry::handle), which returns an
+//! [`ExtensionHandle`]. Call [`lock`](ExtensionHandle::lock) on the handle to
+//! acquire a per-entry mutex lock and access `&T` via a closure. The lock is
+//! fast (~2-3ns uncontended) and sound regardless of runtime configuration.
 //!
 //! # Adding New Extension Traits
 //!
@@ -42,14 +43,13 @@
 //!
 //! # Consuming Extension Traits
 //!
-//! Components access extensions via [`with_extension`](ExtensionRegistry::with_extension).
+//! Components access extensions via [`handle`](ExtensionRegistry::handle) +
+//! [`lock`](ExtensionHandle::lock).
 //! Extract owned values from the closure — don't await inside it:
 //!
 //! ```ignore
-//! let rx = extension_registry.with_extension::<dyn MyCapability, _>(
-//!     "extension_name",
-//!     |ext| ext.subscribe(),
-//! )?;
+//! let ext = extension_registry.handle::<dyn MyCapability>("extension_name")?;
+//! let rx = ext.lock(|e| e.subscribe());
 //! ```
 
 pub mod registry;
