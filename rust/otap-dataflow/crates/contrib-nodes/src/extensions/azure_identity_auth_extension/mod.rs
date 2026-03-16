@@ -89,7 +89,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
                 }
             })?;
 
-        Ok(ExtensionWrapper::new(
+        Ok(ExtensionWrapper::active(
             extension,
             node,
             node_config,

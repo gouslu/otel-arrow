@@ -251,31 +251,59 @@ impl EffectHandler {
 
 // ── ExtensionWrapper ────────────────────────────────────────────────────────
 
-/// A wrapper that owns an [`Extension`] instance and its control channel.
+/// Wrapper for extension instances in the pipeline engine.
 ///
 /// Extensions are NOT generic over PData — they operate exclusively on
 /// [`ExtensionControlMsg`], keeping the extension system entirely decoupled
 /// from the data-plane type.
-pub struct ExtensionWrapper {
-    /// Index identifier for the node.
-    node_id: NodeId,
-    /// The user configuration for the node.
-    user_config: Arc<NodeUserConfig>,
-    /// The runtime configuration for the extension.
-    runtime_config: ExtensionConfig,
-    /// The extension instance.
-    extension: Box<dyn Extension>,
-    /// A sender for control messages.
-    control_sender: SharedSender<ExtensionControlMsg>,
-    /// A receiver for control messages.
-    control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
-    /// Telemetry guard for node lifecycle cleanup.
-    telemetry: Option<NodeTelemetryGuard>,
+///
+/// Two variants exist:
+///
+/// - **Active** — an extension with a background task that processes control
+///   messages (shutdown, config updates). Created via [`ExtensionWrapper::active`].
+///   Example: an auth extension that periodically refreshes tokens.
+///
+/// - **Passive** — an extension that only provides capabilities at build time,
+///   with no background task. Created via [`ExtensionWrapper::passive`].
+///   Example: a static configuration provider.
+pub enum ExtensionWrapper {
+    /// An extension with a background task that processes control messages.
+    Active {
+        /// Index identifier for the node.
+        node_id: NodeId,
+        /// The user configuration for the node.
+        user_config: Arc<NodeUserConfig>,
+        /// The runtime configuration for the extension.
+        runtime_config: ExtensionConfig,
+        /// The extension instance.
+        extension: Box<dyn Extension>,
+        /// A sender for control messages.
+        control_sender: SharedSender<ExtensionControlMsg>,
+        /// A receiver for control messages.
+        control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
+        /// Telemetry guard for node lifecycle cleanup.
+        telemetry: Option<NodeTelemetryGuard>,
+    },
+    /// An extension that only provides capabilities without a background task.
+    Passive {
+        /// Index identifier for the node.
+        node_id: NodeId,
+        /// The user configuration for the node.
+        user_config: Arc<NodeUserConfig>,
+        /// Capability registrations to publish.
+        capabilities: Vec<registry::CapabilityRegistration>,
+        /// Telemetry guard for node lifecycle cleanup.
+        telemetry: Option<NodeTelemetryGuard>,
+    },
 }
 
 impl ExtensionWrapper {
-    /// Creates a new `ExtensionWrapper` with the given extension and configuration.
-    pub fn new<E>(
+    /// Creates an **Active** extension with a background task and control channel.
+    ///
+    /// Active extensions implement the [`Extension`] trait and are spawned as
+    /// dedicated async tasks. They receive control messages (shutdown, config
+    /// updates) via a control channel.
+    pub fn active<E>(
         extension: E,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
@@ -287,7 +315,7 @@ impl ExtensionWrapper {
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
 
-        ExtensionWrapper {
+        ExtensionWrapper::Active {
             node_id,
             user_config,
             runtime_config: config.clone(),
@@ -298,34 +326,80 @@ impl ExtensionWrapper {
         }
     }
 
+    /// Creates a **Passive** extension that only publishes capabilities.
+    ///
+    /// Passive extensions register capability traits at build time but do not
+    /// run any async task. Suitable for stateless service providers that expose
+    /// pre-built objects (e.g., a configured HTTP client).
+    pub fn passive(
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        capabilities: Vec<registry::CapabilityRegistration>,
+    ) -> Self {
+        ExtensionWrapper::Passive {
+            node_id,
+            user_config,
+            capabilities,
+            telemetry: None,
+        }
+    }
+
+    /// Returns `true` if this is an Active extension that needs to be spawned.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        matches!(self, ExtensionWrapper::Active { .. })
+    }
+
     /// Returns the node ID of this extension.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
-        self.node_id.clone()
+        match self {
+            ExtensionWrapper::Active { node_id, .. }
+            | ExtensionWrapper::Passive { node_id, .. } => node_id.clone(),
+        }
     }
 
     /// Returns the user configuration for this extension.
     #[must_use]
     pub fn user_config(&self) -> Arc<NodeUserConfig> {
-        self.user_config.clone()
+        match self {
+            ExtensionWrapper::Active { user_config, .. }
+            | ExtensionWrapper::Passive { user_config, .. } => user_config.clone(),
+        }
     }
 
     /// Collects the extension's trait registrations and inserts them into
     /// the registry under the given name.
     ///
     /// Called by the engine during pipeline build.
-    pub fn register_traits(&self, registry: &mut registry::CapabilityRegistry, name: &str) {
-        let registrations = self.extension.extension_capabilities();
+    ///
+    /// - **Active**: delegates to [`Extension::extension_capabilities`].
+    /// - **Passive**: drains the stored capability registrations.
+    pub fn register_traits(&mut self, registry: &mut registry::CapabilityRegistry, name: &str) {
+        let registrations = match self {
+            ExtensionWrapper::Active { extension, .. } => extension.extension_capabilities(),
+            ExtensionWrapper::Passive { capabilities, .. } => {
+                std::mem::take(capabilities)
+            }
+        };
         registry.register_all(name, registrations);
     }
 
     pub(crate) fn with_node_telemetry_guard(mut self, guard: NodeTelemetryGuard) -> Self {
-        self.telemetry = Some(guard);
+        match &mut self {
+            ExtensionWrapper::Active { telemetry, .. }
+            | ExtensionWrapper::Passive { telemetry, .. } => {
+                *telemetry = Some(guard);
+            }
+        }
         self
     }
 
-    pub(crate) const fn take_telemetry_guard(&mut self) -> Option<NodeTelemetryGuard> {
-        self.telemetry.take()
+    pub(crate) fn take_telemetry_guard(&mut self) -> Option<NodeTelemetryGuard> {
+        match self {
+            ExtensionWrapper::Active { telemetry, .. }
+            | ExtensionWrapper::Passive { telemetry, .. } => telemetry.take(),
+        }
     }
 
     pub(crate) fn with_control_channel_metrics(
@@ -334,56 +408,94 @@ impl ExtensionWrapper {
         channel_metrics: &mut ChannelMetricsRegistry,
         channel_metrics_enabled: bool,
     ) -> Self {
-        let control_receiver = self
-            .control_receiver
-            .expect("control_receiver already taken");
-
-        let (control_sender, control_receiver) =
-            wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
-                &self.node_id,
-                pipeline_ctx,
-                channel_metrics,
-                channel_metrics_enabled,
-                self.runtime_config.control_channel.capacity as u64,
-                self.control_sender,
+        match self {
+            ExtensionWrapper::Active {
+                node_id,
+                user_config,
+                runtime_config,
+                extension,
+                control_sender,
                 control_receiver,
-            );
+                telemetry,
+            } => {
+                let control_receiver =
+                    control_receiver.expect("control_receiver already taken");
 
-        ExtensionWrapper {
-            node_id: self.node_id,
-            user_config: self.user_config,
-            runtime_config: self.runtime_config,
-            extension: self.extension,
-            control_sender,
-            control_receiver: Some(control_receiver),
-            telemetry: self.telemetry,
+                let (control_sender, control_receiver) =
+                    wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
+                        &node_id,
+                        pipeline_ctx,
+                        channel_metrics,
+                        channel_metrics_enabled,
+                        runtime_config.control_channel.capacity as u64,
+                        control_sender,
+                        control_receiver,
+                    );
+
+                ExtensionWrapper::Active {
+                    node_id,
+                    user_config,
+                    runtime_config,
+                    extension,
+                    control_sender,
+                    control_receiver: Some(control_receiver),
+                    telemetry,
+                }
+            }
+            // Passive extensions have no control channel — nothing to wrap.
+            passive @ ExtensionWrapper::Passive { .. } => passive,
         }
     }
 
-    /// Returns an `ExtensionControlSender` for sending control messages to this extension.
-    pub(crate) fn extension_control_sender(&self) -> crate::control::ExtensionControlSender {
-        crate::control::ExtensionControlSender {
-            node_id: self.node_id.clone(),
-            sender: crate::message::Sender::Shared(self.control_sender.clone()),
+    /// Returns an `ExtensionControlSender` for sending control messages.
+    ///
+    /// Returns `Some` for Active extensions and `None` for Passive extensions
+    /// (which have no control channel).
+    pub(crate) fn extension_control_sender(
+        &self,
+    ) -> Option<crate::control::ExtensionControlSender> {
+        match self {
+            ExtensionWrapper::Active {
+                node_id,
+                control_sender,
+                ..
+            } => Some(crate::control::ExtensionControlSender {
+                node_id: node_id.clone(),
+                sender: crate::message::Sender::Shared(control_sender.clone()),
+            }),
+            ExtensionWrapper::Passive { .. } => None,
         }
     }
 
     /// Starts the extension and begins its operation.
     ///
-    /// Extensions do NOT receive a `PipelineCtrlMsgSender` — they are fully
-    /// PData-free and manage their own timers directly via `tokio::time`.
+    /// Only valid for Active extensions. Passive extensions do not have a
+    /// background task — they should not be spawned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a Passive extension.
     pub async fn start(
         self,
         metrics_reporter: MetricsReporter,
     ) -> Result<TerminalState, Error> {
-        let effect_handler = EffectHandler::new(self.node_id, metrics_reporter);
-
-        let control_receiver = self
-            .control_receiver
-            .expect("control_receiver missing from ExtensionWrapper");
-
-        let ctrl_chan = ControlChannel::new(control_receiver);
-        self.extension.start(ctrl_chan, effect_handler).await
+        match self {
+            ExtensionWrapper::Active {
+                node_id,
+                extension,
+                control_receiver,
+                ..
+            } => {
+                let effect_handler = EffectHandler::new(node_id, metrics_reporter);
+                let control_receiver =
+                    control_receiver.expect("control_receiver missing from ExtensionWrapper");
+                let ctrl_chan = ControlChannel::new(control_receiver);
+                extension.start(ctrl_chan, effect_handler).await
+            }
+            ExtensionWrapper::Passive { .. } => {
+                panic!("start() called on a Passive extension — Passive extensions have no background task")
+            }
+        }
     }
 }
 
@@ -463,6 +575,6 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        let _wrapper = ExtensionWrapper::new(extension, node_id, user_config, &config);
+        let _wrapper = ExtensionWrapper::active(extension, node_id, user_config, &config);
     }
 }
