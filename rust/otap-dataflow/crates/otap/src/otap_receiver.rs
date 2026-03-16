@@ -117,19 +117,18 @@ pub struct OTAPReceiver {
 #[distributed_slice(OTAP_RECEIVER_FACTORIES)]
 pub static OTAP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     name: OTAP_RECEIVER_URN,
-    create:
-        |pipeline: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         receiver_config: &ReceiverConfig,
-         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            Ok(ReceiverWrapper::shared(
-                OTAPReceiver::from_config(pipeline, &node_config.config)?,
-                node,
-                node_config,
-                receiver_config,
-            ))
-        },
+    create: |pipeline: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             receiver_config: &ReceiverConfig,
+             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        Ok(ReceiverWrapper::shared(
+            OTAPReceiver::from_config(pipeline, &node_config.config)?,
+            node,
+            node_config,
+            receiver_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };

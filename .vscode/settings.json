@@ -30,5 +30,8 @@
     },
     "search.exclude": {
         "**/target/**": true
+    },
+    "chat.tools.terminal.autoApprove": {
+        "cargo build": true
     }
 }

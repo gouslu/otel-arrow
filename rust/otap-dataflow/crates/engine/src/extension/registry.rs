@@ -404,7 +404,9 @@ impl CapabilityRegistry {
             }
 
             // 2. Capability name must be a known type (registered at link time).
-            let is_known_type = KNOWN_CAPABILITIES.iter().any(|&name| name == capability_name);
+            let is_known_type = KNOWN_CAPABILITIES
+                .iter()
+                .any(|&name| name == capability_name);
             if !is_known_type {
                 let all_known: Vec<&str> = KNOWN_CAPABILITIES.iter().copied().collect();
                 return Err(otap_df_config::error::Error::InvalidUserConfig {
@@ -428,18 +430,19 @@ impl CapabilityRegistry {
                         "Capability '{capability_name}' is a known type but no loaded \
                          extension provides it. Loaded extensions: [{}]. \
                          Add an extension that provides '{capability_name}' to your config.",
-                        extension_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                        extension_names
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     ),
                 });
             }
 
             // 4. The specific extension must provide the requested capability.
-            let matched = self
-                .handles
-                .iter()
-                .find(|((name, _), entry)| {
-                    name == extension_name && entry.capability_name == capability_name
-                });
+            let matched = self.handles.iter().find(|((name, _), entry)| {
+                name == extension_name && entry.capability_name == capability_name
+            });
 
             match matched {
                 Some(((_, type_id), entry)) => {
@@ -877,12 +880,16 @@ mod tests {
     #[test]
     fn test_resolve_bindings_unknown_extension() {
         let registry = CapabilityRegistry::new();
-        let bindings = HashMap::from([
-            ("bearer_token_provider".to_string(), "nonexistent".to_string()),
-        ]);
+        let bindings = HashMap::from([(
+            "bearer_token_provider".to_string(),
+            "nonexistent".to_string(),
+        )]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("nonexistent"), "should name the missing extension: {msg}");
+        assert!(
+            msg.contains("nonexistent"),
+            "should name the missing extension: {msg}"
+        );
         assert!(msg.contains("no extension with that name exists"), "{msg}");
     }
 
@@ -890,31 +897,42 @@ mod tests {
     fn test_resolve_bindings_unknown_capability_name() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([
-            ("totally_made_up".to_string(), "azure_auth".to_string()),
-        ]);
+        let bindings = HashMap::from([("totally_made_up".to_string(), "azure_auth".to_string())]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Unknown capability"), "should say unknown: {msg}");
+        assert!(
+            msg.contains("Unknown capability"),
+            "should say unknown: {msg}"
+        );
         assert!(msg.contains("totally_made_up"), "{msg}");
-        assert!(msg.contains("bearer_token_provider"), "should list known caps: {msg}");
+        assert!(
+            msg.contains("bearer_token_provider"),
+            "should list known caps: {msg}"
+        );
     }
 
     #[test]
     fn test_resolve_bindings_valid() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([
-            ("bearer_token_provider".to_string(), "azure_auth".to_string()),
-        ]);
+        let bindings = HashMap::from([(
+            "bearer_token_provider".to_string(),
+            "azure_auth".to_string(),
+        )]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
         assert!(!caps.is_empty());
     }
 
     /// Helper: register a fake extension that only has entries under a custom
     /// capability name (simulates a second trait type for testing).
-    fn register_fake_capability(registry: &mut CapabilityRegistry, ext_name: &str, cap_name: &'static str) {
-        let instance = TestTokenProvider { token: "fake".to_string() };
+    fn register_fake_capability(
+        registry: &mut CapabilityRegistry,
+        ext_name: &str,
+        cap_name: &'static str,
+    ) {
+        let instance = TestTokenProvider {
+            token: "fake".to_string(),
+        };
         // Build a registration but override the capability_name.
         let reg = CapabilityRegistration::new(
             // Use a different TypeId so it doesn't collide with BearerTokenProvider.
@@ -935,12 +953,14 @@ mod tests {
         // Extension "other_ext" exists but only provides "other_cap", not bearer_token_provider.
         let mut registry = CapabilityRegistry::new();
         register_fake_capability(&mut registry, "other_ext", "other_cap");
-        let bindings = HashMap::from([
-            ("bearer_token_provider".to_string(), "other_ext".to_string()),
-        ]);
+        let bindings =
+            HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no loaded extension provides it"), "should say no provider: {msg}");
+        assert!(
+            msg.contains("no loaded extension provides it"),
+            "should say no provider: {msg}"
+        );
         assert!(msg.contains("bearer_token_provider"), "{msg}");
     }
 
@@ -952,14 +972,19 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
         register_fake_capability(&mut registry, "other_ext", "other_cap");
-        let bindings = HashMap::from([
-            ("bearer_token_provider".to_string(), "other_ext".to_string()),
-        ]);
+        let bindings =
+            HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("does not provide capability"), "should say missing: {msg}");
+        assert!(
+            msg.contains("does not provide capability"),
+            "should say missing: {msg}"
+        );
         assert!(msg.contains("other_ext"), "{msg}");
-        assert!(msg.contains("other_cap"), "should list what it provides: {msg}");
+        assert!(
+            msg.contains("other_cap"),
+            "should list what it provides: {msg}"
+        );
     }
 
     #[test]
@@ -976,9 +1001,10 @@ mod tests {
     fn test_unused_bindings_detected() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([
-            ("bearer_token_provider".to_string(), "azure_auth".to_string()),
-        ]);
+        let bindings = HashMap::from([(
+            "bearer_token_provider".to_string(),
+            "azure_auth".to_string(),
+        )]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Before any access, all bindings are unused.
@@ -988,6 +1014,9 @@ mod tests {
         // After accessing, none are unused.
         let _ = caps.require::<dyn BearerTokenProvider>().unwrap();
         let unused = caps.unused_bindings();
-        assert!(unused.is_empty(), "after require(), should be empty: {unused:?}");
+        assert!(
+            unused.is_empty(),
+            "after require(), should be empty: {unused:?}"
+        );
     }
 }

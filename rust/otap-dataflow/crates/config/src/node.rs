@@ -106,7 +106,11 @@ pub struct NodeUserConfig {
     /// capabilities:
     ///   bearer_token_provider: azure_auth
     /// ```
-    #[serde(default, skip_serializing_if = "HashMap::is_empty", deserialize_with = "deserialize_no_dup_keys")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "deserialize_no_dup_keys"
+    )]
     pub capabilities: HashMap<String, String>,
 
     /// Entity configuration for the node.
@@ -456,7 +460,10 @@ capabilities:
         let result: Result<NodeUserConfig, _> = serde_yaml::from_str(yaml);
         let err = result.expect_err("should reject duplicate capability keys");
         let msg = err.to_string();
-        assert!(msg.contains("duplicate"), "error should mention duplicate: {msg}");
+        assert!(
+            msg.contains("duplicate"),
+            "error should mention duplicate: {msg}"
+        );
     }
 
     #[test]
@@ -471,6 +478,9 @@ capabilities:
         let result: Result<NodeUserConfig, _> = serde_json::from_str(json);
         let err = result.expect_err("should reject duplicate capability keys");
         let msg = err.to_string();
-        assert!(msg.contains("duplicate"), "error should mention duplicate: {msg}");
+        assert!(
+            msg.contains("duplicate"),
+            "error should mention duplicate: {msg}"
+        );
     }
 }

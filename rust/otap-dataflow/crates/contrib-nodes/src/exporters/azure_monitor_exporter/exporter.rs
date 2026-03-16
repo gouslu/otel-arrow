@@ -36,6 +36,16 @@ use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Max concurrent HTTP requests in flight to the Logs Ingestion API.
+///
+/// Approximation using Little's Law (L = λ × W):
+///   - λ (throughput): LA API allows ~500 req/min per DCR (~8 req/s, estimated)
+///   - W (latency): p99 response time ~0.5-1s (estimated, varies by region/load)
+///   - L ≈ 8 × 0.5 = 4 slots minimum, doubled for burst headroom ≈ 8
+///
+/// Set to 16 to absorb transient latency spikes without throttling.
+/// Worst-case memory for pending requests is roughly: 16 × 1MB = 16MB.
+/// These are rough estimates — tune based on observed metrics in production.
 const MAX_IN_FLIGHT_EXPORTS: usize = 16;
 const PERIODIC_EXPORT_INTERVAL: u64 = 3;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
@@ -73,7 +83,7 @@ impl AzureMonitorExporter {
         ));
 
         // Create log transformer
-        let transformer = Transformer::new(&config, metrics.clone());
+        let transformer = Transformer::new(&config);
 
         // Create Gzip batcher
         let gzip_batcher = GzipBatcher::new();
@@ -136,7 +146,7 @@ impl AzureMonitorExporter {
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
         batch_id: u64,
-        row_count: f64,
+        row_count: u64,
         duration: std::time::Duration,
     ) -> Result<(), EngineError> {
         // Export succeeded - Ack only fully-completed messages
@@ -144,7 +154,7 @@ impl AzureMonitorExporter {
         {
             let mut m = self.metrics.borrow_mut();
             m.add_messages(completed_messages.len() as u64);
-            m.add_rows(row_count as u64);
+            m.add_rows(row_count);
             m.add_batch();
         }
 
@@ -167,7 +177,7 @@ impl AzureMonitorExporter {
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
         batch_id: u64,
-        row_count: f64,
+        row_count: u64,
         error: Error,
     ) -> Result<(), EngineError> {
         // Export failed - Nack ALL messages in this batch, remove entirely
@@ -175,7 +185,7 @@ impl AzureMonitorExporter {
         {
             let mut m = self.metrics.borrow_mut();
             m.add_failed_messages(failed_messages.len() as u64);
-            m.add_failed_rows(row_count as u64);
+            m.add_failed_rows(row_count);
             m.add_failed_batch();
         }
 
@@ -642,6 +652,7 @@ mod tests {
     }
 
     fn create_test_pipeline_ctx() -> PipelineContext {
+        otap_df_otap::crypto::ensure_crypto_provider();
         let registry = TelemetryRegistryHandle::new();
         let controller = ControllerContext::new(registry);
         controller.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0)
@@ -699,7 +710,7 @@ mod tests {
             .handle_export_success(
                 &effect_handler,
                 batch_id,
-                10.0,
+                10,
                 std::time::Duration::from_secs(1),
             )
             .await;
@@ -748,7 +759,7 @@ mod tests {
         };
 
         let _ = exporter
-            .handle_export_failure(&effect_handler, batch_id, 10.0, error)
+            .handle_export_failure(&effect_handler, batch_id, 10, error)
             .await;
 
         // Verify stats

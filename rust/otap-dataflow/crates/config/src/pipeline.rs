@@ -1793,7 +1793,7 @@ sink:
                 type: "processor:attribute"
                 config: {}
               exporter:
-                type: "urn:otel:exporter:otlp"
+                type: "urn:otel:exporter:otlp_grpc"
                 config: {}
             connections:
               - from: receiver
@@ -1814,7 +1814,7 @@ sink:
         );
         assert_eq!(
             config.nodes["exporter"].r#type.as_ref(),
-            "urn:otel:exporter:otlp"
+            "urn:otel:exporter:otlp_grpc"
         );
     }
 
@@ -1846,7 +1846,7 @@ sink:
                 type: "processor:attribute"
                 config: {}
               exporter:
-                type: "urn:otel:exporter:otlp"
+                type: "urn:otel:exporter:otlp_grpc"
                 config: {}
             connections:
               - from: receiver
@@ -1878,7 +1878,7 @@ sink:
         );
         assert_eq!(
             config.nodes["exporter"].r#type.as_ref(),
-            "urn:otel:exporter:otlp"
+            "urn:otel:exporter:otlp_grpc"
         );
     }
 

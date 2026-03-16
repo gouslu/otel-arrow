@@ -382,7 +382,7 @@ mod tests {
         assert!(validate_plugin_urn("urn:otel:receiver:my%2Ffamily", NodeKind::Receiver).is_err());
 
         // Wrong kind mapping
-        assert!(validate_plugin_urn("urn:otel:exporter:otlp", NodeKind::Receiver).is_err());
+        assert!(validate_plugin_urn("urn:otel:exporter:otlp_grpc", NodeKind::Receiver).is_err());
 
         // Unknown kind
         assert!(infer_node_kind("urn:otel:sink:otlp").is_err());

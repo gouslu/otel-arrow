@@ -63,25 +63,24 @@ struct CountingExporter {
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 static COUNTING_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     name: COUNTING_EXPORTER_URN,
-    create:
-        |_pipeline: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         exporter_config: &ExporterConfig,
-         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            // Look up counter by ID from node config
-            let counter_id = node_config
-                .config
-                .get("counter_id")
-                .and_then(|v| v.as_str());
-            let counter = counter_id.and_then(get_counter);
-            Ok(ExporterWrapper::local(
-                CountingExporter { counter },
-                node,
-                node_config,
-                exporter_config,
-            ))
-        },
+    create: |_pipeline: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             exporter_config: &ExporterConfig,
+             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        // Look up counter by ID from node config
+        let counter_id = node_config
+            .config
+            .get("counter_id")
+            .and_then(|v| v.as_str());
+        let counter = counter_id.and_then(get_counter);
+        Ok(ExporterWrapper::local(
+            CountingExporter { counter },
+            node,
+            node_config,
+            exporter_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: |_| Ok(()),
 };

@@ -406,8 +406,7 @@ impl ExtensionWrapper {
                 control_receiver,
                 telemetry,
             } => {
-                let control_receiver =
-                    control_receiver.expect("control_receiver already taken");
+                let control_receiver = control_receiver.expect("control_receiver already taken");
 
                 let (control_sender, control_receiver) =
                     wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
@@ -464,10 +463,7 @@ impl ExtensionWrapper {
     /// # Panics
     ///
     /// Panics if called on a Passive extension.
-    pub async fn start(
-        self,
-        metrics_reporter: MetricsReporter,
-    ) -> Result<TerminalState, Error> {
+    pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
         match self {
             ExtensionWrapper::Active {
                 node_id,
@@ -482,7 +478,9 @@ impl ExtensionWrapper {
                 extension.start(ctrl_chan, effect_handler).await
             }
             ExtensionWrapper::Passive { .. } => {
-                panic!("start() called on a Passive extension — Passive extensions have no background task")
+                panic!(
+                    "start() called on a Passive extension — Passive extensions have no background task"
+                )
             }
         }
     }
@@ -564,6 +562,7 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        let _wrapper = ExtensionWrapper::active(Vec::new(), extension, node_id, user_config, &config);
+        let _wrapper =
+            ExtensionWrapper::active(Vec::new(), extension, node_id, user_config, &config);
     }
 }

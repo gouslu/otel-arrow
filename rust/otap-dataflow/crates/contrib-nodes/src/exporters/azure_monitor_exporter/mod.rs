@@ -19,13 +19,15 @@ use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
 
 mod client;
-mod config;
+/// Configuration types for the Azure Monitor Exporter.
+pub mod config;
 mod error;
 mod exporter;
 mod gzip_batcher;
 mod heartbeat;
 mod in_flight_exports;
-mod metrics;
+/// Metrics types for the Azure Monitor Exporter.
+pub mod metrics;
 mod state;
 mod transformer;
 
@@ -47,34 +49,34 @@ pub const AZURE_MONITOR_EXPORTER_URN: &str = "urn:microsoft:exporter:azure_monit
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     name: AZURE_MONITOR_EXPORTER_URN,
-    create:
-        |pipeline_ctx: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         exporter_config: &ExporterConfig,
-         capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            // Deserialize user config JSON into typed Config
-            let cfg: Config = serde_json::from_value(node_config.config.clone()).map_err(|e| {
+    create: |pipeline_ctx: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             exporter_config: &ExporterConfig,
+             capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        // Deserialize user config JSON into typed Config
+        let cfg: Config = serde_json::from_value(node_config.config.clone()).map_err(|e| {
+            otap_df_config::error::Error::InvalidUserConfig {
+                error: e.to_string(),
+            }
+        })?;
+
+        // Resolve the auth extension at factory time
+        let auth = capabilities
+            .require::<dyn otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>(
+        )?;
+
+        Ok(ExporterWrapper::local(
+            AzureMonitorExporter::new(pipeline_ctx, cfg, auth).map_err(|e| {
                 otap_df_config::error::Error::InvalidUserConfig {
                     error: e.to_string(),
                 }
-            })?;
-
-            // Resolve the auth extension at factory time
-            let auth = capabilities
-                .require::<dyn otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>()?;
-
-            Ok(ExporterWrapper::local(
-                AzureMonitorExporter::new(pipeline_ctx, cfg, auth).map_err(|e| {
-                    otap_df_config::error::Error::InvalidUserConfig {
-                        error: e.to_string(),
-                    }
-                })?,
-                node,
-                node_config,
-                exporter_config,
-            ))
-        },
+            })?,
+            node,
+            node_config,
+            exporter_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };

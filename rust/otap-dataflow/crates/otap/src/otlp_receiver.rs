@@ -193,22 +193,21 @@ pub struct OTLPReceiver {
 #[distributed_slice(OTAP_RECEIVER_FACTORIES)]
 pub static OTLP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
     name: OTLP_RECEIVER_URN,
-    create:
-        |pipeline: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         receiver_config: &ReceiverConfig,
-         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            let mut receiver = OTLPReceiver::from_config(pipeline, &node_config.config)?;
-            receiver.tune_max_concurrent_requests(receiver_config.output_pdata_channel.capacity);
+    create: |pipeline: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             receiver_config: &ReceiverConfig,
+             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        let mut receiver = OTLPReceiver::from_config(pipeline, &node_config.config)?;
+        receiver.tune_max_concurrent_requests(receiver_config.output_pdata_channel.capacity);
 
-            Ok(ReceiverWrapper::shared(
-                receiver,
-                node,
-                node_config,
-                receiver_config,
-            ))
-        },
+        Ok(ReceiverWrapper::shared(
+            receiver,
+            node,
+            node_config,
+            receiver_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };

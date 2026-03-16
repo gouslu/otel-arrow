@@ -76,19 +76,18 @@ pub struct ValidationExporter {
 /// Distributed-slice factory that registers the validation exporter with the engine.
 pub static VALIDATION_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFactory {
     name: VALIDATION_EXPORTER_URN,
-    create:
-        |pipeline_ctx: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         exporter_config: &ExporterConfig,
-         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            Ok(ExporterWrapper::local(
-                ValidationExporter::from_config(pipeline_ctx, &node_config.config)?,
-                node,
-                node_config,
-                exporter_config,
-            ))
-        },
+    create: |pipeline_ctx: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             exporter_config: &ExporterConfig,
+             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        Ok(ExporterWrapper::local(
+            ValidationExporter::from_config(pipeline_ctx, &node_config.config)?,
+            node,
+            node_config,
+            exporter_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<ValidationExporterConfig>,
 };

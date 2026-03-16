@@ -75,19 +75,18 @@ pub struct ParquetExporter {
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 pub static PARQUET_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
     name: PARQUET_EXPORTER_URN,
-    create:
-        |pipeline: PipelineContext,
-         node: NodeId,
-         node_config: Arc<NodeUserConfig>,
-         exporter_config: &ExporterConfig,
-         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
-            Ok(ExporterWrapper::local(
-                ParquetExporter::from_config(pipeline, &node_config.config)?,
-                node,
-                node_config,
-                exporter_config,
-            ))
-        },
+    create: |pipeline: PipelineContext,
+             node: NodeId,
+             node_config: Arc<NodeUserConfig>,
+             exporter_config: &ExporterConfig,
+             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+        Ok(ExporterWrapper::local(
+            ParquetExporter::from_config(pipeline, &node_config.config)?,
+            node,
+            node_config,
+            exporter_config,
+        ))
+    },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
     validate_config: otap_df_config::validation::validate_typed_config::<config::Config>,
 };

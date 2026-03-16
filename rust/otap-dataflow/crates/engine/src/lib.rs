@@ -16,7 +16,7 @@ use crate::{
     error::{Error, TypedError},
     exporter::ExporterWrapper,
     extension::ExtensionWrapper,
-    extension::registry::{CapabilityRegistry, Capabilities},
+    extension::registry::{Capabilities, CapabilityRegistry},
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -74,6 +74,7 @@ pub mod runtime_pipeline;
 pub mod shared;
 pub mod terminal_state;
 pub mod testing;
+pub mod topic;
 pub mod wiring_contract;
 
 /// Trait for factory types that expose a name.
