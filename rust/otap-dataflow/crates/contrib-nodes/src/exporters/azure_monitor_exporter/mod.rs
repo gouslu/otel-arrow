@@ -52,7 +52,7 @@ pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory 
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          exporter_config: &ExporterConfig,
-         capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         capabilities: &otap_df_engine::extension::registry::Capabilities| {
             // Deserialize user config JSON into typed Config
             let cfg: Config = serde_json::from_value(node_config.config.clone()).map_err(|e| {
                 otap_df_config::error::Error::InvalidUserConfig {
@@ -61,13 +61,8 @@ pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory 
             })?;
 
             // Resolve the auth extension at factory time
-            let auth = capability_registry
-                .get::<dyn otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>(
-                    &cfg.auth,
-                )
-                .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
-                    error: format!("auth extension '{}' not found: {e}", cfg.auth),
-                })?;
+            let auth = capabilities
+                .require::<dyn otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>()?;
 
             Ok(ExporterWrapper::local(
                 AzureMonitorExporter::new(pipeline_ctx, cfg, auth).map_err(|e| {

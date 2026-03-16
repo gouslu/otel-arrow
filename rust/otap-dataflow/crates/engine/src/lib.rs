@@ -16,7 +16,7 @@ use crate::{
     error::{Error, TypedError},
     exporter::ExporterWrapper,
     extension::ExtensionWrapper,
-    extension::registry::CapabilityRegistry,
+    extension::registry::{CapabilityRegistry, Capabilities},
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -95,7 +95,7 @@ pub struct ReceiverFactory<PData> {
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         receiver_config: &ReceiverConfig,
-        capability_registry: &CapabilityRegistry,
+        capabilities: &Capabilities,
     ) -> Result<ReceiverWrapper<PData>, otap_df_config::error::Error>,
     /// Optional wiring constraints enforced during pipeline build.
     pub wiring_contract: wiring_contract::WiringContract,
@@ -135,7 +135,7 @@ pub struct ProcessorFactory<PData> {
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         processor_config: &ProcessorConfig,
-        capability_registry: &CapabilityRegistry,
+        capabilities: &Capabilities,
     ) -> Result<ProcessorWrapper<PData>, otap_df_config::error::Error>,
     /// Optional wiring constraints enforced during pipeline build.
     pub wiring_contract: wiring_contract::WiringContract,
@@ -175,7 +175,7 @@ pub struct ExporterFactory<PData> {
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         exporter_config: &ExporterConfig,
-        capability_registry: &CapabilityRegistry,
+        capabilities: &Capabilities,
     ) -> Result<ExporterWrapper<PData>, otap_df_config::error::Error>,
     /// Optional wiring constraints enforced during pipeline build.
     pub wiring_contract: wiring_contract::WiringContract,
@@ -1489,12 +1489,13 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
+        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let receiver = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
             &runtime_config,
-            capability_registry,
+            &mut capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
@@ -1552,12 +1553,13 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
+        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let processor = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config.clone(),
             &processor_config,
-            capability_registry,
+            &mut capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
@@ -1615,12 +1617,13 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
+        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let exporter = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
             &exporter_config,
-            capability_registry,
+            &mut capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 

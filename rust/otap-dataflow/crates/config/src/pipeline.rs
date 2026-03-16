@@ -965,6 +965,7 @@ impl PipelineConfigBuilder {
                     outputs: Vec::new(),
                     default_output: None,
                     config: config.unwrap_or(Value::Null),
+                    capabilities: HashMap::new(),
                 },
             );
         }
@@ -1022,6 +1023,7 @@ impl PipelineConfigBuilder {
                     outputs: Vec::new(),
                     default_output: None,
                     config: config.unwrap_or(Value::Null),
+                    capabilities: HashMap::new(),
                 },
             );
         }

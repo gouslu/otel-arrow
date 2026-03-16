@@ -68,7 +68,7 @@ pub static OTAP_FAKE_DATA_GENERATOR: ReceiverFactory<OtapPdata> = ReceiverFactor
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          receiver_config: &ReceiverConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             Ok(ReceiverWrapper::local(
                 FakeGeneratorReceiver::from_config(pipeline, &node_config.config)?,
                 node,

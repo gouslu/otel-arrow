@@ -81,7 +81,7 @@ pub static VALIDATION_EXPORTER_FACTORY: ExporterFactory<OtapPdata> = ExporterFac
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          exporter_config: &ExporterConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             Ok(ExporterWrapper::local(
                 ValidationExporter::from_config(pipeline_ctx, &node_config.config)?,
                 node,

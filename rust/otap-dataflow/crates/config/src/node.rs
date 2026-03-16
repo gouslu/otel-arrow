@@ -58,6 +58,19 @@ pub struct NodeUserConfig {
     #[schemars(extend("x-kubernetes-preserve-unknown-fields" = true))]
     pub config: Value,
 
+    /// Capability bindings mapping capability names to extension instance names.
+    ///
+    /// Each entry maps a capability (e.g., `bearer_token_provider`) to the name
+    /// of an extension instance declared in the pipeline's `extensions` section.
+    ///
+    /// Example:
+    /// ```yaml
+    /// capabilities:
+    ///   bearer_token_provider: azure_auth
+    /// ```
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub capabilities: HashMap<String, String>,
+
     /// Entity configuration for the node.
     ///
     /// Currently, we support entity::extend::identity_attributes, for example:
@@ -124,6 +137,7 @@ impl NodeUserConfig {
             default_output: None,
             entity: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -140,6 +154,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -156,6 +171,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -169,6 +185,7 @@ impl NodeUserConfig {
             outputs: Vec::new(),
             default_output: None,
             config: user_config,
+            capabilities: HashMap::new(),
         }
     }
 

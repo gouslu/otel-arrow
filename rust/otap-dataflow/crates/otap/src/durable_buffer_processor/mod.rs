@@ -1808,7 +1808,7 @@ pub fn create_durable_buffer(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capabilities: &otap_df_engine::extension::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let config: DurableBufferConfig =
         serde_json::from_value(node_config.config.clone()).map_err(|e| {

@@ -75,7 +75,7 @@ pub static TOPIC_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          receiver_config: &ReceiverConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             let config = TopicReceiver::parse_config(&node_config.config)?;
             Ok(ReceiverWrapper::local(
                 TopicReceiver { config },

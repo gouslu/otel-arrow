@@ -266,7 +266,7 @@ pub static SIGNAL_TYPE_ROUTER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFa
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          proc_cfg: &ProcessorConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             // Deserialize the (currently empty) router configuration
             let router_config: SignalTypeRouterConfig =
                 serde_json::from_value(node_config.config.clone()).map_err(|e| {

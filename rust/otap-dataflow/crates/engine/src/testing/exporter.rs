@@ -15,7 +15,7 @@ use crate::control::{
 };
 use crate::error::Error;
 use crate::exporter::ExporterWrapper;
-use crate::extension::registry::CapabilityRegistry;
+use crate::extension::registry::Capabilities;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message::{Receiver, Sender};
 use crate::node::NodeWithPDataReceiver;
@@ -384,6 +384,6 @@ pub fn create_exporter_from_factory<PData: Clone + Debug + 'static>(
         node,
         Arc::new(node_config),
         &exporter_config,
-        &CapabilityRegistry::new(),
+        &Capabilities::new(),
     )
 }

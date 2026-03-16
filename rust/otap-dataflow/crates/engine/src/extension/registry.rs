@@ -58,7 +58,16 @@ pub(crate) mod private {
 /// Each extension trait file in `extension/` adds its own `impl Sealed` +
 /// `impl ExtensionCapability` pair (see
 /// [`bearer_token_provider`](super::bearer_token_provider) for the pattern).
-pub trait ExtensionCapability: private::Sealed {}
+pub trait ExtensionCapability: private::Sealed {
+    /// The stable, human-readable name for this capability.
+    ///
+    /// Used in YAML configuration for capability bindings:
+    /// ```yaml
+    /// capabilities:
+    ///   bearer_token_provider: my_auth_extension
+    /// ```
+    const NAME: &'static str;
+}
 
 /// Error type for extension trait operations.
 ///
@@ -246,42 +255,28 @@ impl CapabilityRegistry {
 
     /// Get an owned clone of a trait implementation by extension name.
     ///
-    /// Returns `Box<dyn Trait>` — a fresh clone produced from the stored
-    /// extension value. The clone shares any `Arc`-wrapped state with the
-    /// original and with other clones.
+    /// Returns `Some(Box<dyn Trait>)` if found, `None` if no extension with
+    /// that name exists or if it doesn't expose the requested trait.
+    ///
+    /// The returned value is a fresh clone produced from the stored extension
+    /// value. The clone shares any `Arc`-wrapped state with the original and
+    /// with other clones.
     ///
     /// # Type Parameters
     ///
     /// * `T` - The trait type (e.g., `dyn BearerTokenProvider`).
     ///
-    /// # Errors
-    ///
-    /// Returns `ExtensionError::NotFound` if no extension with that name exists.
-    /// Returns `ExtensionError::TraitNotImplemented` if the extension doesn't expose that trait.
-    ///
     /// # Example
     ///
     /// ```ignore
     /// let provider: Box<dyn BearerTokenProvider> = registry
-    ///     .get::<dyn BearerTokenProvider>("azure_auth")?;
+    ///     .get::<dyn BearerTokenProvider>("azure_auth")
+    ///     .expect("auth extension required");
     /// provider.get_token().await?;
     /// ```
-    pub fn get<T: ?Sized + 'static>(&self, name: &str) -> Result<Box<T>, ExtensionError> {
+    pub fn get<T: ?Sized + 'static>(&self, name: &str) -> Option<Box<T>> {
         let key = (name.to_string(), TypeId::of::<Box<T>>());
-        let entry = self.handles.get(&key).ok_or_else(|| {
-            // Distinguish "extension not found" from "trait not implemented"
-            let has_any = self.handles.keys().any(|(n, _)| n == name);
-            if has_any {
-                ExtensionError::TraitNotImplemented {
-                    name: name.to_string(),
-                    expected: std::any::type_name::<T>(),
-                }
-            } else {
-                ExtensionError::NotFound {
-                    name: name.to_string(),
-                }
-            }
-        })?;
+        let entry = self.handles.get(&key)?;
 
         // Coerce produces Box<dyn Any + Send> that is actually Box<Box<dyn Trait>>.
         // Explicit deref (*entry.value) ensures we dispatch through the vtable
@@ -292,7 +287,7 @@ impl CapabilityRegistry {
             .downcast::<Box<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
 
-        Ok(*double_boxed)
+        Some(*double_boxed)
     }
 
     /// Check if an extension exists by name.
@@ -324,6 +319,38 @@ impl CapabilityRegistry {
             .map(|(n, _)| n)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
+    }
+
+    /// Build a per-node registry from capability bindings.
+    ///
+    /// Takes a map of `capability_name → extension_instance_name` (from the
+    /// node's `capabilities:` config section) and produces a new registry
+    /// where each entry is keyed by the **capability name** instead of the
+    /// extension instance name.
+    ///
+    /// This allows nodes to look up capabilities by their stable trait name
+    /// (e.g., `"bearer_token_provider"`) without knowing which extension
+    /// instance provides it.
+    ///
+    /// Bindings that reference non-existent extensions are silently skipped.
+    /// Validation of required capabilities is the responsibility of the
+    /// node's factory `create()` method.
+    #[must_use]
+    pub fn resolve_bindings(
+        &self,
+        bindings: &HashMap<String, String>,
+    ) -> Capabilities {
+        let mut capabilities = Capabilities::new();
+        for (_capability_name, extension_name) in bindings {
+            // For each binding, find all trait entries for this extension
+            // and insert them into the per-node Capabilities keyed by TypeId.
+            for ((name, type_id), entry) in &self.handles {
+                if name == extension_name {
+                    capabilities.insert_entry(*type_id, entry.clone());
+                }
+            }
+        }
+        capabilities
     }
 }
 
@@ -425,6 +452,95 @@ macro_rules! extension_capabilities {
     };
 }
 
+// ── Capabilities ─────────────────────────────────────────────────────────
+
+/// Per-node capability instances resolved from config bindings.
+///
+/// Built by the engine from the node's `capabilities` config section and
+/// the global [`CapabilityRegistry`]. Nodes receive this at factory time
+/// and look up capabilities by type only — no extension names needed.
+///
+/// # Example
+///
+/// ```ignore
+/// // Required capability — fails with a clear error if not bound
+/// let auth = capabilities.require::<dyn BearerTokenProvider>()?;
+///
+/// // Optional capability — returns None if not bound
+/// let enrichment = capabilities.optional::<dyn DatasetLookup>();
+/// ```
+pub struct Capabilities {
+    resolved: HashMap<TypeId, RegistryEntry>,
+}
+
+impl Capabilities {
+    /// Creates an empty `Capabilities`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            resolved: HashMap::new(),
+        }
+    }
+
+    /// Insert a resolved capability. Called by the engine during build.
+    fn insert_entry(&mut self, type_id: TypeId, entry: RegistryEntry) {
+        let _ = self.resolved.insert(type_id, entry);
+    }
+
+    /// Require a capability by trait type.
+    ///
+    /// Returns the capability if bound, or a standardized error with
+    /// the capability name and guidance on how to fix the config.
+    ///
+    /// Use this for capabilities that the node cannot function without.
+    pub fn require<T: ExtensionCapability + ?Sized + 'static>(
+        &self,
+    ) -> Result<Box<T>, otap_df_config::error::Error> {
+        self.get::<T>().ok_or_else(|| {
+            otap_df_config::error::Error::InvalidUserConfig {
+                error: format!(
+                    "Missing required capability '{}'. Add to your node config:\n  capabilities:\n    {}: <extension_instance_name>",
+                    T::NAME,
+                    T::NAME,
+                ),
+            }
+        })
+    }
+
+    /// Get an optional capability by trait type.
+    ///
+    /// Returns `Some(Box<dyn Trait>)` if the capability was bound,
+    /// `None` if it was not configured for this node.
+    ///
+    /// Use this for capabilities that enhance the node but are not required.
+    pub fn optional<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
+        self.get::<T>()
+    }
+
+    /// Returns `true` if no capabilities are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.resolved.is_empty()
+    }
+
+    /// Internal typed lookup — clones via the stored coerce function.
+    fn get<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
+        let key = TypeId::of::<Box<T>>();
+        let entry = self.resolved.get(&key)?;
+        let erased = (entry.coerce)((*entry.value).as_any_ref());
+        let double_boxed = erased
+            .downcast::<Box<T>>()
+            .expect("TypeId matched but downcast failed — this is a bug");
+        Some(*double_boxed)
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,9 +580,9 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "test_ext", "test_token");
 
-        let result: Result<Box<dyn BearerTokenProvider>, _> =
+        let result: Option<Box<dyn BearerTokenProvider>> =
             registry.get::<dyn BearerTokenProvider>("test_ext");
-        assert!(result.is_ok());
+        assert!(result.is_some());
     }
 
     #[test]
@@ -509,7 +625,7 @@ mod tests {
     fn test_not_found() {
         let registry = CapabilityRegistry::new();
         let result = registry.get::<dyn BearerTokenProvider>("missing");
-        assert!(matches!(result, Err(ExtensionError::NotFound { .. })));
+        assert!(result.is_none());
     }
 
     #[test]

@@ -1137,7 +1137,7 @@ pub fn create_fanout_processor(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capabilities: &otap_df_engine::extension::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let fanout =
         FanoutProcessor::from_config(pipeline_ctx.clone(), &node_config, &node_config.config)?;
@@ -1159,13 +1159,13 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          proc_cfg: &ProcessorConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             create_fanout_processor(
                 pipeline_ctx,
                 node,
                 node_config,
                 proc_cfg,
-                _capability_registry,
+                _capabilities,
             )
         },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract {
@@ -1234,6 +1234,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: outputs.clone(),
             default_output: None,
             config: json!({
@@ -1286,6 +1287,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec![TEST_OUT_PORT_NAME.into()],
             default_output: None,
             config: json!({
@@ -1339,6 +1341,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: (0..65).map(|i| PortName::from(format!("p{i}"))).collect(),
             default_output: None,
             config: json!({}),
@@ -1376,6 +1379,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["p1".into(), "p2".into()],
             default_output: None,
             config: json!({}),
@@ -1406,6 +1410,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["p1".into(), "p2".into()],
             default_output: None,
             config: json!({}),
@@ -1429,6 +1434,7 @@ mod tests {
             description: None,
             outputs: vec!["p1".into()],
             entity: None,
+            capabilities: HashMap::new(),
             default_output: None,
             config: json!({}),
         };
@@ -1461,6 +1467,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["primary".into(), "backup".into()],
             default_output: None,
             config: json!({}),
@@ -1493,6 +1500,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["dest".into()],
             default_output: None,
             config: json!({}),
@@ -1538,6 +1546,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["primary".into(), "a".into(), "b".into()],
             default_output: None,
             config: json!({}),
@@ -1579,6 +1588,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["primary".into(), "fb1".into(), "fb2".into()],
             default_output: None,
             config: json!({}),
@@ -1623,6 +1633,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: vec!["p1".into(), "p2".into()],
             default_output: None,
             config: json!({
@@ -2497,6 +2508,7 @@ mod tests {
             r#type: FANOUT_PROCESSOR_URN.into(),
             description: None,
             entity: None,
+            capabilities: HashMap::new(),
             outputs: outputs.clone(),
             default_output: None,
             config,

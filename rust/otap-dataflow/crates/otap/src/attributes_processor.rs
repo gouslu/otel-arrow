@@ -429,7 +429,7 @@ pub fn create_attributes_processor(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capabilities: &otap_df_engine::extension::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let mut proc = AttributesProcessor::from_config(&node_config.config)?;
     proc.metrics = Some(pipeline_ctx.register_metrics::<AttributesProcessorMetrics>());
@@ -451,8 +451,8 @@ pub static ATTRIBUTES_PROCESSOR_FACTORY: otap_df_engine::ProcessorFactory<OtapPd
                  node: NodeId,
                  node_config: Arc<NodeUserConfig>,
                  proc_cfg: &ProcessorConfig,
-                _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
-            create_attributes_processor(pipeline_ctx, node, node_config, proc_cfg, _capability_registry)
+                _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+            create_attributes_processor(pipeline_ctx, node, node_config, proc_cfg, _capabilities)
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: otap_df_config::validation::validate_typed_config::<Config>,
@@ -640,7 +640,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -727,7 +727,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -819,7 +819,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -905,7 +905,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -980,7 +980,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1053,7 +1053,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1129,7 +1129,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1218,7 +1218,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1293,7 +1293,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1374,7 +1374,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1459,7 +1459,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1543,7 +1543,7 @@ mod tests {
             node,
             Arc::new(node_config),
             rt.config(),
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
         let phase = rt.set_processor(proc);
@@ -1618,7 +1618,7 @@ mod telemetry_tests {
             node,
             Arc::new(node_cfg),
             &proc_cfg,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
 

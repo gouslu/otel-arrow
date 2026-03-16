@@ -1034,7 +1034,7 @@ pub fn create_otap_batch_processor(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capabilities: &otap_df_engine::extension::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let metrics = pipeline_ctx.register_metrics::<BatchProcessorMetrics>();
     let proc = BatchProcessor::build_from_json(&node_config.config, metrics)?;
@@ -1319,8 +1319,8 @@ pub static OTAP_BATCH_PROCESSOR_FACTORY: otap_df_engine::ProcessorFactory<OtapPd
                  node: NodeId,
                  node_config: Arc<NodeUserConfig>,
                  proc_cfg: &ProcessorConfig,
-                _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
-            create_otap_batch_processor(pipeline_ctx, node, node_config, proc_cfg, _capability_registry)
+                _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+            create_otap_batch_processor(pipeline_ctx, node, node_config, proc_cfg, _capabilities)
         },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,
         validate_config: otap_df_config::validation::validate_typed_config::<Config>,
@@ -1400,7 +1400,7 @@ mod tests {
             node,
             Arc::new(node_config),
             &proc_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("create processor");
 
@@ -1493,7 +1493,7 @@ mod tests {
             node,
             nuc.clone(),
             &proc_cfg,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::extension::registry::Capabilities::new(),
         )
         .expect("factory should succeed");
 

@@ -49,7 +49,7 @@ impl ErrorExporter {
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         exporter_config: &ExporterConfig,
-        _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+        _capabilities: &otap_df_engine::extension::registry::Capabilities,
     ) -> Result<ExporterWrapper<OtapPdata>, otap_df_config::error::Error> {
         let config: ErrorExporterConfig = serde_json::from_value(node_config.config.clone())
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {

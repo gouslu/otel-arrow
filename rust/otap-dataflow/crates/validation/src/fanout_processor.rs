@@ -46,7 +46,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          processor_config: &ProcessorConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             let metrics = pipeline_ctx.register_metrics::<FanoutMetrics>();
             Ok(ProcessorWrapper::local(
                 FanoutProcessor { metrics },

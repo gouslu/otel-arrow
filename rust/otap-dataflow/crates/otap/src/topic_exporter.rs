@@ -58,7 +58,7 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
          node: NodeId,
          node_config: Arc<NodeUserConfig>,
          exporter_config: &ExporterConfig,
-         _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry| {
+         _capabilities: &otap_df_engine::extension::registry::Capabilities| {
             let config = TopicExporter::parse_config(&node_config.config)?;
             Ok(ExporterWrapper::local(
                 TopicExporter { config },

@@ -15,7 +15,13 @@ use std::borrow::Cow;
 // stored in the CapabilityRegistry.  Copy this block when adding a new
 // extension trait.
 impl super::registry::private::Sealed for dyn BearerTokenProvider {}
-impl super::registry::ExtensionCapability for dyn BearerTokenProvider {}
+impl super::registry::ExtensionCapability for dyn BearerTokenProvider {
+    const NAME: &'static str = "bearer_token_provider";
+}
+
+/// The stable capability name used in config bindings.
+pub const CAPABILITY_NAME: &str =
+    <dyn BearerTokenProvider as super::registry::ExtensionCapability>::NAME;
 
 /// Represents a secret value that should not be exposed in logs or debug output.
 ///
