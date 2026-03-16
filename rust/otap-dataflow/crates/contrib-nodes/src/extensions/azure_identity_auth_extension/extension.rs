@@ -33,7 +33,7 @@ use tokio::sync::watch;
 
 use otap_df_engine::control::ExtensionControlMsg;
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::local::extension::{ControlChannel, EffectHandler, Extension};
+use otap_df_engine::extension::{ControlChannel, EffectHandler, Extension};
 use otap_df_engine::terminal_state::TerminalState;
 
 use super::config::{AuthMethod, Config};
@@ -239,7 +239,7 @@ impl BearerTokenProvider for AzureIdentityAuthExtension {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Extension for AzureIdentityAuthExtension {
     otap_df_engine::extension_capabilities!(BearerTokenProvider);
 

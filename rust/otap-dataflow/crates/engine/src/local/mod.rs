@@ -5,7 +5,6 @@
 //! and extensions.
 
 pub mod exporter;
-pub mod extension;
 pub mod message;
 pub mod processor;
 pub mod receiver;

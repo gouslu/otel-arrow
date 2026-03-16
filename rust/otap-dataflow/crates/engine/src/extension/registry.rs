@@ -9,7 +9,7 @@
 //! wraps shared state in `Arc`).
 //!
 //! Extensions that publish traits override
-//! [`Extension::extension_capabilities`](crate::local::extension::Extension::extension_capabilities),
+//! [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities),
 //! using the [`extension_capabilities!`] macro to declare their trait implementations.
 //! The engine calls `extension_capabilities()` during pipeline build and inserts the
 //! results into the registry.
@@ -141,7 +141,7 @@ impl Clone for RegistryEntry {
 /// - The `TypeId` of `Box<dyn Trait>` for registry lookup
 ///
 /// The extension writer just returns `Vec<CapabilityRegistration>` from
-/// [`Extension::extension_capabilities`](crate::local::extension::Extension::extension_capabilities);
+/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities);
 /// the engine inserts them into the [`CapabilityRegistry`] by name.
 pub struct CapabilityRegistration {
     /// `TypeId` of `Box<dyn Trait>` — used as registry lookup key.
@@ -370,7 +370,7 @@ impl std::fmt::Debug for CapabilityRegistry {
 /// ## Convenience form (inside `impl Extension` block)
 ///
 /// Expands to a complete
-/// [`Extension::extension_capabilities`](crate::local::extension::Extension::extension_capabilities)
+/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities)
 /// method definition. Place it directly inside an `impl Extension` block:
 ///
 /// ```ignore
@@ -387,7 +387,7 @@ impl std::fmt::Debug for CapabilityRegistry {
 /// Returns `Vec<CapabilityRegistration>` — self-contained registrations each carrying
 /// a cloned copy of `self` and a monomorphised coerce function pointer.  The
 /// extension writer returns this from
-/// [`Extension::extension_capabilities`](crate::local::extension::Extension::extension_capabilities);
+/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities);
 /// the engine inserts the registrations into the [`CapabilityRegistry`] by name.
 ///
 /// ```ignore
