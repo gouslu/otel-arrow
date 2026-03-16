@@ -70,9 +70,18 @@ pub trait Extension: Send {
     /// Returns an [`Error`] if an unrecoverable error occurs.
     async fn start(
         self: Box<Self>,
-        ctrl_chan: ControlChannel,
-        effect_handler: EffectHandler,
-    ) -> Result<TerminalState, Error>;
+        mut ctrl_chan: ControlChannel,
+        _effect_handler: EffectHandler,
+    ) -> Result<TerminalState, Error> {
+        // Default: no background task. Wait for shutdown and exit.
+        loop {
+            match ctrl_chan.recv().await? {
+                ExtensionControlMsg::Shutdown { .. } => break,
+                _ => {}
+            }
+        }
+        Ok(TerminalState::default())
+    }
 
     /// Returns extension trait registrations for this extension.
     ///
