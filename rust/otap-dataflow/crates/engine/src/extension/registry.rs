@@ -41,24 +41,56 @@ use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use linkme::distributed_slice;
+
+// ── Static capability name registry ─────────────────────────────────────────
+
+/// All known capability names, collected at link time.
+///
+/// Each capability trait file adds an entry via [`register_capability!`].
+/// This lets the engine distinguish a typo from a real capability that
+/// simply isn't provided by any extension in the current config.
+#[allow(unsafe_code)]
+#[distributed_slice]
+pub static KNOWN_CAPABILITIES: [&'static str];
+
 // ── Sealed trait infrastructure ─────────────────────────────────────────────
 
-// Sealed module — `pub(crate)` so extension trait files in `extension/` can
-// add `impl Sealed` for their own `dyn Trait` types, while external crates
-// cannot.
+// Sealed module — `pub(crate)` so the `register_capability!` macro can
+// expand impls for `dyn Trait` types, while external crates cannot.
+// Manual `impl Sealed` is blocked by `MacroToken`'s private field.
 pub(crate) mod private {
+    /// Proof that a capability was registered via [`register_capability!`](crate::register_capability).
+    ///
+    /// The private field makes this type unconstructable outside this module,
+    /// so the only way to satisfy `Sealed::MACRO_TOKEN` is through the
+    /// `MACRO_SEAL` const below — which only the macro uses.
+    #[doc(hidden)]
+    pub struct MacroToken(());
+
+    /// The sole `MacroToken` instance. Used by [`register_capability!`](crate::register_capability) only.
+    #[doc(hidden)]
+    pub const MACRO_SEAL: MacroToken = MacroToken(());
+
     /// Sealing trait — prevents external crates from implementing
     /// [`ExtensionCapability`](super::ExtensionCapability).
-    pub trait Sealed {}
+    ///
+    /// Within this crate, the `MACRO_TOKEN` associated const requires a
+    /// [`MacroToken`] value, which cannot be constructed outside this module.
+    /// Use [`register_capability!`](crate::register_capability) instead of
+    /// implementing this trait manually.
+    pub trait Sealed {
+        /// Must be set to [`MACRO_SEAL`]. Only the macro can do this.
+        #[doc(hidden)]
+        const MACRO_TOKEN: MacroToken;
+    }
 }
 
 /// Marker trait for extension trait types that can be stored in the
 /// [`CapabilityRegistry`].
 ///
-/// This trait is **sealed** — it can only be implemented inside this crate.
-/// Each extension trait file in `extension/` adds its own `impl Sealed` +
-/// `impl ExtensionCapability` pair (see
-/// [`bearer_token_provider`](super::bearer_token_provider) for the pattern).
+/// This trait is **sealed** and can only be implemented via the
+/// [`register_capability!`](crate::register_capability) macro.
 pub trait ExtensionCapability: private::Sealed {
     /// The stable, human-readable name for this capability.
     ///
@@ -68,6 +100,11 @@ pub trait ExtensionCapability: private::Sealed {
     ///   bearer_token_provider: my_auth_extension
     /// ```
     const NAME: &'static str;
+
+    /// A short description of what this capability provides.
+    ///
+    /// Surfaced in error messages, generated documentation, and CLI inspection.
+    const DESCRIPTION: &'static str;
 }
 
 /// Error type for extension trait operations.
@@ -342,25 +379,90 @@ impl CapabilityRegistry {
     /// (e.g., `"bearer_token_provider"`) without knowing which extension
     /// instance provides it.
     ///
-    /// Bindings that reference non-existent extensions are silently skipped.
-    /// Validation of required capabilities is the responsibility of the
-    /// node's factory `create()` method.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A binding references an extension instance that doesn't exist.
+    /// - A capability name is not a known type (not in [`KNOWN_CAPABILITIES`]).
+    /// - A capability is a known type but no loaded extension provides it.
+    /// - A binding references a capability that the specific extension doesn't provide.
     pub fn resolve_bindings(
         &self,
         bindings: &HashMap<String, String>,
-    ) -> Capabilities {
+    ) -> Result<Capabilities, otap_df_config::error::Error> {
         let mut capabilities = Capabilities::new();
-        for (_capability_name, extension_name) in bindings {
-            // For each binding, find all trait entries for this extension
-            // and insert them into the per-node Capabilities keyed by TypeId.
-            for ((name, type_id), entry) in &self.handles {
-                if name == extension_name {
+        for (capability_name, extension_name) in bindings {
+            // 1. Extension must exist in the registry.
+            if !self.contains(extension_name) {
+                return Err(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Capability binding '{capability_name}' references extension \
+                         '{extension_name}', but no extension with that name exists. \
+                         Check the 'extensions' section of your pipeline config.",
+                    ),
+                });
+            }
+
+            // 2. Capability name must be a known type (registered at link time).
+            let is_known_type = KNOWN_CAPABILITIES.iter().any(|&name| name == capability_name);
+            if !is_known_type {
+                let all_known: Vec<&str> = KNOWN_CAPABILITIES.iter().copied().collect();
+                return Err(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Unknown capability '{capability_name}'. \
+                         Known capability types: [{}].",
+                        all_known.join(", "),
+                    ),
+                });
+            }
+
+            // 3. Some loaded extension must actually provide this capability.
+            let provided_anywhere = self
+                .handles
+                .values()
+                .any(|entry| entry.capability_name == capability_name);
+            if !provided_anywhere {
+                let extension_names: Vec<&String> = self.names().collect();
+                return Err(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Capability '{capability_name}' is a known type but no loaded \
+                         extension provides it. Loaded extensions: [{}]. \
+                         Add an extension that provides '{capability_name}' to your config.",
+                        extension_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                    ),
+                });
+            }
+
+            // 4. The specific extension must provide the requested capability.
+            let matched = self
+                .handles
+                .iter()
+                .find(|((name, _), entry)| {
+                    name == extension_name && entry.capability_name == capability_name
+                });
+
+            match matched {
+                Some(((_, type_id), entry)) => {
                     capabilities.insert_entry(*type_id, entry.clone());
+                }
+                None => {
+                    let available: Vec<&str> = self
+                        .handles
+                        .iter()
+                        .filter(|((name, _), _)| name == extension_name)
+                        .map(|(_, entry)| entry.capability_name)
+                        .collect();
+                    return Err(otap_df_config::error::Error::InvalidUserConfig {
+                        error: format!(
+                            "Extension '{extension_name}' does not provide capability \
+                             '{capability_name}'. It provides: [{}].",
+                            available.join(", "),
+                        ),
+                    });
                 }
             }
         }
-        capabilities
+        Ok(capabilities)
     }
 }
 
@@ -371,6 +473,43 @@ impl std::fmt::Debug for CapabilityRegistry {
             .field("extensions", &names)
             .finish()
     }
+}
+
+/// Registers a trait as a known extension capability.
+///
+/// This macro does three things:
+/// 1. `impl Sealed for dyn $trait` — seals the trait
+/// 2. `impl ExtensionCapability for dyn $trait` — sets `NAME`
+/// 3. Registers the name in [`KNOWN_CAPABILITIES`] via `distributed_slice`
+///
+/// This is the only way to declare a new capability type. Using one macro
+/// for all three steps makes it impossible to forget the static registration.
+///
+/// # Usage (in each extension trait file inside `extension/`)
+///
+/// ```ignore
+/// crate::register_capability!(
+///     BearerTokenProvider,
+///     "bearer_token_provider",
+///     "Provides bearer tokens for authenticated requests",
+/// );
+/// ```
+#[macro_export]
+macro_rules! register_capability {
+    ($trait:ident, $name:literal, $description:literal $(,)?) => {
+        impl $crate::extension::registry::private::Sealed for dyn $trait {
+            const MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
+                $crate::extension::registry::private::MACRO_SEAL;
+        }
+        impl $crate::extension::registry::ExtensionCapability for dyn $trait {
+            const NAME: &'static str = $name;
+            const DESCRIPTION: &'static str = $description;
+        }
+
+        #[allow(unsafe_code)]
+        #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
+        static _KNOWN_CAP: &str = $name;
+    };
 }
 
 /// Declares which capability traits an extension instance implements.
@@ -437,6 +576,26 @@ macro_rules! extension_capabilities {
     }};
 }
 
+/// Produces a `&'static [&'static str]` of capability names from trait types.
+///
+/// Use this in [`ExtensionFactory`](crate::ExtensionFactory) definitions so
+/// the `capabilities` field is derived from the same sealed
+/// [`ExtensionCapability::NAME`] constants — no hand-written strings that
+/// could drift from what [`extension_capabilities!`](crate::extension_capabilities)
+/// actually registers at runtime.
+///
+/// # Usage
+///
+/// ```ignore
+/// capabilities: otap_df_engine::extension_capability_names!(BearerTokenProvider),
+/// ```
+#[macro_export]
+macro_rules! extension_capability_names {
+    ($($trait:ident),+ $(,)?) => {
+        &[$(<dyn $trait as $crate::extension::registry::ExtensionCapability>::NAME),+]
+    };
+}
+
 // ── Capabilities ─────────────────────────────────────────────────────────
 
 /// Per-node capability instances resolved from config bindings.
@@ -459,6 +618,15 @@ pub struct Capabilities {
     /// Tracks which TypeIds were accessed via `require()` or `optional()`.
     /// Uses `RefCell` so that `require`/`optional` can take `&self`.
     accessed: RefCell<HashSet<TypeId>>,
+}
+
+impl std::fmt::Debug for Capabilities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.resolved.values().map(|e| e.capability_name).collect();
+        f.debug_struct("Capabilities")
+            .field("capabilities", &names)
+            .finish()
+    }
 }
 
 impl Capabilities {
@@ -704,5 +872,122 @@ mod tests {
     fn test_registry_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<CapabilityRegistry>();
+    }
+
+    #[test]
+    fn test_resolve_bindings_unknown_extension() {
+        let registry = CapabilityRegistry::new();
+        let bindings = HashMap::from([
+            ("bearer_token_provider".to_string(), "nonexistent".to_string()),
+        ]);
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"), "should name the missing extension: {msg}");
+        assert!(msg.contains("no extension with that name exists"), "{msg}");
+    }
+
+    #[test]
+    fn test_resolve_bindings_unknown_capability_name() {
+        let mut registry = CapabilityRegistry::new();
+        register_provider(&mut registry, "azure_auth", "token");
+        let bindings = HashMap::from([
+            ("totally_made_up".to_string(), "azure_auth".to_string()),
+        ]);
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown capability"), "should say unknown: {msg}");
+        assert!(msg.contains("totally_made_up"), "{msg}");
+        assert!(msg.contains("bearer_token_provider"), "should list known caps: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_bindings_valid() {
+        let mut registry = CapabilityRegistry::new();
+        register_provider(&mut registry, "azure_auth", "token");
+        let bindings = HashMap::from([
+            ("bearer_token_provider".to_string(), "azure_auth".to_string()),
+        ]);
+        let caps = registry.resolve_bindings(&bindings).unwrap();
+        assert!(!caps.is_empty());
+    }
+
+    /// Helper: register a fake extension that only has entries under a custom
+    /// capability name (simulates a second trait type for testing).
+    fn register_fake_capability(registry: &mut CapabilityRegistry, ext_name: &str, cap_name: &'static str) {
+        let instance = TestTokenProvider { token: "fake".to_string() };
+        // Build a registration but override the capability_name.
+        let reg = CapabilityRegistration::new(
+            // Use a different TypeId so it doesn't collide with BearerTokenProvider.
+            // We use TypeId::of::<Box<dyn std::fmt::Debug>>() as a stand-in.
+            TypeId::of::<Box<dyn std::fmt::Debug>>(),
+            instance,
+            |any| {
+                let concrete = any.downcast_ref::<TestTokenProvider>().unwrap();
+                Box::new(Box::new(concrete.clone()) as Box<dyn BearerTokenProvider>)
+            },
+            cap_name,
+        );
+        registry.register_all(ext_name, vec![reg]);
+    }
+
+    #[test]
+    fn test_resolve_bindings_known_type_no_provider() {
+        // Extension "other_ext" exists but only provides "other_cap", not bearer_token_provider.
+        let mut registry = CapabilityRegistry::new();
+        register_fake_capability(&mut registry, "other_ext", "other_cap");
+        let bindings = HashMap::from([
+            ("bearer_token_provider".to_string(), "other_ext".to_string()),
+        ]);
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no loaded extension provides it"), "should say no provider: {msg}");
+        assert!(msg.contains("bearer_token_provider"), "{msg}");
+    }
+
+    #[test]
+    fn test_resolve_bindings_extension_lacks_specific_cap() {
+        // Two extensions: azure_auth provides bearer_token_provider,
+        // other_ext provides other_cap. Binding bearer_token_provider → other_ext
+        // should fail with "does not provide capability".
+        let mut registry = CapabilityRegistry::new();
+        register_provider(&mut registry, "azure_auth", "token");
+        register_fake_capability(&mut registry, "other_ext", "other_cap");
+        let bindings = HashMap::from([
+            ("bearer_token_provider".to_string(), "other_ext".to_string()),
+        ]);
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not provide capability"), "should say missing: {msg}");
+        assert!(msg.contains("other_ext"), "{msg}");
+        assert!(msg.contains("other_cap"), "should list what it provides: {msg}");
+    }
+
+    #[test]
+    fn test_require_missing_capability() {
+        let caps = Capabilities::new();
+        let result = caps.require::<dyn BearerTokenProvider>();
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("Missing required capability"), "{msg}");
+        assert!(msg.contains("bearer_token_provider"), "{msg}");
+    }
+
+    #[test]
+    fn test_unused_bindings_detected() {
+        let mut registry = CapabilityRegistry::new();
+        register_provider(&mut registry, "azure_auth", "token");
+        let bindings = HashMap::from([
+            ("bearer_token_provider".to_string(), "azure_auth".to_string()),
+        ]);
+        let caps = registry.resolve_bindings(&bindings).unwrap();
+
+        // Before any access, all bindings are unused.
+        let unused = caps.unused_bindings();
+        assert_eq!(unused, vec!["bearer_token_provider"]);
+
+        // After accessing, none are unused.
+        let _ = caps.require::<dyn BearerTokenProvider>().unwrap();
+        let unused = caps.unused_bindings();
+        assert!(unused.is_empty(), "after require(), should be empty: {unused:?}");
     }
 }

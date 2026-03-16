@@ -9,15 +9,16 @@
 use async_trait::async_trait;
 use std::borrow::Cow;
 
-// ── Sealed ExtensionCapability registration ──────────────────────────────────────
-//
-// Every extension trait file must add these two impls so the type can be
-// stored in the CapabilityRegistry.  Copy this block when adding a new
-// extension trait.
-impl super::registry::private::Sealed for dyn BearerTokenProvider {}
-impl super::registry::ExtensionCapability for dyn BearerTokenProvider {
-    const NAME: &'static str = "bearer_token_provider";
-}
+// Register BearerTokenProvider as a known extension capability.
+// This macro:
+//   1. impl Sealed for dyn BearerTokenProvider
+//   2. impl ExtensionCapability with NAME = "bearer_token_provider"
+//   3. Registers the name in KNOWN_CAPABILITIES (distributed_slice)
+crate::register_capability!(
+    BearerTokenProvider,
+    "bearer_token_provider",
+    "Provides bearer tokens for authenticated HTTP/gRPC requests",
+);
 
 /// The stable capability name used in config bindings.
 pub const CAPABILITY_NAME: &str =

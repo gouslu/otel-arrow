@@ -212,6 +212,16 @@ impl<PData> NamedFactory for ExporterFactory<PData> {
 pub struct ExtensionFactory {
     /// The name of the extension.
     pub name: &'static str,
+    /// A short, human-readable description of the extension.
+    pub description: &'static str,
+    /// URL to the extension's documentation.
+    pub documentation_url: &'static str,
+    /// The capability names this extension provides.
+    ///
+    /// Use [`extension_capability_names!`](crate::extension_capability_names) to
+    /// derive this from the sealed [`ExtensionCapability::NAME`] constants so it
+    /// cannot drift from what `create()` actually registers.
+    pub capabilities: &'static [&'static str],
     /// A function that creates a new extension instance.
     pub create: fn(
         pipeline: PipelineContext,
@@ -232,6 +242,9 @@ impl Clone for ExtensionFactory {
     fn clone(&self) -> Self {
         ExtensionFactory {
             name: self.name,
+            description: self.description,
+            documentation_url: self.documentation_url,
+            capabilities: self.capabilities,
             create: self.create,
             validate_config: self.validate_config,
         }
@@ -1489,7 +1502,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry
+            .resolve_bindings(&node_config.capabilities)
+            .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let receiver = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
@@ -1568,7 +1583,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry
+            .resolve_bindings(&node_config.capabilities)
+            .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let processor = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
@@ -1647,7 +1664,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry
+            .resolve_bindings(&node_config.capabilities)
+            .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let exporter = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),

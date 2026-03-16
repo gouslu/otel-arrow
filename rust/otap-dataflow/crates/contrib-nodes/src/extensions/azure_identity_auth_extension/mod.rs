@@ -65,6 +65,12 @@ pub const AZURE_IDENTITY_AUTH_EXTENSION_URN: &str = "urn:microsoft:extension:azu
 #[distributed_slice(OTAP_EXTENSION_FACTORIES)]
 pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     name: AZURE_IDENTITY_AUTH_EXTENSION_URN,
+    description: "Azure Identity authentication via managed identity or developer tools",
+    documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
+    // NOTE: The trait list here duplicates the one in `extension_capabilities!`
+    // below. A declarative macro could unify both, but isn't worth the rigidity
+    // until there are multiple extensions following the same pattern.
+    capabilities: otap_df_engine::extension_capability_names!(BearerTokenProvider),
     create: |_: PipelineContext,
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
