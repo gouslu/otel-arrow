@@ -1489,15 +1489,30 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let receiver = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
             &runtime_config,
-            &mut capabilities,
+            &capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
+
+        let unused = capabilities.unused_bindings();
+        if !unused.is_empty() {
+            return Err(Error::ConfigError(Box::new(
+                otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Receiver '{}' does not support capabilities [{}]. \
+                         This receiver may not recognize these extensions — \
+                         check its documentation or remove the unsupported bindings from its capabilities section.",
+                        name.as_ref(),
+                        unused.join(", "),
+                    ),
+                },
+            )));
+        };
 
         otel_debug!(
             "receiver.create.complete",
@@ -1553,15 +1568,30 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let processor = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config.clone(),
             &processor_config,
-            &mut capabilities,
+            &capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
+
+        let unused = capabilities.unused_bindings();
+        if !unused.is_empty() {
+            return Err(Error::ConfigError(Box::new(
+                otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Processor '{}' does not support capabilities [{}]. \
+                         This processor may not recognize these extensions — \
+                         check its documentation or remove the unsupported bindings from its capabilities section.",
+                        name.as_ref(),
+                        unused.join(", "),
+                    ),
+                },
+            )));
+        };
 
         otel_debug!(
             "processor.create.complete",
@@ -1617,15 +1647,30 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         );
         let create = factory.create;
 
-        let mut capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
+        let capabilities = capability_registry.resolve_bindings(&node_config.capabilities);
         let exporter = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
             &exporter_config,
-            &mut capabilities,
+            &capabilities,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
+
+        let unused = capabilities.unused_bindings();
+        if !unused.is_empty() {
+            return Err(Error::ConfigError(Box::new(
+                otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Exporter '{}' does not support capabilities [{}]. \
+                         This exporter may not recognize these extensions — \
+                         check its documentation or remove the unsupported bindings from its capabilities section.",
+                        name.as_ref(),
+                        unused.join(", "),
+                    ),
+                },
+            )));
+        };
 
         otel_debug!(
             "exporter.create.complete",

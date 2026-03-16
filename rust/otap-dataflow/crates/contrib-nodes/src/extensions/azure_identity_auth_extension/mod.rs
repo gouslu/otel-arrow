@@ -40,6 +40,7 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
+use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::extension::ExtensionWrapper;
 use otap_df_engine::node::NodeId;
 use std::sync::Arc;
@@ -90,6 +91,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
             })?;
 
         Ok(ExtensionWrapper::active(
+            otap_df_engine::extension_capabilities!(extension => BearerTokenProvider),
             extension,
             node,
             node_config,

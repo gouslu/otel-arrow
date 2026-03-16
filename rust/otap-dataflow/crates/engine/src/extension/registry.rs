@@ -10,9 +10,9 @@
 //!
 //! Extensions that publish traits override
 //! [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities),
-//! using the [`extension_capabilities!`] macro to declare their trait implementations.
-//! The engine calls `extension_capabilities()` during pipeline build and inserts the
-//! results into the registry.
+//! using the [`extension_capabilities!`] macro in the factory to declare their
+//! trait implementations. The engine inserts the results into the registry
+//! during pipeline build.
 //!
 //! # Extension writer contract
 //!
@@ -26,10 +26,10 @@
 //! # Example
 //!
 //! ```ignore
-//! // In the Extension impl:
-//! fn extension_capabilities(&self) -> Vec<CapabilityRegistration> {
-//!     extension_capabilities!(self => BearerTokenProvider)
-//! }
+//! // In the factory:
+//! let ext = MyExtension::new(config)?;
+//! let caps = extension_capabilities!(ext, BearerTokenProvider);
+//! Ok(ExtensionWrapper::active(caps, ext, node_id, user_config, &cfg))
 //!
 //! // A consumer retrieves an owned trait object:
 //! let provider: Box<dyn BearerTokenProvider> = registry
@@ -38,7 +38,8 @@
 //! ```
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 // ── Sealed trait infrastructure ─────────────────────────────────────────────
 
@@ -120,6 +121,8 @@ struct RegistryEntry {
     /// Clones the concrete value out of `&dyn Any` and wraps it as
     /// `Box<Box<dyn Trait>>` erased to `Box<dyn Any + Send>`.
     coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
+    /// Human-readable capability name (from `ExtensionCapability::NAME`).
+    capability_name: &'static str,
 }
 
 impl Clone for RegistryEntry {
@@ -127,6 +130,7 @@ impl Clone for RegistryEntry {
         Self {
             value: self.value.clone(),
             coerce: self.coerce,
+            capability_name: self.capability_name,
         }
     }
 }
@@ -140,9 +144,10 @@ impl Clone for RegistryEntry {
 /// - A monomorphised `coerce` function pointer for producing `Box<dyn Trait>`
 /// - The `TypeId` of `Box<dyn Trait>` for registry lookup
 ///
-/// The extension writer just returns `Vec<CapabilityRegistration>` from
-/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities);
-/// the engine inserts them into the [`CapabilityRegistry`] by name.
+/// Extension factories produce these and pass them to
+/// [`ExtensionWrapper::active`](crate::extension::ExtensionWrapper::active) or
+/// [`ExtensionWrapper::passive`](crate::extension::ExtensionWrapper::passive);
+/// the engine drains them during pipeline build.
 pub struct CapabilityRegistration {
     /// `TypeId` of `Box<dyn Trait>` — used as registry lookup key.
     trait_id: TypeId,
@@ -152,6 +157,8 @@ pub struct CapabilityRegistration {
     /// type, clone it, wrap in `Box<dyn Trait>`, and return as
     /// `Box<dyn Any + Send>`.
     coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
+    /// Human-readable capability name (from `ExtensionCapability::NAME`).
+    capability_name: &'static str,
 }
 
 impl CapabilityRegistration {
@@ -164,11 +171,13 @@ impl CapabilityRegistration {
         trait_id: TypeId,
         value: impl Clone + Send + 'static,
         coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
+        capability_name: &'static str,
     ) -> Self {
         Self {
             trait_id,
             value: Box::new(value),
             coerce,
+            capability_name,
         }
     }
 }
@@ -248,6 +257,7 @@ impl CapabilityRegistry {
             let entry = RegistryEntry {
                 value: reg.value,
                 coerce: reg.coerce,
+                capability_name: reg.capability_name,
             };
             let _ = self.handles.insert((name.to_string(), reg.trait_id), entry);
         }
@@ -302,7 +312,7 @@ impl CapabilityRegistry {
         self.handles
             .keys()
             .map(|(n, _)| n)
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .len()
     }
 
@@ -363,93 +373,68 @@ impl std::fmt::Debug for CapabilityRegistry {
     }
 }
 
-/// Macro to declare which extension traits a concrete type implements.
+/// Declares which capability traits an extension instance implements.
 ///
-/// Has two forms:
+/// Returns `Vec<CapabilityRegistration>` — self-contained registrations each
+/// carrying a cloned copy of the extension and a monomorphised coerce function.
 ///
-/// ## Convenience form (inside `impl Extension` block)
+/// Used in extension **factories** to produce capabilities that are passed to
+/// [`ExtensionWrapper::active`](crate::extension::ExtensionWrapper::active) or
+/// [`ExtensionWrapper::passive`](crate::extension::ExtensionWrapper::passive).
 ///
-/// Expands to a complete
-/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities)
-/// method definition. Place it directly inside an `impl Extension` block:
-///
-/// ```ignore
-/// #[async_trait(?Send)]
-/// impl Extension for MyExtension {
-///     otap_df_engine::extension_capabilities!(BearerTokenProvider, SomeOtherTrait);
-///
-///     async fn start(...) { ... }
-/// }
-/// ```
-///
-/// ## Explicit form (returns `Vec<CapabilityRegistration>`)
-///
-/// Returns `Vec<CapabilityRegistration>` — self-contained registrations each carrying
-/// a cloned copy of `self` and a monomorphised coerce function pointer.  The
-/// extension writer returns this from
-/// [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities);
-/// the engine inserts the registrations into the [`CapabilityRegistry`] by name.
+/// # Usage
 ///
 /// ```ignore
-/// fn extension_capabilities(&self) -> Vec<CapabilityRegistration> {
-///     extension_capabilities!(self => BearerTokenProvider)
-/// }
+/// let ext = MyExtension::new(config)?;
+/// let caps = extension_capabilities!(ext => BearerTokenProvider, SomeOtherTrait);
+/// Ok(ExtensionWrapper::active(caps, ext, node_id, user_config, &cfg))
 /// ```
 ///
-/// # Type Safety
+/// # Compile-time guarantees
 ///
-/// The macro verifies at compile time that:
-/// - Each listed trait implements [`ExtensionCapability`] (sealed)
-/// - The concrete type implements each listed trait plus `Clone + Send + 'static`
+/// - Each listed trait implements [`ExtensionCapability`] (sealed).
+/// - The concrete type implements each listed trait plus `Clone + Send + 'static`.
 #[macro_export]
 macro_rules! extension_capabilities {
-    // Explicit form: `extension_capabilities!(self => Trait1, Trait2)`
-    ($self:expr => $($trait:ident),* $(,)?) => {{
-        let mut __regs: Vec<$crate::extension::registry::CapabilityRegistration> = Vec::new();
+    ($instance:expr => $($trait:ident),+ $(,)?) => {{
+        // Bind once — avoids multiple evaluations if $instance is an expression.
+        let instance = &$instance;
+        let mut registrations = Vec::<$crate::extension::registry::CapabilityRegistration>::new();
         $(
             {
-                // Compile-time: ensure the trait is a sealed ExtensionCapability.
+                // Compile-time: trait must be a sealed ExtensionCapability.
                 const _: fn() = || {
-                    fn assert_extension_capability<T: ?Sized + $crate::extension::registry::ExtensionCapability>() {}
-                    assert_extension_capability::<dyn $trait>();
+                    fn _assert<T: ?Sized + $crate::extension::registry::ExtensionCapability>() {}
+                    _assert::<dyn $trait>();
                 };
 
-                // Generic coerce fn — monomorphised for concrete T by the call
-                // to `__make_reg` below.
-                fn __coerce<T: Clone + Send + 'static + $trait>(
-                    any: &dyn std::any::Any,
-                ) -> Box<dyn std::any::Any + Send> {
-                    let concrete = any
-                        .downcast_ref::<T>()
-                        .expect("registry entry type mismatch — this is a bug");
-                    let cloned = concrete.clone();
-                    let trait_obj: Box<dyn $trait> = Box::new(cloned);
-                    Box::new(trait_obj) as Box<dyn std::any::Any + Send>
-                }
-
-                // Generic helper whose T is inferred from $self.
-                fn __make_reg<T: Clone + Send + 'static + $trait>(
-                    instance: &T,
+                // Single generic helper — T is inferred from `instance`.
+                fn make_registration<T: Clone + Send + 'static + $trait>(
+                    val: &T,
                 ) -> $crate::extension::registry::CapabilityRegistration {
+                    fn coerce<T: Clone + Send + 'static + $trait>(
+                        any: &dyn std::any::Any,
+                    ) -> Box<dyn std::any::Any + Send> {
+                        let concrete = any
+                            .downcast_ref::<T>()
+                            .expect("registry entry type mismatch — this is a bug");
+                        let boxed: Box<dyn $trait> = Box::new(concrete.clone());
+                        Box::new(boxed) as Box<dyn std::any::Any + Send>
+                    }
+
                     $crate::extension::registry::CapabilityRegistration::new(
                         std::any::TypeId::of::<Box<dyn $trait>>(),
-                        instance.clone(),
-                        __coerce::<T>,
+                        val.clone(),
+                        coerce::<T>,
+                        <dyn $trait as $crate::extension::registry::ExtensionCapability>::NAME,
                     )
                 }
 
-                __regs.push(__make_reg($self));
+                registrations.push(make_registration(instance));
             }
-        )*
-        __regs
+        )+
+        registrations
     }};
-    // Convenience form: `extension_capabilities!(Trait1, Trait2)`
-    // Expands to a full method definition inside an `impl Extension` block.
-    ($($trait:ident),* $(,)?) => {
-        fn extension_capabilities(&self) -> Vec<$crate::extension::registry::CapabilityRegistration> {
-            $crate::extension_capabilities!(self => $($trait),*)
-        }
-    };
 }
 
 // ── Capabilities ─────────────────────────────────────────────────────────
@@ -471,6 +456,9 @@ macro_rules! extension_capabilities {
 /// ```
 pub struct Capabilities {
     resolved: HashMap<TypeId, RegistryEntry>,
+    /// Tracks which TypeIds were accessed via `require()` or `optional()`.
+    /// Uses `RefCell` so that `require`/`optional` can take `&self`.
+    accessed: RefCell<HashSet<TypeId>>,
 }
 
 impl Capabilities {
@@ -479,6 +467,7 @@ impl Capabilities {
     pub fn new() -> Self {
         Self {
             resolved: HashMap::new(),
+            accessed: RefCell::new(HashSet::new()),
         }
     }
 
@@ -523,10 +512,26 @@ impl Capabilities {
         self.resolved.is_empty()
     }
 
+    /// Returns the capability names that were resolved from config bindings
+    /// but never consumed by the factory via `require()` or `optional()`.
+    ///
+    /// Called by the engine after the factory `create()` returns to detect
+    /// misconfigured or unnecessary capability bindings.
+    #[must_use]
+    pub fn unused_bindings(&self) -> Vec<&'static str> {
+        let accessed = self.accessed.borrow();
+        self.resolved
+            .iter()
+            .filter(|(type_id, _)| !accessed.contains(type_id))
+            .map(|(_, entry)| entry.capability_name)
+            .collect()
+    }
+
     /// Internal typed lookup — clones via the stored coerce function.
     fn get<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         let key = TypeId::of::<Box<T>>();
         let entry = self.resolved.get(&key)?;
+        let _ = self.accessed.borrow_mut().insert(key);
         let erased = (entry.coerce)((*entry.value).as_any_ref());
         let double_boxed = erased
             .downcast::<Box<T>>()
@@ -571,7 +576,7 @@ mod tests {
         let instance = TestTokenProvider {
             token: token.to_string(),
         };
-        let regs = crate::extension_capabilities!(&instance => BearerTokenProvider);
+        let regs = crate::extension_capabilities!(instance => BearerTokenProvider);
         registry.register_all(name, regs);
     }
 

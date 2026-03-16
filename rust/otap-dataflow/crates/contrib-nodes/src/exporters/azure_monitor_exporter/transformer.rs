@@ -431,7 +431,6 @@ mod tests {
                     ]),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         }
     }
 
@@ -732,7 +731,6 @@ mod tests {
                     log_record_mapping: HashMap::new(),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         };
 
         let transformer = Transformer::new(&config, create_test_metrics());

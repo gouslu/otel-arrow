@@ -12,12 +12,6 @@ use std::collections::{HashMap, HashSet};
 pub struct Config {
     /// API configuration for Azure Monitor
     pub api: ApiConfig,
-
-    /// Name of the authentication extension to use for token acquisition.
-    /// This should match the name of an Azure Identity Auth Extension configured
-    /// in the pipeline.
-    #[serde(default)]
-    pub auth: String,
 }
 
 /// API configuration for connecting to Azure Monitor
@@ -144,7 +138,6 @@ mod tests {
                 dcr: "mydcr".to_string(),
                 schema: SchemaConfig::default(),
             },
-            auth: "azure_identity_auth".to_string(),
         };
 
         assert!(config.validate().is_ok());
@@ -159,7 +152,6 @@ mod tests {
                 dcr: "".to_string(),
                 schema: SchemaConfig::default(),
             },
-            auth: String::new(),
         };
 
         let result = config.validate();
@@ -187,7 +179,6 @@ mod tests {
                     ]),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         };
 
         let result = config.validate();
@@ -227,7 +218,6 @@ mod tests {
                     ]),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         };
 
         let result = config.validate();
@@ -256,7 +246,6 @@ mod tests {
                     )]),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         };
 
         let result = config.validate();

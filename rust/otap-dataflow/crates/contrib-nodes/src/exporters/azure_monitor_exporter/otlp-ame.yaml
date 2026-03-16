@@ -52,6 +52,9 @@ groups:
 
           azure-monitor-exporter:
             type: "urn:microsoft:exporter:azure_monitor"
+          # Auth is resolved via capability bindings:
+            capabilities:
+              bearer_token_provider: azure-auth
             config:
               # API configuration - Update with your actual values
               api:
@@ -86,9 +89,6 @@ groups:
                       "exception.type": "ExceptionType"
                       "exception.message": "ExceptionMessage"
                       "user.id": "UserId"
-
-              # Reference the auth extension by name
-              auth: "azure-auth"
 
         connections:
           - from: otlp-receiver

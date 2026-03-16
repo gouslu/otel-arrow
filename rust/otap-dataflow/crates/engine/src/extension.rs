@@ -89,24 +89,6 @@ pub trait Extension: Send {
         }
         Ok(TerminalState::default())
     }
-
-    /// Returns extension trait registrations for this extension.
-    ///
-    /// Override this method to publish traits that other pipeline components can
-    /// consume via `registry.get::<dyn Trait>(name)`.  The default
-    /// implementation returns an empty vec — suitable for pure background-task
-    /// extensions that do not expose any traits.
-    ///
-    /// Inside the override, use the [`extension_capabilities!`](crate::extension_capabilities!) macro:
-    ///
-    /// ```ignore
-    /// fn extension_capabilities(&self) -> Vec<CapabilityRegistration> {
-    ///     extension_capabilities!(self => BearerTokenProvider)
-    /// }
-    /// ```
-    fn extension_capabilities(&self) -> Vec<registry::CapabilityRegistration> {
-        Vec::new()
-    }
 }
 
 // ── ControlChannel ──────────────────────────────────────────────────────────
@@ -277,6 +259,8 @@ pub enum ExtensionWrapper {
         runtime_config: ExtensionConfig,
         /// The extension instance.
         extension: Box<dyn Extension>,
+        /// Capability registrations to publish.
+        capabilities: Vec<registry::CapabilityRegistration>,
         /// A sender for control messages.
         control_sender: SharedSender<ExtensionControlMsg>,
         /// A receiver for control messages.
@@ -303,7 +287,12 @@ impl ExtensionWrapper {
     /// Active extensions implement the [`Extension`] trait and are spawned as
     /// dedicated async tasks. They receive control messages (shutdown, config
     /// updates) via a control channel.
+    ///
+    /// Capabilities are produced by the factory using the
+    /// [`extension_capabilities!`](crate::extension_capabilities) macro and
+    /// passed in at construction time.
     pub fn active<E>(
+        capabilities: Vec<registry::CapabilityRegistration>,
         extension: E,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
@@ -320,6 +309,7 @@ impl ExtensionWrapper {
             user_config,
             runtime_config: config.clone(),
             extension: Box::new(extension),
+            capabilities,
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
@@ -368,19 +358,16 @@ impl ExtensionWrapper {
         }
     }
 
-    /// Collects the extension's trait registrations and inserts them into
+    /// Drains the stored capability registrations and inserts them into
     /// the registry under the given name.
     ///
-    /// Called by the engine during pipeline build.
-    ///
-    /// - **Active**: delegates to [`Extension::extension_capabilities`].
-    /// - **Passive**: drains the stored capability registrations.
+    /// Called by the engine during pipeline build. Both Active and Passive
+    /// extensions store their capabilities at construction time (produced
+    /// by the factory via [`extension_capabilities!`](crate::extension_capabilities)).
     pub fn register_traits(&mut self, registry: &mut registry::CapabilityRegistry, name: &str) {
         let registrations = match self {
-            ExtensionWrapper::Active { extension, .. } => extension.extension_capabilities(),
-            ExtensionWrapper::Passive { capabilities, .. } => {
-                std::mem::take(capabilities)
-            }
+            ExtensionWrapper::Active { capabilities, .. }
+            | ExtensionWrapper::Passive { capabilities, .. } => std::mem::take(capabilities),
         };
         registry.register_all(name, registrations);
     }
@@ -414,6 +401,7 @@ impl ExtensionWrapper {
                 user_config,
                 runtime_config,
                 extension,
+                capabilities,
                 control_sender,
                 control_receiver,
                 telemetry,
@@ -437,6 +425,7 @@ impl ExtensionWrapper {
                     user_config,
                     runtime_config,
                     extension,
+                    capabilities,
                     control_sender,
                     control_receiver: Some(control_receiver),
                     telemetry,
@@ -575,6 +564,6 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        let _wrapper = ExtensionWrapper::active(extension, node_id, user_config, &config);
+        let _wrapper = ExtensionWrapper::active(Vec::new(), extension, node_id, user_config, &config);
     }
 }

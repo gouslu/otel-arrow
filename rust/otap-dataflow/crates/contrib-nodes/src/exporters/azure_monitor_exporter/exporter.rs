@@ -448,7 +448,6 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             endpoint = self.config.api.dcr_endpoint.as_str(),
             stream = self.config.api.stream_name.as_str(),
             dcr = self.config.api.dcr.as_str(),
-            auth_extension = self.config.auth.as_str()
         );
 
         let mut msg_id = 0;
@@ -660,7 +659,6 @@ mod tests {
                     log_record_mapping: HashMap::new(),
                 },
             },
-            auth: "azure_identity_auth".to_string(),
         }
     }
 
