@@ -102,8 +102,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
 
         Ok(ExtensionWrapper::active().cloned().shared(
             otap_df_engine::extension_capabilities!(
-                cloned(extension) => otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
-                BearerTokenProvider
+                extension => otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
             ),
             extension,
             node,

@@ -232,7 +232,7 @@ impl ActiveClonedBuilder {
     /// Creates an active extension with shared (Send) cloned registrations.
     pub fn shared<E>(
         self,
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
+        mut capabilities: Vec<registry::shared::CapabilityRegistration>,
         extension: E,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
@@ -241,12 +241,9 @@ impl ActiveClonedBuilder {
     where
         E: shared_ext::Extension + 'static,
     {
-        assert!(
-            capabilities
-                .iter()
-                .all(|reg| matches!(reg.source, registry::RegistrationSource::Cloned)),
-            "active().cloned().shared(...) requires cloned capability registrations; use extension_capabilities!(cloned(...))"
-        );
+        for reg in &mut capabilities {
+            reg.source = registry::RegistrationSource::Cloned;
+        }
 
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
@@ -308,16 +305,13 @@ impl PassiveModeBuilder {
     /// Creates a passive extension with shared registrations for the selected source mode.
     pub fn shared(
         self,
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
+        mut capabilities: Vec<registry::shared::CapabilityRegistration>,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
     ) -> ExtensionWrapper {
-        assert!(
-            capabilities
-                .iter()
-                .all(|reg| reg.source == self.source),
-            "passive().<mode>().shared(...) requires matching capability registration mode"
-        );
+        for reg in &mut capabilities {
+            reg.source = self.source;
+        }
 
         ExtensionWrapper::PassiveShared {
             node_id,
@@ -425,7 +419,7 @@ impl ExtensionWrapper {
     #[must_use]
     pub fn local(
         mut self,
-        local_capabilities: Vec<registry::local::CapabilityRegistration>,
+        mut local_capabilities: Vec<registry::local::CapabilityRegistration>,
     ) -> Self {
         match &mut self {
             ExtensionWrapper::ActiveShared {
@@ -438,12 +432,9 @@ impl ExtensionWrapper {
                 local_capabilities: local_regs,
                 ..
             } => {
-                assert!(
-                    local_capabilities
-                        .iter()
-                        .all(|reg| reg.source == *registration_source),
-                    "local(...) requires local registration mode to match shared mode"
-                );
+                for reg in &mut local_capabilities {
+                    reg.source = *registration_source;
+                }
                 local_regs.extend(local_capabilities);
                 self
             }
@@ -774,8 +765,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "active().cloned().shared(...) requires cloned capability registrations")]
-    fn test_active_rejects_instance_shared_registration_mode() {
+    fn test_active_normalizes_shared_registration_mode_to_cloned() {
         let counter = CtrlMsgCounters::new();
         let extension = TestExtension::new(counter);
         let node_id = test_node("test_active_instance_shared_rejected");
@@ -785,18 +775,29 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_active_instance_shared_rejected");
 
-        let _ = ExtensionWrapper::active().cloned().shared(
+        let wrapper = ExtensionWrapper::active().cloned().shared(
             vec![shared_instance_registration_for_tests()],
             extension,
             node_id,
             user_config,
             &config,
         );
+
+        match wrapper {
+            ExtensionWrapper::ActiveShared {
+                shared_capabilities,
+                ..
+            } => {
+                assert!(shared_capabilities
+                    .iter()
+                    .all(|reg| reg.source == RegistrationSource::Cloned));
+            }
+            ExtensionWrapper::PassiveShared { .. } => unreachable!(),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "local(...) requires local registration mode to match shared mode")]
-    fn test_active_rejects_instance_local_registration_mode() {
+    fn test_active_normalizes_local_registration_mode_to_cloned() {
         let counter = CtrlMsgCounters::new();
         let extension = TestExtension::new(counter);
         let node_id = test_node("test_active_instance_local_rejected");
@@ -806,10 +807,22 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_active_instance_local_rejected");
 
-        let _ = ExtensionWrapper::active()
+        let wrapper = ExtensionWrapper::active()
             .cloned()
             .shared(Vec::new(), extension, node_id, user_config, &config)
             .local(vec![local_instance_registration_for_tests()]);
+
+        match wrapper {
+            ExtensionWrapper::ActiveShared {
+                local_capabilities,
+                ..
+            } => {
+                assert!(local_capabilities
+                    .iter()
+                    .all(|reg| reg.source == RegistrationSource::Cloned));
+            }
+            ExtensionWrapper::PassiveShared { .. } => unreachable!(),
+        }
     }
 
     #[test]
