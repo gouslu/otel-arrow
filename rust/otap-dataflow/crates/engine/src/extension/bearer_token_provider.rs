@@ -1,28 +1,30 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Token provider extension trait.
+//! Bearer token provider extension capability.
 //!
-//! This module also contains the sealed-trait impls that register
-//! `dyn BearerTokenProvider` as a valid [`ExtensionCapability`](super::registry::ExtensionCapability).
+//! Provides `local::BearerTokenProvider` (!Send) and `shared::BearerTokenProvider` (Send)
+//! variants, plus a `BearerTokenProviderHandle` that dispatches to whichever
+//! variant the engine selects for the consumer.
 
 use async_trait::async_trait;
 use std::borrow::Cow;
 
-// Register BearerTokenProvider as a known extension capability.
-// This macro:
-//   1. impl Sealed for dyn BearerTokenProvider
-//   2. impl ExtensionCapability with NAME = "bearer_token_provider"
-//   3. Registers the name in KNOWN_CAPABILITIES (distributed_slice)
+// Register both local and shared variants as known capabilities.
+// Using unique static names to avoid linker collisions.
 crate::register_capability!(
-    BearerTokenProvider,
+    local::BearerTokenProvider,
     "bearer_token_provider",
-    "Provides bearer tokens for authenticated HTTP/gRPC requests",
+    "Provides bearer tokens for authenticated HTTP/gRPC requests (local variant)",
+    _KNOWN_CAP_BEARER_LOCAL,
 );
 
-/// The stable capability name used in config bindings.
-pub const CAPABILITY_NAME: &str =
-    <dyn BearerTokenProvider as super::registry::ExtensionCapability>::NAME;
+crate::register_capability!(
+    shared::BearerTokenProvider,
+    "bearer_token_provider",
+    "Provides bearer tokens for authenticated HTTP/gRPC requests (shared variant)",
+    _KNOWN_CAP_BEARER_SHARED,
+);
 
 /// Represents a secret value that should not be exposed in logs or debug output.
 ///
@@ -98,77 +100,80 @@ impl BearerToken {
     }
 }
 
-/// A trait for components that can provide bearer authentication tokens.
+/// !Send variant for local nodes running on a single-threaded LocalSet.
 ///
-/// Extensions implementing this trait can be looked up by other components
-/// (e.g., exporters) to obtain tokens for authentication.
-///
-/// # Thread Safety
-///
-/// - The returned future is `Send` for use with async runtimes like tokio
-/// - The error type is `Send + Sync` for safe propagation across threads
-///
-/// # Subscribing to Token Refresh Events
-///
-/// Use [`subscribe_token_refresh`](BearerTokenProvider::subscribe_token_refresh) to receive notifications when
-/// tokens are refreshed. This is useful for updating HTTP headers or other
-/// authentication state without polling.
-///
-/// # Implementing This Trait
-///
-/// External crates can implement this trait on their extension types:
-///
-/// ```ignore
-/// use async_trait::async_trait;
-/// use otap_df_engine::extension::bearer_token_provider::{BearerToken, BearerTokenProvider};
-/// use otap_df_engine::extension::registry::Error;
-///
-/// struct MyAuthExtension { /* ... */ }
-///
-/// #[async_trait]
-/// impl BearerTokenProvider for MyAuthExtension {
-///     async fn get_token(&self) -> Result<BearerToken, Error> {
-///         // ... acquire token ...
-///         Ok(BearerToken { token: "...".into(), expires_on: 0 })
-///     }
-///
-///     fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>> {
-///         self.token_sender.subscribe()
-///     }
-/// }
-/// ```
-#[async_trait]
-pub trait BearerTokenProvider: Send {
-    /// Returns an authentication token.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the token cannot be obtained.
-    async fn get_token(&self) -> Result<BearerToken, super::registry::Error>;
+/// Implementations can use `Rc`, `RefCell`, and other !Send types.
+/// The returned future is !Send.
+pub mod local {
+    use super::*;
 
-    /// Subscribes to token refresh events.
-    ///
-    /// Returns a new receiver that will be notified whenever the token
-    /// is refreshed. Each call creates an independent subscription.
-    /// The receiver always contains the latest token value (or `None`
-    /// if no token has been acquired yet).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let auth = extension_registry.get::<dyn BearerTokenProvider>("auth")?;
-    /// let mut token_rx = auth.subscribe_token_refresh();
-    ///
-    /// loop {
-    ///     tokio::select! {
-    ///         _ = token_rx.changed() => {
-    ///             if let Some(token) = token_rx.borrow().as_ref() {
-    ///                 // Update headers, etc.
-    ///             }
-    ///         }
-    ///         // ... other branches
-    ///     }
-    /// }
-    /// ```
-    fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+    /// A bearer token provider for local (!Send) contexts.
+    #[async_trait(?Send)]
+    pub trait BearerTokenProvider {
+        /// Returns an authentication token.
+        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
+
+        /// Subscribes to token refresh events.
+        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+    }
+}
+
+/// Send variant for shared nodes that may run on multi-threaded executors.
+///
+/// Implementations must be Send. The returned future is Send.
+pub mod shared {
+    use super::*;
+
+    /// A bearer token provider for shared (Send) contexts.
+    #[async_trait]
+    pub trait BearerTokenProvider: Send {
+        /// Returns an authentication token.
+        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
+
+        /// Subscribes to token refresh events.
+        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+    }
+}
+
+/// Handle that dispatches to either the local or shared variant.
+///
+/// Consumers call methods on the handle without knowing which variant
+/// they received. The engine selects the variant at pipeline build time
+/// based on extension scope and consumer node type.
+pub enum BearerTokenProviderHandle {
+    /// !Send variant — used for local consumers of pipeline-scoped extensions.
+    Local(Box<dyn local::BearerTokenProvider>),
+    /// Send variant — used for shared consumers or cross-scope extensions.
+    Shared(Box<dyn shared::BearerTokenProvider>),
+}
+
+impl BearerTokenProviderHandle {
+    /// Returns an authentication token from the underlying provider.
+    pub async fn get_token(&self) -> Result<BearerToken, super::registry::Error> {
+        match self {
+            Self::Local(p) => p.get_token().await,
+            Self::Shared(p) => p.get_token().await,
+        }
+    }
+
+    /// Subscribes to token refresh events from the underlying provider.
+    pub fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>> {
+        match self {
+            Self::Local(p) => p.subscribe_token_refresh(),
+            Self::Shared(p) => p.subscribe_token_refresh(),
+        }
+    }
+}
+
+impl super::registry::CapabilityHandle for BearerTokenProviderHandle {
+    type Local = dyn local::BearerTokenProvider;
+    type Shared = dyn shared::BearerTokenProvider;
+
+    fn from_local(local: Box<<Self as super::registry::CapabilityHandle>::Local>) -> Self {
+        Self::Local(local)
+    }
+
+    fn from_shared(shared: Box<<Self as super::registry::CapabilityHandle>::Shared>) -> Self {
+        Self::Shared(shared)
+    }
 }

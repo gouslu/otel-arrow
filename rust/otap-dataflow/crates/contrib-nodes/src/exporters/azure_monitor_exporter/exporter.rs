@@ -8,7 +8,7 @@ use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
+use otap_df_engine::extension::bearer_token_provider::BearerTokenProviderHandle;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
@@ -53,7 +53,7 @@ const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
 /// Azure Monitor exporter.
 pub struct AzureMonitorExporter {
     config: Config,
-    auth: Box<dyn BearerTokenProvider>,
+    auth: BearerTokenProviderHandle,
     transformer: Transformer,
     gzip_batcher: GzipBatcher,
     state: AzureMonitorExporterState,
@@ -69,7 +69,7 @@ impl AzureMonitorExporter {
     pub fn new(
         pipeline_ctx: PipelineContext,
         config: Config,
-        auth: Box<dyn BearerTokenProvider>,
+        auth: BearerTokenProviderHandle,
     ) -> Result<Self, Error> {
         // Validate configuration
         config
@@ -614,7 +614,9 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use otap_df_engine::context::{ControllerContext, PipelineContext};
-    use otap_df_engine::extension::bearer_token_provider::BearerToken;
+    use otap_df_engine::extension::bearer_token_provider::{
+        BearerToken, local::BearerTokenProvider,
+    };
     use otap_df_engine::local::exporter::EffectHandler;
     use otap_df_engine::node::NodeId;
     use otap_df_otap::pdata::Context;
@@ -634,7 +636,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl BearerTokenProvider for MockTokenProvider {
         async fn get_token(
             &self,
@@ -647,8 +649,8 @@ mod tests {
         }
     }
 
-    fn create_mock_auth() -> Box<dyn BearerTokenProvider> {
-        Box::new(MockTokenProvider::new())
+    fn create_mock_auth() -> BearerTokenProviderHandle {
+        BearerTokenProviderHandle::Local(Box::new(MockTokenProvider::new()))
     }
 
     fn create_test_pipeline_ctx() -> PipelineContext {

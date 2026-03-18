@@ -1,12 +1,16 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Extension wrapper and unified Extension trait.
+//! Extension wrapper and infrastructure.
 //!
 //! Extensions are PData-free — they never process pipeline data, only control
-//! messages. This module defines the [`Extension`] trait, [`ControlChannel`],
-//! [`EffectHandler`], and the [`ExtensionWrapper`] struct that the engine uses
-//! to start and manage extension instances.
+//! messages. This module defines [`ControlChannel`], [`EffectHandler`], and
+//! the [`ExtensionWrapper`] struct that the engine uses to start and manage
+//! extension instances.
+//!
+//! For the local (!Send) and shared (Send) Extension traits, see
+//! [`local::extension`](crate::local::extension) and
+//! [`shared::extension`](crate::shared::extension).
 //!
 //! For the registry and sealed trait infrastructure, see
 //! [`registry`](registry).
@@ -26,10 +30,11 @@ use crate::context::PipelineContext;
 use crate::control::ExtensionControlMsg;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
+use crate::local::extension as local_ext;
 use crate::node::NodeId;
+use crate::shared::extension as shared_ext;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::terminal_state::TerminalState;
-use async_trait::async_trait;
 use otap_df_channel::error::RecvError;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_telemetry::reporter::MetricsReporter;
@@ -37,59 +42,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{Sleep, sleep_until};
-
-// ── Extension trait ─────────────────────────────────────────────────────────
-
-/// A trait for pipeline extensions.
-///
-/// Extensions are long-lived components that run alongside the pipeline and
-/// expose functionality (e.g., authentication, service discovery) to other
-/// components through the [`CapabilityRegistry`](crate::extension::registry::CapabilityRegistry).
-///
-/// Unlike receivers, processors, and exporters, extensions are NOT generic over
-/// PData — they never process pipeline data.
-///
-/// # Thread Safety
-///
-/// The `Extension` trait requires the `Send` bound, enabling use in both
-/// single-threaded and multi-threaded runtime contexts.
-#[async_trait]
-pub trait Extension: Send {
-    /// Starts the extension.
-    ///
-    /// The pipeline engine calls this to start the extension in a dedicated task.
-    /// Extensions are started BEFORE receivers, processors, and exporters so that
-    /// their capabilities are available when data-path components initialize.
-    ///
-    /// The extension is taken as `Box<Self>` so the method takes ownership once
-    /// `start` is called. This lets it move into an independent task, after which
-    /// the pipeline can only reach it through the control-message channel.
-    ///
-    /// # Parameters
-    ///
-    /// - `ctrl_chan`: A channel to receive control messages. Extensions do not
-    ///   receive PData messages — only control messages (shutdown, timer, config).
-    /// - `effect_handler`: A handler to perform side effects such as
-    ///   info logging.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`Error`] if an unrecoverable error occurs.
-    async fn start(
-        self: Box<Self>,
-        mut ctrl_chan: ControlChannel,
-        _effect_handler: EffectHandler,
-    ) -> Result<TerminalState, Error> {
-        // Default: no background task. Wait for shutdown and exit.
-        loop {
-            match ctrl_chan.recv().await? {
-                ExtensionControlMsg::Shutdown { .. } => break,
-                _ => {}
-            }
-        }
-        Ok(TerminalState::default())
-    }
-}
 
 // ── ControlChannel ──────────────────────────────────────────────────────────
 
@@ -231,6 +183,19 @@ impl EffectHandler {
     }
 }
 
+// ── ExtensionImpl ───────────────────────────────────────────────────────────
+
+/// The extension implementation, which can be either local (!Send) or shared (Send).
+///
+/// Used internally by [`ExtensionWrapper::Active`]. Not intended for direct use.
+#[non_exhaustive]
+pub enum ExtensionImpl {
+    /// A !Send extension that runs on a single-threaded LocalSet.
+    Local(Box<dyn local_ext::Extension>),
+    /// A Send extension that can run on multi-threaded executors.
+    Shared(Box<dyn shared_ext::Extension>),
+}
+
 // ── ExtensionWrapper ────────────────────────────────────────────────────────
 
 /// Wrapper for extension instances in the pipeline engine.
@@ -242,7 +207,8 @@ impl EffectHandler {
 /// Two variants exist:
 ///
 /// - **Active** — an extension with a background task that processes control
-///   messages (shutdown, config updates). Created via [`ExtensionWrapper::active`].
+///   messages (shutdown, config updates). Created via [`ExtensionWrapper::active_local`]
+///   or [`ExtensionWrapper::active_shared`].
 ///   Example: an auth extension that periodically refreshes tokens.
 ///
 /// - **Passive** — an extension that only provides capabilities at build time,
@@ -257,8 +223,8 @@ pub enum ExtensionWrapper {
         user_config: Arc<NodeUserConfig>,
         /// The runtime configuration for the extension.
         runtime_config: ExtensionConfig,
-        /// The extension instance.
-        extension: Box<dyn Extension>,
+        /// The extension instance (local or shared).
+        extension: ExtensionImpl,
         /// Capability registrations to publish.
         capabilities: Vec<registry::CapabilityRegistration>,
         /// A sender for control messages.
@@ -282,16 +248,11 @@ pub enum ExtensionWrapper {
 }
 
 impl ExtensionWrapper {
-    /// Creates an **Active** extension with a background task and control channel.
+    /// Creates an **Active** extension with a local (!Send) implementation.
     ///
-    /// Active extensions implement the [`Extension`] trait and are spawned as
-    /// dedicated async tasks. They receive control messages (shutdown, config
-    /// updates) via a control channel.
-    ///
-    /// Capabilities are produced by the factory using the
-    /// [`extension_capabilities!`](crate::extension_capabilities) macro and
-    /// passed in at construction time.
-    pub fn active<E>(
+    /// Local extensions run on a single-threaded `LocalSet` and can use
+    /// `Rc`, `RefCell`, and other !Send types.
+    pub fn active_local<E>(
         capabilities: Vec<registry::CapabilityRegistration>,
         extension: E,
         node_id: NodeId,
@@ -299,7 +260,7 @@ impl ExtensionWrapper {
         config: &ExtensionConfig,
     ) -> Self
     where
-        E: Extension + 'static,
+        E: local_ext::Extension + 'static,
     {
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
@@ -308,7 +269,35 @@ impl ExtensionWrapper {
             node_id,
             user_config,
             runtime_config: config.clone(),
-            extension: Box::new(extension),
+            extension: ExtensionImpl::Local(Box::new(extension)),
+            capabilities,
+            control_sender: SharedSender::mpsc(control_sender),
+            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            telemetry: None,
+        }
+    }
+
+    /// Creates an **Active** extension with a shared (Send) implementation.
+    ///
+    /// Shared extensions implement `Send` and can run on multi-threaded executors.
+    pub fn active_shared<E>(
+        capabilities: Vec<registry::CapabilityRegistration>,
+        extension: E,
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> Self
+    where
+        E: shared_ext::Extension + 'static,
+    {
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(config.control_channel.capacity);
+
+        ExtensionWrapper::Active {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            extension: ExtensionImpl::Shared(Box::new(extension)),
             capabilities,
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
@@ -475,7 +464,10 @@ impl ExtensionWrapper {
                 let control_receiver =
                     control_receiver.expect("control_receiver missing from ExtensionWrapper");
                 let ctrl_chan = ControlChannel::new(control_receiver);
-                extension.start(ctrl_chan, effect_handler).await
+                match extension {
+                    ExtensionImpl::Local(ext) => ext.start(ctrl_chan, effect_handler).await,
+                    ExtensionImpl::Shared(ext) => ext.start(ctrl_chan, effect_handler).await,
+                }
             }
             ExtensionWrapper::Passive { .. } => {
                 panic!(
@@ -512,6 +504,7 @@ impl crate::TelemetryWrapped for ExtensionWrapper {
 mod tests {
     use super::*;
     use crate::control::ExtensionControlMsg;
+    use crate::shared::extension::Extension;
     use crate::testing::{CtrlMsgCounters, test_node};
     use async_trait::async_trait;
     use otap_df_config::node::NodeUserConfig;
@@ -563,6 +556,6 @@ mod tests {
         let config = ExtensionConfig::new("test_extension");
 
         let _wrapper =
-            ExtensionWrapper::active(Vec::new(), extension, node_id, user_config, &config);
+            ExtensionWrapper::active_shared(Vec::new(), extension, node_id, user_config, &config);
     }
 }

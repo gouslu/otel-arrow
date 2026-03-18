@@ -8,11 +8,7 @@
 //! deep-copies each stored extension (which is cheap when the extension itself
 //! wraps shared state in `Arc`).
 //!
-//! Extensions that publish traits override
-//! [`Extension::extension_capabilities`](crate::extension::Extension::extension_capabilities),
-//! using the [`extension_capabilities!`] macro in the factory to declare their
-//! trait implementations. The engine inserts the results into the registry
-//! during pipeline build.
+//! Extensions that publish traits use the [`extension_capabilities!`] macro,
 //!
 //! # Extension writer contract
 //!
@@ -29,7 +25,7 @@
 //! // In the factory:
 //! let ext = MyExtension::new(config)?;
 //! let caps = extension_capabilities!(ext, BearerTokenProvider);
-//! Ok(ExtensionWrapper::active(caps, ext, node_id, user_config, &cfg))
+//! Ok(ExtensionWrapper::active_shared(caps, ext, node_id, user_config, &cfg))
 //!
 //! // A consumer retrieves an owned trait object:
 //! let provider: Box<dyn BearerTokenProvider> = registry
@@ -182,7 +178,7 @@ impl Clone for RegistryEntry {
 /// - The `TypeId` of `Box<dyn Trait>` for registry lookup
 ///
 /// Extension factories produce these and pass them to
-/// [`ExtensionWrapper::active`](crate::extension::ExtensionWrapper::active) or
+/// [`ExtensionWrapper::active_shared`](crate::extension::ExtensionWrapper::active_shared) or
 /// [`ExtensionWrapper::passive`](crate::extension::ExtensionWrapper::passive);
 /// the engine drains them during pipeline build.
 pub struct CapabilityRegistration {
@@ -440,29 +436,36 @@ impl CapabilityRegistry {
             }
 
             // 4. The specific extension must provide the requested capability.
-            let matched = self.handles.iter().find(|((name, _), entry)| {
-                name == extension_name && entry.capability_name == capability_name
-            });
+            //    Insert ALL matching entries (e.g., both local and shared variants)
+            //    so the handle-based dispatch can pick the best variant at factory time.
+            let mut found_any = false;
+            let matched_entries: Vec<_> = self
+                .handles
+                .iter()
+                .filter(|((name, _), entry)| {
+                    name == extension_name && entry.capability_name == capability_name
+                })
+                .collect();
 
-            match matched {
-                Some(((_, type_id), entry)) => {
-                    capabilities.insert_entry(*type_id, entry.clone());
-                }
-                None => {
-                    let available: Vec<&str> = self
-                        .handles
-                        .iter()
-                        .filter(|((name, _), _)| name == extension_name)
-                        .map(|(_, entry)| entry.capability_name)
-                        .collect();
-                    return Err(otap_df_config::error::Error::InvalidUserConfig {
-                        error: format!(
-                            "Extension '{extension_name}' does not provide capability \
-                             '{capability_name}'. It provides: [{}].",
-                            available.join(", "),
-                        ),
-                    });
-                }
+            for ((_, type_id), entry) in &matched_entries {
+                capabilities.insert_entry(*type_id, (*entry).clone());
+                found_any = true;
+            }
+
+            if !found_any {
+                let available: Vec<&str> = self
+                    .handles
+                    .iter()
+                    .filter(|((name, _), _)| name == extension_name)
+                    .map(|(_, entry)| entry.capability_name)
+                    .collect();
+                return Err(otap_df_config::error::Error::InvalidUserConfig {
+                    error: format!(
+                        "Extension '{extension_name}' does not provide capability \
+                         '{capability_name}'. It provides: [{}].",
+                        available.join(", "),
+                    ),
+                });
             }
         }
         Ok(capabilities)
@@ -499,7 +502,7 @@ impl std::fmt::Debug for CapabilityRegistry {
 /// ```
 #[macro_export]
 macro_rules! register_capability {
-    ($trait:ident, $name:literal, $description:literal $(,)?) => {
+    ($trait:path, $name:literal, $description:literal, $static_name:ident $(,)?) => {
         impl $crate::extension::registry::private::Sealed for dyn $trait {
             const MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
                 $crate::extension::registry::private::MACRO_SEAL;
@@ -511,7 +514,10 @@ macro_rules! register_capability {
 
         #[allow(unsafe_code)]
         #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
-        static _KNOWN_CAP: &str = $name;
+        static $static_name: &str = $name;
+    };
+    ($trait:path, $name:literal, $description:literal $(,)?) => {
+        $crate::register_capability!($trait, $name, $description, _KNOWN_CAP);
     };
 }
 
@@ -521,7 +527,7 @@ macro_rules! register_capability {
 /// carrying a cloned copy of the extension and a monomorphised coerce function.
 ///
 /// Used in extension **factories** to produce capabilities that are passed to
-/// [`ExtensionWrapper::active`](crate::extension::ExtensionWrapper::active) or
+/// [`ExtensionWrapper::active_shared`](crate::extension::ExtensionWrapper::active_shared) or
 /// [`ExtensionWrapper::passive`](crate::extension::ExtensionWrapper::passive).
 ///
 /// # Usage
@@ -529,7 +535,7 @@ macro_rules! register_capability {
 /// ```ignore
 /// let ext = MyExtension::new(config)?;
 /// let caps = extension_capabilities!(ext => BearerTokenProvider, SomeOtherTrait);
-/// Ok(ExtensionWrapper::active(caps, ext, node_id, user_config, &cfg))
+/// Ok(ExtensionWrapper::active_shared(caps, ext, node_id, user_config, &cfg))
 /// ```
 ///
 /// # Compile-time guarantees
@@ -538,7 +544,7 @@ macro_rules! register_capability {
 /// - The concrete type implements each listed trait plus `Clone + Send + 'static`.
 #[macro_export]
 macro_rules! extension_capabilities {
-    ($instance:expr => $($trait:ident),+ $(,)?) => {{
+    ($instance:expr => $($trait:path),+ $(,)?) => {{
         // Bind once — avoids multiple evaluations if $instance is an expression.
         let instance = &$instance;
         let mut registrations = Vec::<$crate::extension::registry::CapabilityRegistration>::new();
@@ -607,14 +613,64 @@ macro_rules! extension_capability_names {
 /// the global [`CapabilityRegistry`]. Nodes receive this at factory time
 /// and look up capabilities by type only — no extension names needed.
 ///
+// ── CapabilityHandle ─────────────────────────────────────────────────────────
+
+/// Trait for handle types that dispatch between local and shared capability variants.
+///
+/// Implement this on handle enums (e.g., `BearerTokenProviderHandle`) so the
+/// registry can construct the right variant based on consumer context.
+///
+/// # Example
+///
+/// ```ignore
+/// impl CapabilityHandle for BearerTokenProviderHandle {
+///     type Local = dyn local::BearerTokenProvider;
+///     type Shared = dyn shared::BearerTokenProvider;
+///
+///     fn from_local(local: Box<Self::Local>) -> Self { Self::Local(local) }
+///     fn from_shared(shared: Box<Self::Shared>) -> Self { Self::Shared(shared) }
+/// }
+/// ```
+pub trait CapabilityHandle: Sized {
+    /// The !Send trait type for local consumers.
+    type Local: ?Sized + 'static;
+    /// The Send trait type for shared consumers.
+    type Shared: ?Sized + 'static;
+
+    /// Construct the handle wrapping a local variant.
+    fn from_local(local: Box<Self::Local>) -> Self;
+    /// Construct the handle wrapping a shared variant.
+    fn from_shared(shared: Box<Self::Shared>) -> Self;
+}
+
+/// Whether the consumer is a local or shared node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerType {
+    /// Local node on a single-threaded LocalSet.
+    Local,
+    /// Shared node that may run on multi-threaded executors.
+    Shared,
+}
+
+// ── Capabilities (per-node resolved bindings) ────────────────────────────────
+
+/// Per-node resolved capability bindings.
+///
+/// Produced by [`CapabilityRegistry::resolve_bindings`] during pipeline build.
+/// Nodes use `require()`, `optional()`, or `get_handle()` in their factory to
+/// retrieve capabilities.
+///
 /// # Example
 ///
 /// ```ignore
 /// // Required capability — fails with a clear error if not bound
-/// let auth = capabilities.require::<dyn BearerTokenProvider>()?;
+/// let auth = capabilities.require::<BearerTokenProviderHandle>(
+///     ConsumerType::Local,
+///     "bearer_token_provider",
+/// )?;
 ///
 /// // Optional capability — returns None if not bound
-/// let enrichment = capabilities.optional::<dyn DatasetLookup>();
+/// let enrichment = capabilities.optional::<DatasetLookupHandle>(ConsumerType::Local);
 /// ```
 pub struct Capabilities {
     resolved: HashMap<TypeId, RegistryEntry>,
@@ -647,36 +703,6 @@ impl Capabilities {
         let _ = self.resolved.insert(type_id, entry);
     }
 
-    /// Require a capability by trait type.
-    ///
-    /// Returns the capability if bound, or a standardized error with
-    /// the capability name and guidance on how to fix the config.
-    ///
-    /// Use this for capabilities that the node cannot function without.
-    pub fn require<T: ExtensionCapability + ?Sized + 'static>(
-        &self,
-    ) -> Result<Box<T>, otap_df_config::error::Error> {
-        self.get::<T>().ok_or_else(|| {
-            otap_df_config::error::Error::InvalidUserConfig {
-                error: format!(
-                    "Missing required capability '{}'. Add to your node config:\n  capabilities:\n    {}: <extension_instance_name>",
-                    T::NAME,
-                    T::NAME,
-                ),
-            }
-        })
-    }
-
-    /// Get an optional capability by trait type.
-    ///
-    /// Returns `Some(Box<dyn Trait>)` if the capability was bound,
-    /// `None` if it was not configured for this node.
-    ///
-    /// Use this for capabilities that enhance the node but are not required.
-    pub fn optional<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
-        self.get::<T>()
-    }
-
     /// Returns `true` if no capabilities are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -698,8 +724,71 @@ impl Capabilities {
             .collect()
     }
 
+    /// Require a capability handle by handle type and consumer type.
+    ///
+    /// Selects the local or shared variant based on the consumer type.
+    /// Returns an error with config guidance if the capability is not available.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let auth = capabilities.require::<BearerTokenProviderHandle>(
+    ///     ConsumerType::Local,
+    ///     "bearer_token_provider",
+    /// )?;
+    /// auth.get_token().await?;
+    /// ```
+    pub fn require<H: CapabilityHandle>(
+        &self,
+        consumer_type: ConsumerType,
+        capability_name: &str,
+    ) -> Result<H, otap_df_config::error::Error> {
+        self.get::<H>(consumer_type).ok_or_else(|| {
+            otap_df_config::error::Error::InvalidUserConfig {
+                error: format!(
+                    "Missing required capability '{capability_name}'. Add to your node config:\n  capabilities:\n    {capability_name}: <extension_instance_name>",
+                ),
+            }
+        })
+    }
+
+    /// Get an optional capability handle by handle type and consumer type.
+    ///
+    /// Returns `None` if the capability was not configured for this node.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if let Some(auth) = capabilities.optional::<BearerTokenProviderHandle>(ConsumerType::Local) {
+    ///     auth.get_token().await?;
+    /// }
+    /// ```
+    pub fn optional<H: CapabilityHandle>(&self, consumer_type: ConsumerType) -> Option<H> {
+        self.get::<H>(consumer_type)
+    }
+
+    /// Get a capability handle, selecting the local or shared variant
+    /// based on the consumer type.
+    ///
+    /// For local consumers, tries the local variant first. If unavailable,
+    /// falls back to the shared variant (shared impls work on local nodes too).
+    /// For shared consumers, always uses the shared variant.
+    fn get<H: CapabilityHandle>(&self, consumer_type: ConsumerType) -> Option<H> {
+        match consumer_type {
+            ConsumerType::Local => {
+                // Prefer local variant; fall back to shared
+                if let Some(local) = self.get_raw::<H::Local>() {
+                    Some(H::from_local(local))
+                } else {
+                    self.get_raw::<H::Shared>().map(H::from_shared)
+                }
+            }
+            ConsumerType::Shared => self.get_raw::<H::Shared>().map(H::from_shared),
+        }
+    }
+
     /// Internal typed lookup — clones via the stored coerce function.
-    fn get<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
+    fn get_raw<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         let key = TypeId::of::<Box<T>>();
         let entry = self.resolved.get(&key)?;
         let _ = self.accessed.borrow_mut().insert(key);
@@ -721,7 +810,8 @@ impl Default for Capabilities {
 mod tests {
     use super::*;
     use crate::extension::bearer_token_provider::BearerToken;
-    use crate::extension::bearer_token_provider::BearerTokenProvider;
+    use crate::extension::bearer_token_provider::BearerTokenProviderHandle;
+    use crate::extension::bearer_token_provider::shared::BearerTokenProvider;
     use tokio::sync::watch;
 
     #[derive(Clone)]
@@ -990,7 +1080,8 @@ mod tests {
     #[test]
     fn test_require_missing_capability() {
         let caps = Capabilities::new();
-        let result = caps.require::<dyn BearerTokenProvider>();
+        let result = caps
+            .require::<BearerTokenProviderHandle>(ConsumerType::Shared, "bearer_token_provider");
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("Missing required capability"), "{msg}");
@@ -1012,7 +1103,9 @@ mod tests {
         assert_eq!(unused, vec!["bearer_token_provider"]);
 
         // After accessing, none are unused.
-        let _ = caps.require::<dyn BearerTokenProvider>().unwrap();
+        let _ = caps
+            .require::<BearerTokenProviderHandle>(ConsumerType::Shared, "bearer_token_provider")
+            .unwrap();
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),

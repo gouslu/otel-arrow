@@ -26,14 +26,15 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extension::bearer_token_provider::{BearerToken, BearerTokenProvider};
+use otap_df_engine::extension::bearer_token_provider::{BearerToken, shared::BearerTokenProvider};
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
 
 use otap_df_engine::control::ExtensionControlMsg;
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::extension::{ControlChannel, EffectHandler, Extension};
+use otap_df_engine::extension::{ControlChannel, EffectHandler};
+use otap_df_engine::shared::extension::Extension;
 use otap_df_engine::terminal_state::TerminalState;
 
 use super::config::{AuthMethod, Config};
