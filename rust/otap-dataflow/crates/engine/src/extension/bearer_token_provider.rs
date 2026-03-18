@@ -4,26 +4,25 @@
 //! Bearer token provider extension capability.
 //!
 //! Provides `local::BearerTokenProvider` (!Send) and `shared::BearerTokenProvider` (Send)
-//! variants, plus a `BearerTokenProviderHandle` that dispatches to whichever
+//! variants, plus a `BearerTokenProvider` handle that dispatches to whichever
 //! variant the engine selects for the consumer.
 
 use async_trait::async_trait;
 use std::borrow::Cow;
 
-// Register both local and shared variants as known capabilities.
-// Using unique static names to avoid linker collisions.
-crate::register_capability!(
-    local::BearerTokenProvider,
+// Register the public capability at the handle level. Local/shared trait
+// variants are internal implementation details selected by the engine.
+crate::register_capability_handle!(
+    BearerTokenProvider,
     "bearer_token_provider",
-    "Provides bearer tokens for authenticated HTTP/gRPC requests (local variant)",
-    _KNOWN_CAP_BEARER_LOCAL,
+    "Provides bearer tokens for authenticated HTTP/gRPC requests",
+    _KNOWN_CAP_BEARER_HANDLE,
 );
 
-crate::register_capability!(
+crate::register_capability_handle_traits!(
+    BearerTokenProvider,
+    local::BearerTokenProvider,
     shared::BearerTokenProvider,
-    "bearer_token_provider",
-    "Provides bearer tokens for authenticated HTTP/gRPC requests (shared variant)",
-    _KNOWN_CAP_BEARER_SHARED,
 );
 
 /// Represents a secret value that should not be exposed in logs or debug output.
@@ -140,14 +139,14 @@ pub mod shared {
 /// Consumers call methods on the handle without knowing which variant
 /// they received. The engine selects the variant at pipeline build time
 /// based on extension scope and consumer node type.
-pub enum BearerTokenProviderHandle {
+pub enum BearerTokenProvider {
     /// !Send variant — used for local consumers of pipeline-scoped extensions.
     Local(Box<dyn local::BearerTokenProvider>),
     /// Send variant — used for shared consumers or cross-scope extensions.
     Shared(Box<dyn shared::BearerTokenProvider>),
 }
 
-impl BearerTokenProviderHandle {
+impl BearerTokenProvider {
     /// Returns an authentication token from the underlying provider.
     pub async fn get_token(&self) -> Result<BearerToken, super::registry::Error> {
         match self {
@@ -165,7 +164,10 @@ impl BearerTokenProviderHandle {
     }
 }
 
-impl super::registry::CapabilityHandle for BearerTokenProviderHandle {
+impl super::registry::CapabilityHandle for BearerTokenProvider {
+    const CAPABILITY_NAME: &'static str =
+        <Self as super::registry::ExtensionCapability>::NAME;
+
     type Local = dyn local::BearerTokenProvider;
     type Shared = dyn shared::BearerTokenProvider;
 

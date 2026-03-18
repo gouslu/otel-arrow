@@ -5,11 +5,16 @@
 //!
 //! Local extensions do not require `Send`, allowing the use of `Rc`, `RefCell`,
 //! and other !Send types. They run on a single-threaded `LocalSet`.
+//!
+//! The `start` method takes `Rc<Self>` rather than `Box<Self>`, enabling true
+//! single-instance sharing: the same `Rc` is used for both the background task
+//! and capability trait objects, with zero-cost refcount cloning.
 
 use crate::error::Error;
 use crate::extension::{ControlChannel, EffectHandler};
 use crate::terminal_state::TerminalState;
 use async_trait::async_trait;
+use std::rc::Rc;
 
 /// A trait for pipeline extensions (!Send variant).
 ///
@@ -25,6 +30,12 @@ use async_trait::async_trait;
 /// The local `Extension` trait does NOT require the `Send` bound, allowing
 /// use of `Rc`, `RefCell`, and other !Send types within a single-threaded
 /// `LocalSet`.
+///
+/// # Ownership
+///
+/// `start` takes `Rc<Self>` so the same instance can serve both the background
+/// task and capability consumers without cloning internal state. The `Rc`
+/// wrapper is managed by the engine — extension authors just implement the trait.
 #[async_trait(?Send)]
 pub trait Extension {
     /// Starts the extension.
@@ -32,6 +43,9 @@ pub trait Extension {
     /// The pipeline engine calls this to start the extension in a dedicated task.
     /// Extensions are started BEFORE receivers, processors, and exporters so that
     /// their capabilities are available when data-path components initialize.
+    ///
+    /// Takes `Rc<Self>` so the running extension and its capability trait objects
+    /// share the same instance via refcounting — no data cloning needed.
     ///
     /// # Parameters
     ///
@@ -42,7 +56,7 @@ pub trait Extension {
     ///
     /// Returns an [`Error`] if an unrecoverable error occurs.
     async fn start(
-        self: Box<Self>,
+        self: Rc<Self>,
         ctrl_chan: ControlChannel,
         effect_handler: EffectHandler,
     ) -> Result<TerminalState, Error>;

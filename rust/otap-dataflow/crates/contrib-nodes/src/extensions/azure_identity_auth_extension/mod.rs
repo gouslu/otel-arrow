@@ -27,12 +27,14 @@
 //!       scope: "https://monitor.azure.com/.default"
 //! ```
 //!
-//! Consumers retrieve the extension by name from the registry:
+//! Consumers bind the capability in node config and retrieve the handle from
+//! resolved capabilities at factory time:
 //!
 //! ```ignore
-//! let provider: Box<dyn BearerTokenProvider> = extension_registry
-//!     .get::<dyn BearerTokenProvider>("azure_auth")?;
-//! let mut token_rx = provider.subscribe_token_refresh();
+//! let auth = capabilities.require::<
+//!     otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
+//! >()?;
+//! let mut token_rx = auth.subscribe_token_refresh();
 //! ```
 
 use linkme::distributed_slice;
@@ -70,7 +72,9 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     // NOTE: The trait list here duplicates the one in `extension_capabilities!`
     // below. A declarative macro could unify both, but isn't worth the rigidity
     // until there are multiple extensions following the same pattern.
-    capabilities: otap_df_engine::extension_capability_names!(BearerTokenProvider),
+    capabilities: otap_df_engine::extension_capability_names!(
+        otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
+    ),
     create: |_: PipelineContext,
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
@@ -96,8 +100,11 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
                 }
             })?;
 
-        Ok(ExtensionWrapper::active_shared(
-            otap_df_engine::extension_capabilities!(extension => BearerTokenProvider),
+        Ok(ExtensionWrapper::active().cloned().shared(
+            otap_df_engine::extension_capabilities!(
+                cloned(extension) => otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
+                BearerTokenProvider
+            ),
             extension,
             node,
             node_config,
