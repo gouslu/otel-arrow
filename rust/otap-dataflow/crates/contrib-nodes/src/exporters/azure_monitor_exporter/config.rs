@@ -29,6 +29,9 @@ pub struct ApiConfig {
     /// Schema mapping configuration
     #[serde(default)]
     pub schema: SchemaConfig,
+
+    /// Arm Resource ID header for the logs exported to Azure Monitor (optional)
+    pub azure_monitor_source_resourceid: Option<String>,
 }
 
 /// Schema mapping configuration
@@ -137,6 +140,7 @@ mod tests {
                 stream_name: "mystream".to_string(),
                 dcr: "mydcr".to_string(),
                 schema: SchemaConfig::default(),
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -151,6 +155,7 @@ mod tests {
                 stream_name: "".to_string(),
                 dcr: "".to_string(),
                 schema: SchemaConfig::default(),
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -178,6 +183,7 @@ mod tests {
                         ("attributes".into(), json!({"user.name": "Name"})),
                     ]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -217,6 +223,7 @@ mod tests {
                         ),
                     ]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -245,6 +252,7 @@ mod tests {
                         json!({"nested": "NotAllowed"}),
                     )]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -273,6 +281,7 @@ mod tests {
                     scope_mapping: HashMap::from([("scope.name".into(), "Name".into())]),
                     log_record_mapping: HashMap::new(),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -301,6 +310,7 @@ mod tests {
                         json!("TimeGenerated"),
                     )]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -329,6 +339,7 @@ mod tests {
                         json!({"log.source": "Source"}),
                     )]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -357,6 +368,7 @@ mod tests {
                         json!({"app.version": "Version"}),
                     )]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
@@ -396,9 +408,31 @@ mod tests {
                         ),
                     ]),
                 },
+                azure_monitor_source_resourceid: None,
             },
         };
 
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_azure_monitor_source_resourceid_from_config() {
+        let config = Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://example.com".to_string(),
+                stream_name: "mystream".to_string(),
+                dcr: "mydcr".to_string(),
+                schema: SchemaConfig::default(),
+                azure_monitor_source_resourceid: Some(
+                    "/subscriptions/test-sub/resourceGroups/test-rg".to_string(),
+                ),
+            },
+        };
+
+        assert_eq!(
+            config.api.azure_monitor_source_resourceid,
+            Some("/subscriptions/test-sub/resourceGroups/test-rg".to_string())
+        );
         assert!(config.validate().is_ok());
     }
 }
