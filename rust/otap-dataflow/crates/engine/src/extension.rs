@@ -194,12 +194,12 @@ impl EffectHandler {
 /// The engine registers capabilities and starts lifecycles for whichever
 /// variants are present.
 ///
-/// # Constructors
-///
+/// Use the builder to construct:
 /// ```ignore
-/// ExtensionWrapper::shared(ext, node, config, ext_config)
-/// ExtensionWrapper::local(Rc::new(ext), node, config, ext_config)
-/// ExtensionWrapper::dual(ext.clone(), Rc::new(ext), node, config, ext_config)
+/// ExtensionWrapper::builder(node, config, ext_config)
+///     .with_local(Rc::new(local_ext))
+///     .with_shared(shared_ext)
+///     .build()
 /// ```
 pub struct ExtensionWrapper {
     /// Index identifier for the node.

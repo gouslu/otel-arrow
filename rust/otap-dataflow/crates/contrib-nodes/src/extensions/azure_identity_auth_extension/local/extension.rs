@@ -19,7 +19,7 @@ use otap_df_engine::terminal_state::TerminalState;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::extensions::azure_identity_auth_extension::config::{AuthMethod, Config};
+use crate::extensions::azure_identity_auth_extension::config::Config;
 use crate::extensions::azure_identity_auth_extension::core;
 use crate::extensions::azure_identity_auth_extension::error::Error;
 
@@ -36,7 +36,6 @@ pub struct AzureIdentityAuthExtension {
     credential: Arc<dyn TokenCredential>,
     credential_type: &'static str,
     scope: String,
-    method: AuthMethod,
     client_id: Option<String>,
     token_sender: watch::Sender<Option<BearerToken>>,
 }
@@ -53,7 +52,6 @@ impl AzureIdentityAuthExtension {
             credential,
             credential_type,
             scope: config.scope,
-            method: config.method,
             client_id: config.client_id,
             token_sender,
         })

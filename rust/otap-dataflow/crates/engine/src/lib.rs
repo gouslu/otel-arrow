@@ -220,16 +220,15 @@ pub struct ExtensionFactory {
     /// The capabilities this extension provides.
     ///
     /// Carries both human-readable names (for documentation/validation) and the
-    /// registration function used at pipeline build time.
+    /// registration functions used at pipeline build time.
     ///
-    /// Use [`local_extension_capabilities!`](crate::local_extension_capabilities) or
-    /// [`shared_extension_capabilities!`](crate::shared_extension_capabilities) to
-    /// produce this from the concrete extension type and capability handle types.
+    /// Use [`extension_capabilities!`](crate::extension_capabilities) to produce
+    /// this from the concrete extension type(s) and capability handle types.
     pub capabilities: extension::registry::ExtensionCapabilities,
-    /// A function that creates both local and shared extension instances.
+    /// A function that creates a new extension instance.
     ///
-    /// Returns a pair `(local_wrapper, shared_wrapper)`. The engine registers
-    /// capabilities from both, then starts only the variant(s) that have consumers.
+    /// Returns an `ExtensionWrapper` built via the builder pattern.
+    /// The wrapper may contain local, shared, or both lifecycle variants.
     pub create: fn(
         pipeline: PipelineContext,
         node: NodeId,
@@ -835,26 +834,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         }
 
         let edges = collect_hyper_edges_runtime_from_connections(&config, &build_state)?;
-
-        // Drop extension variants that no consumer used.
-        // Currently all consumers are local, so shared extensions are dropped.
-        // TODO: implement per-extension-name tracking when mixed local/shared consumers exist.
-        let extensions: Vec<ExtensionWrapper> = extensions
-            .into_iter()
-            .filter(|ext| {
-                if ext.is_local() {
-                    // Keep local if any consumer used local capabilities
-                    // For now, always keep local (all current consumers are local)
-                    true
-                } else if ext.is_shared() {
-                    // Keep shared only if a consumer explicitly asked for shared
-                    // For now, keep shared too (needed for future shared consumers)
-                    true
-                } else {
-                    false
-                }
-            })
-            .collect();
 
         // First pass: plan hyper-edge wiring to avoid multiple mutable borrows
         let buffer_size = NonZeroUsize::new(channel_capacity_policy.pdata)
@@ -1869,10 +1848,6 @@ struct BuildState<PData> {
     nodes: NodeDefs<PData, PipeNode>,
     registry: HashMap<NodeName, NodeRegistration>,
     channel_metrics: ChannelMetricsRegistry,
-    /// Tracks whether any consumer consumed a local capability variant.
-    any_local_consumed: bool,
-    /// Tracks whether any consumer consumed a shared capability variant.
-    any_shared_consumed: bool,
 }
 
 impl<PData> BuildState<PData> {
@@ -1881,18 +1856,6 @@ impl<PData> BuildState<PData> {
             nodes: NodeDefs::default(),
             registry: HashMap::new(),
             channel_metrics: ChannelMetricsRegistry::default(),
-            any_local_consumed: false,
-            any_shared_consumed: false,
-        }
-    }
-
-    /// Update variant consumption from a node's capabilities after factory call.
-    fn track_consumed_variants(&mut self, capabilities: &Capabilities) {
-        if capabilities.consumed_local() {
-            self.any_local_consumed = true;
-        }
-        if capabilities.consumed_shared() {
-            self.any_shared_consumed = true;
         }
     }
 
