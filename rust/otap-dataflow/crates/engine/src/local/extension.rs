@@ -10,6 +10,7 @@
 //! single-instance sharing: the same `Rc` is used for both the background task
 //! and capability trait objects, with zero-cost refcount cloning.
 
+use crate::control::ExtensionControlMsg;
 use crate::error::Error;
 use crate::extension::{ControlChannel, EffectHandler};
 use crate::terminal_state::TerminalState;
@@ -47,6 +48,13 @@ pub trait Extension {
     /// Takes `Rc<Self>` so the running extension and its capability trait objects
     /// share the same instance via refcounting — no data cloning needed.
     ///
+    /// **Passive extensions** (those that only expose capabilities without
+    /// running background work) can omit this method — the default
+    /// implementation waits for shutdown and returns cleanly.
+    ///
+    /// **Active extensions** (those that run background tasks like token
+    /// refresh or periodic polling) should override this method.
+    ///
     /// # Parameters
     ///
     /// - `ctrl_chan`: A channel to receive control messages.
@@ -57,7 +65,16 @@ pub trait Extension {
     /// Returns an [`Error`] if an unrecoverable error occurs.
     async fn start(
         self: Rc<Self>,
-        ctrl_chan: ControlChannel,
-        effect_handler: EffectHandler,
-    ) -> Result<TerminalState, Error>;
+        mut ctrl_chan: ControlChannel,
+        _effect_handler: EffectHandler,
+    ) -> Result<TerminalState, Error> {
+        loop {
+            match ctrl_chan.recv().await? {
+                ExtensionControlMsg::Shutdown { .. } => {
+                    return Ok(TerminalState::default());
+                }
+                _ => {}
+            }
+        }
+    }
 }
