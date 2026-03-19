@@ -44,7 +44,6 @@ use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
 use otap_df_engine::node::NodeId;
-use otap_df_engine::local_extension_capabilities;
 use std::rc::Rc;
 use std::sync::Arc;
 use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
@@ -71,11 +70,8 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     name: AZURE_IDENTITY_AUTH_EXTENSION_URN,
     description: "Azure Identity authentication via managed identity or developer tools",
     documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
-    // NOTE: The trait list here duplicates the one in `shared_extension_capabilities!`
-    // below. A declarative macro could unify both, but isn't worth the rigidity
-    // until there are multiple extensions following the same pattern.
-    capabilities: otap_df_engine::extension_capability_names!(
-        BearerTokenProvider
+    capabilities: otap_df_engine::local_extension_capabilities!(
+        AzureIdentityAuthExtension => BearerTokenProvider
     ),
     create: |_: PipelineContext,
              node: NodeId,
@@ -104,7 +100,6 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
 
         Ok(ExtensionWrapper::local(
             Rc::new(extension),
-            local_extension_capabilities!(AzureIdentityAuthExtension => BearerTokenProvider),
             node,
             node_config,
             extension_config,

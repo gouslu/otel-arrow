@@ -214,8 +214,10 @@ pub enum ExtensionWrapper {
         runtime_config: ExtensionConfig,
         /// The extension instance (Rc for true single instance).
         extension: std::rc::Rc<dyn crate::local::extension::Extension>,
-        /// Local capability registrations to publish (Rc-backed).
-        capabilities: Vec<registry::local::CapabilityRegistration>,
+        /// The extension as `Rc<dyn Any>` for capability registration.
+        extension_any: std::rc::Rc<dyn std::any::Any>,
+        /// Capabilities descriptor with names + registration fn.
+        capabilities: registry::ExtensionCapabilities,
         /// A sender for control messages.
         control_sender: SharedSender<ExtensionControlMsg>,
         /// A receiver for control messages.
@@ -236,8 +238,10 @@ pub enum ExtensionWrapper {
         runtime_config: ExtensionConfig,
         /// The extension instance.
         extension: Box<dyn crate::shared::extension::Extension>,
-        /// Shared capability registrations to publish.
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
+        /// Type-erased clone of the extension for capability registration.
+        extension_any: Box<dyn registry::CloneAnySend>,
+        /// Capabilities descriptor with names + registration fn.
+        capabilities: registry::ExtensionCapabilities,
         /// A sender for control messages.
         control_sender: SharedSender<ExtensionControlMsg>,
         /// A receiver for control messages.
@@ -267,7 +271,6 @@ impl ExtensionWrapper {
     /// ```
     pub fn local<E>(
         extension: std::rc::Rc<E>,
-        capabilities: impl FnOnce(&std::rc::Rc<E>) -> Vec<registry::local::CapabilityRegistration>,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
         config: &ExtensionConfig,
@@ -275,7 +278,7 @@ impl ExtensionWrapper {
     where
         E: crate::local::extension::Extension + 'static,
     {
-        let caps = capabilities(&extension);
+        let extension_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
 
@@ -284,7 +287,13 @@ impl ExtensionWrapper {
             user_config,
             runtime_config: config.clone(),
             extension,
-            capabilities: caps,
+            extension_any,
+            capabilities: registry::ExtensionCapabilities::Local(
+                registry::LocalExtensionCapabilities {
+                    names: &[],
+                    register: |_| Vec::new(),
+                },
+            ),
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
@@ -310,15 +319,14 @@ impl ExtensionWrapper {
     /// ```
     pub fn shared<E>(
         extension: E,
-        capabilities: impl FnOnce(&E) -> Vec<registry::shared::CapabilityRegistration>,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
         config: &ExtensionConfig,
     ) -> Self
     where
-        E: crate::shared::extension::Extension + 'static,
+        E: crate::shared::extension::Extension + Clone + Send + 'static,
     {
-        let caps = capabilities(&extension);
+        let extension_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
 
@@ -327,10 +335,26 @@ impl ExtensionWrapper {
             user_config,
             runtime_config: config.clone(),
             extension: Box::new(extension),
-            capabilities: caps,
+            extension_any,
+            capabilities: registry::ExtensionCapabilities::Shared(
+                registry::SharedExtensionCapabilities {
+                    names: &[],
+                    register: |_| Vec::new(),
+                },
+            ),
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
+        }
+    }
+
+    /// Sets the capabilities descriptor. Called by the engine after `create()`.
+    pub fn set_capabilities(&mut self, caps: registry::ExtensionCapabilities) {
+        match self {
+            ExtensionWrapper::Local { capabilities, .. }
+            | ExtensionWrapper::Shared { capabilities, .. } => {
+                *capabilities = caps;
+            }
         }
     }
 
@@ -352,19 +376,27 @@ impl ExtensionWrapper {
         }
     }
 
-    /// Drains the stored capability registrations and inserts them into
-    /// the registry under the given name.
+    /// Materializes capability registrations and inserts them into the registry.
     pub fn register_traits(&mut self, registry: &mut registry::CapabilityRegistry, name: &str) {
         match self {
             ExtensionWrapper::Local {
-                capabilities, ..
+                extension_any,
+                capabilities: registry::ExtensionCapabilities::Local(caps),
+                ..
             } => {
-                registry.register_all_local(name, std::mem::take(capabilities));
+                let regs = (caps.register)(std::rc::Rc::clone(extension_any));
+                registry.register_all_local(name, regs);
             }
             ExtensionWrapper::Shared {
-                capabilities, ..
+                extension_any,
+                capabilities: registry::ExtensionCapabilities::Shared(caps),
+                ..
             } => {
-                registry.register_all_shared(name, std::mem::take(capabilities));
+                let regs = (caps.register)(extension_any.as_any_ref());
+                registry.register_all_shared(name, regs);
+            }
+            _ => {
+                panic!("ExtensionWrapper variant does not match capabilities variant — this is a bug");
             }
         }
     }
@@ -398,6 +430,7 @@ impl ExtensionWrapper {
                 user_config,
                 runtime_config,
                 extension,
+                extension_any,
                 capabilities,
                 control_sender,
                 control_receiver,
@@ -419,6 +452,7 @@ impl ExtensionWrapper {
                     user_config,
                     runtime_config,
                     extension,
+                    extension_any,
                     capabilities,
                     control_sender,
                     control_receiver: Some(control_receiver),
@@ -430,6 +464,7 @@ impl ExtensionWrapper {
                 user_config,
                 runtime_config,
                 extension,
+                extension_any,
                 capabilities,
                 control_sender,
                 control_receiver,
@@ -451,6 +486,7 @@ impl ExtensionWrapper {
                     user_config,
                     runtime_config,
                     extension,
+                    extension_any,
                     capabilities,
                     control_sender,
                     control_receiver: Some(control_receiver),
@@ -591,7 +627,6 @@ mod tests {
 
         let _wrapper = ExtensionWrapper::shared(
             extension,
-            |_| Vec::new(),
             node_id,
             user_config,
             &config,

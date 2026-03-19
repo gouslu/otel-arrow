@@ -217,12 +217,15 @@ pub struct ExtensionFactory {
     pub description: &'static str,
     /// URL to the extension's documentation.
     pub documentation_url: &'static str,
-    /// The capability names this extension provides.
+    /// The capabilities this extension provides.
     ///
-    /// Use [`extension_capability_names!`](crate::extension_capability_names) to
-    /// derive this from the sealed [`ExtensionCapability::NAME`] constants so it
-    /// cannot drift from what `create()` actually registers.
-    pub capabilities: &'static [&'static str],
+    /// Carries both human-readable names (for documentation/validation) and the
+    /// registration function used at pipeline build time.
+    ///
+    /// Use [`local_extension_capabilities!`](crate::local_extension_capabilities) or
+    /// [`shared_extension_capabilities!`](crate::shared_extension_capabilities) to
+    /// produce this from the concrete extension type and capability handle types.
+    pub capabilities: extension::registry::ExtensionCapabilities,
     /// A function that creates a new extension instance.
     pub create: fn(
         pipeline: PipelineContext,
@@ -245,7 +248,7 @@ impl Clone for ExtensionFactory {
             name: self.name,
             description: self.description,
             documentation_url: self.documentation_url,
-            capabilities: self.capabilities,
+            capabilities: self.capabilities.clone(),
             create: self.create,
             validate_config: self.validate_config,
         }
@@ -1750,13 +1753,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             ExtensionConfig::with_control_channel_capacity(name.clone(), control_channel_capacity);
         let create = factory.create;
 
-        let extension = create(
+        let mut extension = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
             &extension_config,
         )
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
+
+        // Wire up capabilities from the factory descriptor.
+        extension.set_capabilities(factory.capabilities.clone());
 
         otel_debug!(
             "extension.create.complete",
