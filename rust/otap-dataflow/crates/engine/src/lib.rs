@@ -742,6 +742,8 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let mut receivers = Vec::new();
         let mut processors = Vec::new();
         let mut exporters = Vec::new();
+        let mut any_local_consumed = false;
+        let mut any_shared_consumed = false;
         for (name, node_config) in config.node_iter() {
             let node_kind = node_config.kind();
             let node_id = node_ids.get(name).expect("allocated in first pass").clone();
@@ -763,6 +765,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         }
                     }
 
+                    let consumed = std::cell::Cell::new((false, false));
                     let wrapper = self.build_node_wrapper(
                         &mut build_state,
                         &base_ctx,
@@ -770,19 +773,25 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         node_id.clone(),
                         channel_metrics_enabled,
                         || {
-                            self.create_receiver(
+                            let (recv, local, shared) = self.create_receiver(
                                 &base_ctx,
                                 node_id.clone(),
                                 node_config.clone(),
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
                                 &extension_registry,
-                            )
+                            )?;
+                            consumed.set((local, shared));
+                            Ok(recv)
                         },
                     )?;
+                    let (local, shared) = consumed.get();
+                    any_local_consumed |= local;
+                    any_shared_consumed |= shared;
                     receivers.push(wrapper);
                 }
                 otap_df_config::node::NodeKind::Processor => {
+                    let consumed = std::cell::Cell::new((false, false));
                     let wrapper = self.build_node_wrapper(
                         &mut build_state,
                         &base_ctx,
@@ -790,19 +799,25 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         node_id.clone(),
                         channel_metrics_enabled,
                         || {
-                            self.create_processor(
+                            let (proc, local, shared) = self.create_processor(
                                 &base_ctx,
                                 node_id.clone(),
                                 node_config.clone(),
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
                                 &extension_registry,
-                            )
+                            )?;
+                            consumed.set((local, shared));
+                            Ok(proc)
                         },
                     )?;
+                    let (local, shared) = consumed.get();
+                    any_local_consumed |= local;
+                    any_shared_consumed |= shared;
                     processors.push(wrapper);
                 }
                 otap_df_config::node::NodeKind::Exporter => {
+                    let consumed = std::cell::Cell::new((false, false));
                     let wrapper = self.build_node_wrapper(
                         &mut build_state,
                         &base_ctx,
@@ -810,16 +825,21 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                         node_id.clone(),
                         channel_metrics_enabled,
                         || {
-                            self.create_exporter(
+                            let (exp, local, shared) = self.create_exporter(
                                 &base_ctx,
                                 node_id.clone(),
                                 node_config.clone(),
                                 channel_capacity_policy.control.node,
                                 channel_capacity_policy.pdata,
                                 &extension_registry,
-                            )
+                            )?;
+                            consumed.set((local, shared));
+                            Ok(exp)
                         },
                     )?;
+                    let (local, shared) = consumed.get();
+                    any_local_consumed |= local;
+                    any_shared_consumed |= shared;
                     exporters.push(wrapper);
                 }
                 otap_df_config::node::NodeKind::Extension => {
@@ -830,6 +850,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                     // ToDo(LQ): Implement processor chain optimization to eliminate intermediary channels.
                     unreachable!("rejected in first pass");
                 }
+            }
+        }
+
+        // Drop unused extension variants based on what consumers actually consumed.
+        for ext in &mut extensions {
+            if !any_local_consumed {
+                ext.drop_local();
+            }
+            if !any_shared_consumed {
+                ext.drop_shared();
             }
         }
 
@@ -1466,7 +1496,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
         capability_registry: &CapabilityRegistry,
-    ) -> Result<ReceiverWrapper<PData>, Error> {
+    ) -> Result<(ReceiverWrapper<PData>, bool, bool), Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
         let core_id = pipeline_ctx.core_id();
@@ -1529,6 +1559,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             )));
         };
 
+        let used_local = capabilities.consumed_local();
+        let used_shared = capabilities.consumed_shared();
+
         otel_debug!(
             "receiver.create.complete",
             pipeline_group_id = pipeline_group_id.as_ref(),
@@ -1537,7 +1570,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             node_id = name.as_ref(),
         );
 
-        Ok(receiver)
+        Ok((receiver, used_local, used_shared))
     }
 
     /// Creates a processor node and adds it to the list of runtime nodes.
@@ -1549,7 +1582,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
         capability_registry: &CapabilityRegistry,
-    ) -> Result<ProcessorWrapper<PData>, Error> {
+    ) -> Result<(ProcessorWrapper<PData>, bool, bool), Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
         let core_id = pipeline_ctx.core_id();
@@ -1612,6 +1645,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             )));
         };
 
+        let used_local = capabilities.consumed_local();
+        let used_shared = capabilities.consumed_shared();
+
         otel_debug!(
             "processor.create.complete",
             pipeline_group_id = pipeline_group_id.as_ref(),
@@ -1620,7 +1656,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             node_id = name.as_ref(),
         );
 
-        Ok(processor)
+        Ok((processor, used_local, used_shared))
     }
 
     /// Creates an exporter node and adds it to the list of runtime nodes.
@@ -1632,7 +1668,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         control_channel_capacity: usize,
         pdata_channel_capacity: usize,
         capability_registry: &CapabilityRegistry,
-    ) -> Result<ExporterWrapper<PData>, Error> {
+    ) -> Result<(ExporterWrapper<PData>, bool, bool), Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
         let core_id = pipeline_ctx.core_id();
@@ -1695,6 +1731,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             )));
         };
 
+        let used_local = capabilities.consumed_local();
+        let used_shared = capabilities.consumed_shared();
+
         otel_debug!(
             "exporter.create.complete",
             pipeline_group_id = pipeline_group_id.as_ref(),
@@ -1703,7 +1742,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             node_id = name.as_ref(),
         );
 
-        Ok(exporter)
+        Ok((exporter, used_local, used_shared))
     }
 
     /// Creates an extension node.

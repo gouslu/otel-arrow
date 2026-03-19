@@ -33,6 +33,7 @@ use crate::error::Error;
 use crate::node::NodeId;
 use crate::shared::extension as shared_ext;
 use crate::shared::message::{SharedReceiver, SharedSender};
+use otap_df_telemetry::otel_debug;
 use crate::terminal_state::TerminalState;
 use otap_df_channel::error::RecvError;
 use otap_df_config::node::NodeUserConfig;
@@ -248,6 +249,10 @@ impl ExtensionWrapperBuilder {
     where
         E: crate::local::extension::Extension + 'static,
     {
+        otel_debug!(
+            "extension.builder.with_local",
+            node_id = self.node_id.name.as_ref(),
+        );
         let local_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
         self.local_extension = Some(extension);
         self.local_any = Some(local_any);
@@ -259,6 +264,10 @@ impl ExtensionWrapperBuilder {
     where
         E: shared_ext::Extension + Clone + Send + 'static,
     {
+        otel_debug!(
+            "extension.builder.with_shared",
+            node_id = self.node_id.name.as_ref(),
+        );
         let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
         self.shared_extension = Some(Box::new(extension));
         self.shared_any = Some(shared_any);
@@ -368,16 +377,50 @@ impl ExtensionWrapper {
         self.shared_extension.is_some()
     }
 
+    /// Drop the local variant if present. Called by the engine when no
+    /// consumer used local capabilities for this extension.
+    pub fn drop_local(&mut self) {
+        if self.local_extension.is_some() {
+            otel_debug!(
+                "extension.drop_local_unused",
+                node_id = self.node_id.name.as_ref(),
+            );
+            self.local_extension = None;
+            self.local_any = None;
+        }
+    }
+
+    /// Drop the shared variant if present. Called by the engine when no
+    /// consumer used shared capabilities for this extension.
+    pub fn drop_shared(&mut self) {
+        if self.shared_extension.is_some() {
+            otel_debug!(
+                "extension.drop_shared_unused",
+                node_id = self.node_id.name.as_ref(),
+            );
+            self.shared_extension = None;
+            self.shared_any = None;
+        }
+    }
+
     /// Materializes capability registrations and inserts them into the registry.
     ///
     /// Registers shared capabilities if a shared instance is present, and
     /// local capabilities if a local instance is present.
     pub fn register_traits(&self, registry: &mut registry::CapabilityRegistry, name: &str) {
         if let Some(ref shared_any) = self.shared_any {
+            otel_debug!(
+                "extension.register_traits.shared",
+                node_id = self.node_id.name.as_ref(),
+            );
             let regs = (self.capabilities.register_shared)(shared_any.as_ref().as_any_ref());
             registry.register_all_shared(name, regs);
         }
         if let Some(ref local_any) = self.local_any {
+            otel_debug!(
+                "extension.register_traits.local",
+                node_id = self.node_id.name.as_ref(),
+            );
             let regs = (self.capabilities.register_local)(std::rc::Rc::clone(local_any));
             registry.register_all_local(name, regs);
         }
@@ -431,6 +474,7 @@ impl ExtensionWrapper {
     ///
     /// Prefers the local lifecycle if available, otherwise uses shared.
     pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
+        let node_name = self.node_id.name.clone();
         let effect_handler = EffectHandler::new(self.node_id, metrics_reporter);
         let control_receiver = self
             .control_receiver
@@ -438,8 +482,16 @@ impl ExtensionWrapper {
         let ctrl_chan = ControlChannel::new(control_receiver);
 
         if let Some(local_ext) = self.local_extension {
+            otel_debug!(
+                "extension.start.local",
+                node_id = node_name.as_ref(),
+            );
             local_ext.start(ctrl_chan, effect_handler).await
         } else if let Some(shared_ext) = self.shared_extension {
+            otel_debug!(
+                "extension.start.shared",
+                node_id = node_name.as_ref(),
+            );
             shared_ext.start(ctrl_chan, effect_handler).await
         } else {
             panic!("ExtensionWrapper has no extension instance — this is a bug")

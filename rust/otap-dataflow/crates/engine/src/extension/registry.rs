@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use linkme::distributed_slice;
+use otap_df_telemetry::otel_debug;
 
 // ── Static capability name registry ─────────────────────────────────────────
 
@@ -923,19 +924,42 @@ impl Capabilities {
                 // Prefer local variant; fall back to shared
                 if let Some(local) = self.get_local_raw::<H::Local>() {
                     *self.accessed_local.borrow_mut() = true;
+                    otel_debug!(
+                        "capabilities.get.local_resolved",
+                        capability = H::CAPABILITY_NAME,
+                        variant = "local",
+                    );
                     Some(H::from_local(local))
                 } else {
                     self.get_shared_raw::<H::Shared>().map(|shared| {
                         *self.accessed_shared.borrow_mut() = true;
+                        otel_debug!(
+                            "capabilities.get.local_fallback_to_shared",
+                            capability = H::CAPABILITY_NAME,
+                            variant = "shared (fallback)",
+                        );
                         H::from_shared(shared)
                     })
                 }
             }
             ConsumerType::Shared => self.get_shared_raw::<H::Shared>().map(|shared| {
                 *self.accessed_shared.borrow_mut() = true;
+                otel_debug!(
+                    "capabilities.get.shared_resolved",
+                    capability = H::CAPABILITY_NAME,
+                    variant = "shared",
+                );
                 H::from_shared(shared)
             }),
         };
+
+        if resolved.is_none() {
+            otel_debug!(
+                "capabilities.get.not_found",
+                capability = H::CAPABILITY_NAME,
+                consumer_type = ?consumer_type,
+            );
+        }
 
         if resolved.is_some() {
             let _ = self
