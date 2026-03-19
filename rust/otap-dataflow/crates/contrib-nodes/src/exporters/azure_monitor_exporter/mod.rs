@@ -63,7 +63,9 @@ pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory 
 
         // Resolve the auth extension at factory time
         let auth = capabilities
-            .require::<otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>()?;
+            .require::<otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>(
+                otap_df_engine::extension::registry::ConsumerType::Local,
+            )?;
 
         Ok(ExporterWrapper::local(
             AzureMonitorExporter::new(pipeline_ctx, cfg, auth).map_err(|e| {

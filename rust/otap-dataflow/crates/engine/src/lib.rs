@@ -1509,7 +1509,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let capabilities = capability_registry
             .resolve_bindings(
                 &node_config.capabilities,
-                extension::registry::ConsumerType::Local,
             )
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let receiver = create(
@@ -1593,7 +1592,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let capabilities = capability_registry
             .resolve_bindings(
                 &node_config.capabilities,
-                extension::registry::ConsumerType::Local,
             )
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let processor = create(
@@ -1677,7 +1675,6 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let capabilities = capability_registry
             .resolve_bindings(
                 &node_config.capabilities,
-                extension::registry::ConsumerType::Local,
             )
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let exporter = create(

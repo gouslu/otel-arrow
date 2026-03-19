@@ -384,9 +384,8 @@ impl CapabilityRegistry {
     pub fn resolve_bindings(
         &self,
         bindings: &HashMap<String, String>,
-        consumer_type: ConsumerType,
     ) -> Result<Capabilities, otap_df_config::error::Error> {
-        let mut capabilities = Capabilities::with_consumer_type(consumer_type);
+        let mut capabilities = Capabilities::new();
         for (capability_name, extension_name) in bindings {
             // 1. Extension must exist in the registry.
             if !self.contains(extension_name) {
@@ -440,9 +439,17 @@ impl CapabilityRegistry {
             }
 
             // 4. The specific extension must provide the requested capability.
-            //    Local consumers can use local-first with shared fallback.
-            //    Shared consumers can use shared variants only.
+            //    Populate both local and shared entries — the consumer picks
+            //    which variant to use via ConsumerType at require() time.
             let mut found_any = false;
+
+            let matched_local_entries: Vec<_> = self
+                .local_handles
+                .iter()
+                .filter(|((name, _), entry)| {
+                    name == extension_name && entry.capability_name == capability_name
+                })
+                .collect();
 
             let matched_shared_entries: Vec<_> = self
                 .shared_handles
@@ -452,32 +459,14 @@ impl CapabilityRegistry {
                 })
                 .collect();
 
-            match consumer_type {
-                ConsumerType::Local => {
-                    let matched_local_entries: Vec<_> = self
-                        .local_handles
-                        .iter()
-                        .filter(|((name, _), entry)| {
-                            name == extension_name && entry.capability_name == capability_name
-                        })
-                        .collect();
+            for ((_, type_id), entry) in &matched_local_entries {
+                capabilities.insert_local_entry(*type_id, (*entry).clone());
+                found_any = true;
+            }
 
-                    for ((_, type_id), entry) in &matched_local_entries {
-                        capabilities.insert_local_entry(*type_id, (*entry).clone());
-                        found_any = true;
-                    }
-
-                    for ((_, type_id), entry) in &matched_shared_entries {
-                        capabilities.insert_shared_entry(*type_id, (*entry).clone());
-                        found_any = true;
-                    }
-                }
-                ConsumerType::Shared => {
-                    for ((_, type_id), entry) in &matched_shared_entries {
-                        capabilities.insert_shared_entry(*type_id, (*entry).clone());
-                        found_any = true;
-                    }
-                }
+            for ((_, type_id), entry) in &matched_shared_entries {
+                capabilities.insert_shared_entry(*type_id, (*entry).clone());
+                found_any = true;
             }
 
             if !found_any {
@@ -768,7 +757,6 @@ pub enum ConsumerType {
 pub struct Capabilities {
     local_resolved: HashMap<TypeId, local::RegistryEntry>,
     shared_resolved: HashMap<TypeId, shared::RegistryEntry>,
-    consumer_type: ConsumerType,
     /// Tracks which capability names were accessed via `require()` or `optional()`.
     /// Uses `RefCell` so that `require`/`optional` can take `&self`.
     accessed_capability_names: RefCell<HashSet<&'static str>>,
@@ -792,16 +780,9 @@ impl Capabilities {
     /// Creates an empty `Capabilities`.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_consumer_type(ConsumerType::Local)
-    }
-
-    /// Creates an empty `Capabilities` for a specific consumer type.
-    #[must_use]
-    pub fn with_consumer_type(consumer_type: ConsumerType) -> Self {
         Self {
             local_resolved: HashMap::new(),
             shared_resolved: HashMap::new(),
-            consumer_type,
             accessed_capability_names: RefCell::new(HashSet::new()),
         }
     }
@@ -840,19 +821,23 @@ impl Capabilities {
             .collect()
     }
 
-    /// Require a capability handle by handle type and consumer type.
+    /// Require a capability handle.
     ///
-    /// Selects the local or shared variant based on the consumer type.
-    /// Returns an error with config guidance if the capability is not available.
+    /// The `consumer_type` determines which variant is returned:
+    /// - `ConsumerType::Local` — tries local first, falls back to shared
+    /// - `ConsumerType::Shared` — shared only
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let auth = capabilities.require::<BearerTokenProvider>()?;
+    /// let auth = capabilities.require::<BearerTokenProvider>(ConsumerType::Local)?;
     /// auth.get_token().await?;
     /// ```
-    pub fn require<H: CapabilityHandle>(&self) -> Result<H, otap_df_config::error::Error> {
-        self.get::<H>(self.consumer_type).ok_or_else(|| {
+    pub fn require<H: CapabilityHandle>(
+        &self,
+        consumer_type: ConsumerType,
+    ) -> Result<H, otap_df_config::error::Error> {
+        self.get::<H>(consumer_type).ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: format!(
                     "Missing required capability '{}'. Add to your node config:\n  capabilities:\n    {}: <extension_instance_name>",
@@ -863,19 +848,19 @@ impl Capabilities {
         })
     }
 
-    /// Get an optional capability handle by handle type and consumer type.
+    /// Get an optional capability handle.
     ///
     /// Returns `None` if the capability was not configured for this node.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// if let Some(auth) = capabilities.optional::<BearerTokenProvider>() {
+    /// if let Some(auth) = capabilities.optional::<BearerTokenProvider>(ConsumerType::Local) {
     ///     auth.get_token().await?;
     /// }
     /// ```
-    pub fn optional<H: CapabilityHandle>(&self) -> Option<H> {
-        self.get::<H>(self.consumer_type)
+    pub fn optional<H: CapabilityHandle>(&self, consumer_type: ConsumerType) -> Option<H> {
+        self.get::<H>(consumer_type)
     }
 
     /// Get a capability handle, selecting the local or shared variant
@@ -1116,9 +1101,9 @@ mod tests {
             "ext".to_string(),
         )]);
         let caps = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap();
-        let handle = caps.require::<BearerTokenProviderHandle>().unwrap();
+        let handle = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1256,7 +1241,7 @@ mod tests {
             "nonexistent".to_string(),
         )]);
         let err = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1272,7 +1257,7 @@ mod tests {
         register_provider(&mut registry, "azure_auth", "token");
         let bindings = HashMap::from([("totally_made_up".to_string(), "azure_auth".to_string())]);
         let err = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1295,7 +1280,7 @@ mod tests {
             "azure_auth".to_string(),
         )]);
         let caps = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap();
         assert!(!caps.is_empty());
     }
@@ -1331,7 +1316,7 @@ mod tests {
         let bindings =
             HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
         let err = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1352,7 +1337,7 @@ mod tests {
         let bindings =
             HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
         let err = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1369,7 +1354,7 @@ mod tests {
     #[test]
     fn test_require_missing_capability() {
         let caps = Capabilities::new();
-        let result = caps.require::<BearerTokenProviderHandle>();
+        let result = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local);
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("Missing required capability"), "{msg}");
@@ -1385,7 +1370,7 @@ mod tests {
             "azure_auth".to_string(),
         )]);
         let caps = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap();
 
         // Before any access, all bindings are unused.
@@ -1393,7 +1378,7 @@ mod tests {
         assert_eq!(unused, vec!["bearer_token_provider"]);
 
         // After accessing, none are unused.
-        let _ = caps.require::<BearerTokenProviderHandle>().unwrap();
+        let _ = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),
@@ -1408,10 +1393,10 @@ mod tests {
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry
-            .resolve_bindings(&bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings)
             .unwrap();
 
-        let auth = caps.require::<BearerTokenProviderHandle>().unwrap();
+        let auth = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "local_token");
     }
@@ -1423,10 +1408,10 @@ mod tests {
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry
-            .resolve_bindings(&bindings, ConsumerType::Shared)
+            .resolve_bindings(&bindings)
             .unwrap();
 
-        let auth = caps.require::<BearerTokenProviderHandle>().unwrap();
+        let auth = caps.require::<BearerTokenProviderHandle>(ConsumerType::Shared).unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "shared_token");
     }
@@ -1437,11 +1422,12 @@ mod tests {
         register_local_only_provider(&mut registry, "auth", "local_only_token");
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
-        let err = registry
-            .resolve_bindings(&bindings, ConsumerType::Shared)
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("does not provide capability"), "{msg}");
-        assert!(msg.contains("bearer_token_provider"), "{msg}");
+        let caps = registry
+            .resolve_bindings(&bindings)
+            .unwrap();
+
+        // Shared consumer should not get local-only capability
+        let result = caps.require::<BearerTokenProviderHandle>(ConsumerType::Shared);
+        assert!(result.is_err());
     }
 }
