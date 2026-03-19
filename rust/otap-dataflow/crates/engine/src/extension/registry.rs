@@ -760,6 +760,10 @@ pub struct Capabilities {
     /// Tracks which capability names were accessed via `require()` or `optional()`.
     /// Uses `RefCell` so that `require`/`optional` can take `&self`.
     accessed_capability_names: RefCell<HashSet<&'static str>>,
+    /// Tracks whether any local variant was consumed.
+    accessed_local: RefCell<bool>,
+    /// Tracks whether any shared variant was consumed.
+    accessed_shared: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Capabilities {
@@ -784,6 +788,8 @@ impl Capabilities {
             local_resolved: HashMap::new(),
             shared_resolved: HashMap::new(),
             accessed_capability_names: RefCell::new(HashSet::new()),
+            accessed_local: RefCell::new(false),
+            accessed_shared: RefCell::new(false),
         }
     }
 
@@ -819,6 +825,18 @@ impl Capabilities {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    /// Returns `true` if any local variant was consumed by `require()` or `optional()`.
+    #[must_use]
+    pub fn consumed_local(&self) -> bool {
+        *self.accessed_local.borrow()
+    }
+
+    /// Returns `true` if any shared variant was consumed by `require()` or `optional()`.
+    #[must_use]
+    pub fn consumed_shared(&self) -> bool {
+        *self.accessed_shared.borrow()
     }
 
     /// Require a capability handle.
@@ -874,12 +892,19 @@ impl Capabilities {
             ConsumerType::Local => {
                 // Prefer local variant; fall back to shared
                 if let Some(local) = self.get_local_raw::<H::Local>() {
+                    *self.accessed_local.borrow_mut() = true;
                     Some(H::from_local(local))
                 } else {
-                    self.get_shared_raw::<H::Shared>().map(H::from_shared)
+                    self.get_shared_raw::<H::Shared>().map(|shared| {
+                        *self.accessed_shared.borrow_mut() = true;
+                        H::from_shared(shared)
+                    })
                 }
             }
-            ConsumerType::Shared => self.get_shared_raw::<H::Shared>().map(H::from_shared),
+            ConsumerType::Shared => self.get_shared_raw::<H::Shared>().map(|shared| {
+                *self.accessed_shared.borrow_mut() = true;
+                H::from_shared(shared)
+            }),
         };
 
         if resolved.is_some() {

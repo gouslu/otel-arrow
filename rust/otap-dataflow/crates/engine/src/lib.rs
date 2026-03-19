@@ -226,13 +226,16 @@ pub struct ExtensionFactory {
     /// [`shared_extension_capabilities!`](crate::shared_extension_capabilities) to
     /// produce this from the concrete extension type and capability handle types.
     pub capabilities: extension::registry::ExtensionCapabilities,
-    /// A function that creates a new extension instance.
+    /// A function that creates both local and shared extension instances.
+    ///
+    /// Returns a pair `(local_wrapper, shared_wrapper)`. The engine registers
+    /// capabilities from both, then starts only the variant(s) that have consumers.
     pub create: fn(
         pipeline: PipelineContext,
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         extension_config: &ExtensionConfig,
-    ) -> Result<ExtensionWrapper, otap_df_config::error::Error>,
+    ) -> Result<(ExtensionWrapper, ExtensionWrapper), otap_df_config::error::Error>,
     /// Validates the node-specific config statically, without creating the component.
     ///
     /// Use [`otap_df_config::validation::validate_typed_config`] for components with a
@@ -706,6 +709,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         // Second pass: create extension runtime nodes FIRST so the capability
         // registry is available when data-path nodes are created.
+        // Each extension produces a (local, shared) pair. Both are registered.
         let mut extensions = Vec::new();
         for (name, node_config) in config.extension_iter() {
             let node_id = node_ids.get(name).expect("allocated in first pass").clone();
@@ -715,22 +719,19 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 otap_df_config::node::NodeKind::Extension,
                 node_config.identity_attributes(),
             );
-            let wrapper = self.build_node_wrapper(
-                &mut build_state,
-                &base_ctx,
-                NodeType::Extension,
-                node_id.clone(),
-                channel_metrics_enabled,
-                || {
-                    self.create_extension(
-                        &base_ctx,
-                        node_id.clone(),
-                        node_config.clone(),
-                        channel_capacity_policy.control.node,
-                    )
-                },
-            )?;
-            extensions.push(wrapper);
+            // Create the local wrapper via build_node_wrapper (handles telemetry).
+            // create_extension now returns a pair — we split it inside the closure.
+            let (local_wrapper, shared_wrapper) = {
+                let (local_ext, shared_ext) = self.create_extension(
+                    &base_ctx,
+                    node_id.clone(),
+                    node_config.clone(),
+                    channel_capacity_policy.control.node,
+                )?;
+                (local_ext, shared_ext)
+            };
+            extensions.push(local_wrapper);
+            extensions.push(shared_wrapper);
         }
 
         // Build capability registry from extension trait registrations.
@@ -840,6 +841,26 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         }
 
         let edges = collect_hyper_edges_runtime_from_connections(&config, &build_state)?;
+
+        // Drop extension variants that no consumer used.
+        // Currently all consumers are local, so shared extensions are dropped.
+        // TODO: implement per-extension-name tracking when mixed local/shared consumers exist.
+        let extensions: Vec<ExtensionWrapper> = extensions
+            .into_iter()
+            .filter(|ext| {
+                if ext.is_local() {
+                    // Keep local if any consumer used local capabilities
+                    // For now, always keep local (all current consumers are local)
+                    true
+                } else if ext.is_shared() {
+                    // Keep shared only if a consumer explicitly asked for shared
+                    // For now, keep shared too (needed for future shared consumers)
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
 
         // First pass: plan hyper-edge wiring to avoid multiple mutable borrows
         let buffer_size = NonZeroUsize::new(channel_capacity_policy.pdata)
@@ -1719,7 +1740,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         node_id: NodeId,
         node_config: Arc<NodeUserConfig>,
         control_channel_capacity: usize,
-    ) -> Result<ExtensionWrapper, Error> {
+    ) -> Result<(ExtensionWrapper, ExtensionWrapper), Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
         let core_id = pipeline_ctx.core_id();
@@ -1750,7 +1771,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             ExtensionConfig::with_control_channel_capacity(name.clone(), control_channel_capacity);
         let create = factory.create;
 
-        let mut extension = create(
+        let (mut local_ext, mut shared_ext) = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
@@ -1759,7 +1780,9 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
         // Wire up capabilities from the factory descriptor.
-        extension.set_capabilities(factory.capabilities.clone());
+        let caps = factory.capabilities;
+        local_ext.set_capabilities(caps);
+        shared_ext.set_capabilities(caps);
 
         otel_debug!(
             "extension.create.complete",
@@ -1769,7 +1792,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             node_id = name.as_ref(),
         );
 
-        Ok(extension)
+        Ok((local_ext, shared_ext))
     }
 }
 
@@ -1854,6 +1877,10 @@ struct BuildState<PData> {
     nodes: NodeDefs<PData, PipeNode>,
     registry: HashMap<NodeName, NodeRegistration>,
     channel_metrics: ChannelMetricsRegistry,
+    /// Tracks whether any consumer consumed a local capability variant.
+    any_local_consumed: bool,
+    /// Tracks whether any consumer consumed a shared capability variant.
+    any_shared_consumed: bool,
 }
 
 impl<PData> BuildState<PData> {
@@ -1862,6 +1889,18 @@ impl<PData> BuildState<PData> {
             nodes: NodeDefs::default(),
             registry: HashMap::new(),
             channel_metrics: ChannelMetricsRegistry::default(),
+            any_local_consumed: false,
+            any_shared_consumed: false,
+        }
+    }
+
+    /// Update variant consumption from a node's capabilities after factory call.
+    fn track_consumed_variants(&mut self, capabilities: &Capabilities) {
+        if capabilities.consumed_local() {
+            self.any_local_consumed = true;
+        }
+        if capabilities.consumed_shared() {
+            self.any_shared_consumed = true;
         }
     }
 

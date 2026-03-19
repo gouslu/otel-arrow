@@ -227,7 +227,50 @@ pub struct ExtensionWrapper {
 }
 
 impl ExtensionWrapper {
-    /// Create a **shared** extension (Send, clone-based).
+    /// Create an extension with both local and shared variants from a single instance.
+    ///
+    /// The type must implement both `local::Extension` and `shared::Extension`,
+    /// plus `Clone + Send`. The constructor creates both lifecycle variants
+    /// and both capability registration instances internally.
+    pub fn new<E>(
+        extension: E,
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> Self
+    where
+        E: shared_ext::Extension
+            + crate::local::extension::Extension
+            + Clone
+            + Send
+            + 'static,
+    {
+        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
+        let local_rc = std::rc::Rc::new(extension.clone());
+        let local_any: std::rc::Rc<dyn std::any::Any> = local_rc.clone();
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(config.control_channel.capacity);
+
+        Self {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            shared_extension: Some(Box::new(extension)),
+            local_extension: Some(local_rc),
+            shared_any: Some(shared_any),
+            local_any: Some(local_any),
+            capabilities: registry::ExtensionCapabilities {
+                names: &[],
+                register_shared: |_| Vec::new(),
+                register_local: |_| Vec::new(),
+            },
+            control_sender: SharedSender::mpsc(control_sender),
+            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            telemetry: None,
+        }
+    }
+
+    /// Create a **shared-only** extension (Send, clone-based).
     pub fn shared<E>(
         extension: E,
         node_id: NodeId,
@@ -260,7 +303,7 @@ impl ExtensionWrapper {
         }
     }
 
-    /// Create a **local** extension (Rc-based, true single instance).
+    /// Create a **local-only** extension (Rc-based, true single instance).
     pub fn local<E>(
         extension: std::rc::Rc<E>,
         node_id: NodeId,
@@ -293,41 +336,6 @@ impl ExtensionWrapper {
         }
     }
 
-    /// Create a **dual** extension with both shared and local lifecycles.
-    pub fn dual<E>(
-        shared: E,
-        local: std::rc::Rc<E>,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> Self
-    where
-        E: shared_ext::Extension + crate::local::extension::Extension + Clone + Send + 'static,
-    {
-        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(shared.clone());
-        let local_any: std::rc::Rc<dyn std::any::Any> = local.clone();
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(config.control_channel.capacity);
-
-        Self {
-            node_id,
-            user_config,
-            runtime_config: config.clone(),
-            shared_extension: Some(Box::new(shared)),
-            local_extension: Some(local),
-            shared_any: Some(shared_any),
-            local_any: Some(local_any),
-            capabilities: registry::ExtensionCapabilities {
-                names: &[],
-                register_shared: |_| Vec::new(),
-                register_local: |_| Vec::new(),
-            },
-            control_sender: SharedSender::mpsc(control_sender),
-            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
-            telemetry: None,
-        }
-    }
-
     /// Sets the capabilities descriptor. Called by the engine after `create()`.
     pub fn set_capabilities(&mut self, caps: registry::ExtensionCapabilities) {
         self.capabilities = caps;
@@ -343,6 +351,18 @@ impl ExtensionWrapper {
     #[must_use]
     pub fn user_config(&self) -> Arc<NodeUserConfig> {
         self.user_config.clone()
+    }
+
+    /// Returns `true` if this wrapper holds a local extension instance.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.local_extension.is_some()
+    }
+
+    /// Returns `true` if this wrapper holds a shared extension instance.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        self.shared_extension.is_some()
     }
 
     /// Materializes capability registrations and inserts them into the registry.

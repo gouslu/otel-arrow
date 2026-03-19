@@ -43,20 +43,23 @@ use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
+use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::node::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;
-use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
 
 use otap_df_otap::OTAP_EXTENSION_FACTORIES;
 
 mod config;
+mod core;
 mod error;
-mod extension;
+/// Local (!Send) variant of the extension.
+pub mod local;
+/// Shared (Send) variant of the extension.
+pub mod shared;
 
 pub use config::{AuthMethod, Config};
 pub use error::Error;
-pub use extension::AzureIdentityAuthExtension;
 
 /// URN identifying the Azure Identity Auth Extension in configuration pipelines.
 pub const AZURE_IDENTITY_AUTH_EXTENSION_URN: &str = "urn:microsoft:extension:azure_identity_auth";
@@ -98,12 +101,19 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
                 }
             })?;
 
-        Ok(ExtensionWrapper::dual(
-            extension.clone(),
-            Rc::new(extension),
-            node,
-            node_config,
-            extension_config,
+        Ok((
+            ExtensionWrapper::local(
+                Rc::new(extension.clone()),
+                node.clone(),
+                node_config.clone(),
+                extension_config,
+            ),
+            ExtensionWrapper::shared(
+                extension,
+                node,
+                node_config,
+                extension_config,
+            ),
         ))
     },
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
