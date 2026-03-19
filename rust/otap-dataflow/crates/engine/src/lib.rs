@@ -16,7 +16,7 @@ use crate::{
     error::{Error, TypedError},
     exporter::ExporterWrapper,
     extension::ExtensionWrapper,
-    extension::registry::{Capabilities, CapabilityRegistry},
+    capability::registry::{Capabilities, CapabilityRegistry},
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -52,6 +52,7 @@ use std::{
 pub mod error;
 pub mod exporter;
 pub mod extension;
+pub mod capability;
 pub mod message;
 pub mod processor;
 pub mod receiver;
@@ -225,7 +226,7 @@ pub struct ExtensionFactory {
     ///
     /// Use [`extension_capabilities!`](crate::extension_capabilities) to produce
     /// this from the concrete extension type(s) and capability handle types.
-    pub capabilities: extension::registry::ExtensionCapabilities,
+    pub capabilities: capability::registry::ExtensionCapabilities,
     /// A function that creates a new extension instance.
     ///
     /// Returns an `ExtensionWrapper` built via the builder pattern.

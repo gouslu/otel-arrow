@@ -321,7 +321,7 @@ fn create_transform_processor(
     node_id: NodeId,
     user_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capabilities: &otap_df_engine::extension::registry::Capabilities,
+    _capabilities: &otap_df_engine::capability::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let processor = TransformProcessor::from_config(&pipeline_ctx, &user_config.config)?;
     Ok(ProcessorWrapper::local(
@@ -534,7 +534,7 @@ mod test {
             node_id,
             Arc::new(node_config),
             runtime.config(),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
     }
 
@@ -1039,7 +1039,7 @@ mod test {
             node_id,
             Arc::new(node_config),
             runtime.config(),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
         .expect("created processor");
 

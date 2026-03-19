@@ -9,3 +9,6 @@ pub mod extension;
 pub mod message;
 pub mod processor;
 pub mod receiver;
+
+/// Shared capability traits for extensions.
+pub mod capability;

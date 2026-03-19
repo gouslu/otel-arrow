@@ -43,7 +43,7 @@ use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::{Active, ExtensionWrapper};
-use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
+use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::node::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;

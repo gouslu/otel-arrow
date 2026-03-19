@@ -1165,7 +1165,7 @@ pub fn create_fanout_processor(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capabilities: &otap_df_engine::extension::registry::Capabilities,
+    _capabilities: &otap_df_engine::capability::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let fanout =
         FanoutProcessor::from_config(pipeline_ctx.clone(), &node_config, &node_config.config)?;
@@ -1186,7 +1186,7 @@ pub static FANOUT_PROCESSOR_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFact
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              proc_cfg: &ProcessorConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         create_fanout_processor(pipeline_ctx, node, node_config, proc_cfg, _capabilities)
     },
     wiring_contract: otap_df_engine::wiring_contract::WiringContract {

@@ -528,15 +528,15 @@ impl std::fmt::Debug for CapabilityRegistry {
 macro_rules! register_capability {
     ($handle:ident, $local_trait:path, $shared_trait:path, $name:literal, $description:literal $(,)?) => {
         // ── Seal the handle type ────────────────────────────────────────
-        impl $crate::extension::registry::private::Sealed for $handle {
-            const MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
-                $crate::extension::registry::private::MACRO_SEAL;
+        impl $crate::capability::registry::private::Sealed for $handle {
+            const MACRO_TOKEN: $crate::capability::registry::private::MacroToken =
+                $crate::capability::registry::private::MACRO_SEAL;
         }
-        impl $crate::extension::registry::private::HandleSealed for $handle {
-            const HANDLE_MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
-                $crate::extension::registry::private::MACRO_SEAL;
+        impl $crate::capability::registry::private::HandleSealed for $handle {
+            const HANDLE_MACRO_TOKEN: $crate::capability::registry::private::MacroToken =
+                $crate::capability::registry::private::MACRO_SEAL;
         }
-        impl $crate::extension::registry::ExtensionCapability for $handle {
+        impl $crate::capability::registry::ExtensionCapability for $handle {
             const NAME: &'static str = $name;
             const DESCRIPTION: &'static str = $description;
         }
@@ -544,20 +544,20 @@ macro_rules! register_capability {
         // ── Link-time capability name registration ──────────────────────
         ::paste::paste! {
             #[allow(unsafe_code)]
-            #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
+            #[$crate::distributed_slice($crate::capability::registry::KNOWN_CAPABILITIES)]
             static [<_KNOWN_CAP_ $handle:upper>]: &str = $name;
         }
 
         // ── Coercion glue: shared_capabilities / local_capabilities ─────
         impl $handle {
             /// Build shared capability registrations for this handle.
-            pub fn shared_capabilities<T>(instance: &T) -> Vec<$crate::extension::registry::shared::CapabilityRegistration>
+            pub fn shared_capabilities<T>(instance: &T) -> Vec<$crate::capability::registry::shared::CapabilityRegistration>
             where
                 T: Clone + Send + 'static + $shared_trait,
             {
                 fn make_registration<TInner: Clone + Send + 'static + $shared_trait>(
                     val: &TInner,
-                ) -> $crate::extension::registry::shared::CapabilityRegistration {
+                ) -> $crate::capability::registry::shared::CapabilityRegistration {
                     fn coerce<TInner: Clone + Send + 'static + $shared_trait>(
                         any: &dyn std::any::Any,
                     ) -> Box<dyn std::any::Any + Send> {
@@ -568,11 +568,11 @@ macro_rules! register_capability {
                         Box::new(boxed) as Box<dyn std::any::Any + Send>
                     }
 
-                    $crate::extension::registry::shared::CapabilityRegistration {
+                    $crate::capability::registry::shared::CapabilityRegistration {
                         trait_id: std::any::TypeId::of::<Box<dyn $shared_trait>>(),
                         value: Box::new(val.clone()),
                         coerce: coerce::<TInner>,
-                        capability_name: <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
+                        capability_name: <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
                     }
                 }
 
@@ -580,13 +580,13 @@ macro_rules! register_capability {
             }
 
             /// Build local capability registrations (Rc-based) for this handle.
-            pub fn local_capabilities<T>(instance: &std::rc::Rc<T>) -> Vec<$crate::extension::registry::local::CapabilityRegistration>
+            pub fn local_capabilities<T>(instance: &std::rc::Rc<T>) -> Vec<$crate::capability::registry::local::CapabilityRegistration>
             where
                 T: 'static + $local_trait,
             {
                 fn make_registration<TInner: 'static + $local_trait>(
                     rc: &std::rc::Rc<TInner>,
-                ) -> $crate::extension::registry::local::CapabilityRegistration {
+                ) -> $crate::capability::registry::local::CapabilityRegistration {
                     fn coerce<TInner: 'static + $local_trait>(
                         rc_any: std::rc::Rc<dyn std::any::Any>,
                     ) -> Box<dyn std::any::Any> {
@@ -597,11 +597,11 @@ macro_rules! register_capability {
                         Box::new(trait_obj) as Box<dyn std::any::Any>
                     }
 
-                    $crate::extension::registry::local::CapabilityRegistration {
+                    $crate::capability::registry::local::CapabilityRegistration {
                         trait_id: std::any::TypeId::of::<std::rc::Rc<dyn $local_trait>>(),
                         value: std::rc::Rc::clone(rc) as std::rc::Rc<dyn std::any::Any>,
                         coerce: coerce::<TInner>,
-                        capability_name: <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
+                        capability_name: <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
                     }
                 }
 
@@ -651,16 +651,16 @@ pub struct ExtensionCapabilities {
 macro_rules! extension_capabilities {
     // Single type — implements both local and shared traits
     ($type:ty => $($handle:path),+ $(,)?) => {
-        $crate::extension::registry::ExtensionCapabilities {
-            names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
-            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::extension::registry::shared::CapabilityRegistration> {
+        $crate::capability::registry::ExtensionCapabilities {
+            names: &[$(<$handle as $crate::capability::registry::ExtensionCapability>::NAME),+],
+            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::capability::registry::shared::CapabilityRegistration> {
                 let ext = any.downcast_ref::<$type>()
                     .expect("extension type mismatch — this is a bug");
                 let mut caps = Vec::new();
                 $(caps.extend(<$handle>::shared_capabilities(ext));)+
                 caps
             },
-            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
+            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::capability::registry::local::CapabilityRegistration> {
                 let rc = rc_any.downcast::<$type>()
                     .expect("extension type mismatch — this is a bug");
                 let mut caps = Vec::new();
@@ -671,16 +671,16 @@ macro_rules! extension_capabilities {
     };
     // Dual types — separate local and shared implementations
     (shared: $shared_type:ty, local: $local_type:ty => $($handle:path),+ $(,)?) => {
-        $crate::extension::registry::ExtensionCapabilities {
-            names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
-            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::extension::registry::shared::CapabilityRegistration> {
+        $crate::capability::registry::ExtensionCapabilities {
+            names: &[$(<$handle as $crate::capability::registry::ExtensionCapability>::NAME),+],
+            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::capability::registry::shared::CapabilityRegistration> {
                 let ext = any.downcast_ref::<$shared_type>()
                     .expect("extension type mismatch — this is a bug");
                 let mut caps = Vec::new();
                 $(caps.extend(<$handle>::shared_capabilities(ext));)+
                 caps
             },
-            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
+            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::capability::registry::local::CapabilityRegistration> {
                 let rc = rc_any.downcast::<$local_type>()
                     .expect("extension type mismatch — this is a bug");
                 let mut caps = Vec::new();
@@ -970,8 +970,8 @@ impl Default for Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::bearer_token_provider::BearerToken;
-    use crate::extension::bearer_token_provider::BearerTokenProvider as BearerTokenProviderHandle;
+    use crate::capability::bearer_token_provider::BearerToken;
+    use crate::capability::bearer_token_provider::BearerTokenProvider as BearerTokenProviderHandle;
     use crate::local::capability::BearerTokenProvider as LocalBearerTokenProvider;
     use crate::shared::capability::BearerTokenProvider as SharedBearerTokenProvider;
     use tokio::sync::watch;

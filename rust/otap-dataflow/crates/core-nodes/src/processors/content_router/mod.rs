@@ -630,7 +630,7 @@ pub fn create_content_router(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capability_registry: &otap_df_engine::capability::registry::CapabilityRegistry,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     let router_config: ContentRouterConfig = serde_json::from_value(node_config.config.clone())
         .map_err(|e| ConfigError::InvalidUserConfig {
@@ -659,7 +659,7 @@ pub static CONTENT_ROUTER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFactor
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              proc_cfg: &ProcessorConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         let router_config: ContentRouterConfig = serde_json::from_value(node_config.config.clone())
             .map_err(|e| ConfigError::InvalidUserConfig {
                 error: format!("Failed to parse ContentRouter configuration: {e}"),
@@ -1008,7 +1008,7 @@ mod tests {
             test_node(processor_config.name.clone()),
             Arc::new(node_config),
             &processor_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::capability::registry::CapabilityRegistry::new(),
         );
         assert!(result.is_ok());
     }
@@ -1028,7 +1028,7 @@ mod tests {
             test_node(processor_config.name.clone()),
             Arc::new(node_config),
             &processor_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::capability::registry::CapabilityRegistry::new(),
         );
         assert!(result.is_err());
     }
@@ -1043,7 +1043,7 @@ mod tests {
             test_node(processor_config.name.clone()),
             Arc::new(node_config),
             &processor_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::capability::registry::CapabilityRegistry::new(),
         );
         assert!(result.is_err());
     }

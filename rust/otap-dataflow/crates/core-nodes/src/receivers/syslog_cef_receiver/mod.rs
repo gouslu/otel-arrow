@@ -205,7 +205,7 @@ pub static SYSLOG_CEF_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              receiver_config: &ReceiverConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         Ok(ReceiverWrapper::local(
             SyslogCefReceiver::from_config(pipeline, &node_config.config)?,
             node,

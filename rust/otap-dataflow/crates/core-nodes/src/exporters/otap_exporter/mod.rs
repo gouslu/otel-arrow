@@ -67,7 +67,7 @@ pub static OTAP_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         Ok(ExporterWrapper::local(
             OTAPExporter::from_config(pipeline, &node_config.config)?,
             node,

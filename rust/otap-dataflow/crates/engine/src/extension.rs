@@ -16,15 +16,7 @@
 //! [`registry`](registry).
 //!
 //! For built-in extension traits, see
-//! [`bearer_token_provider`](bearer_token_provider).
-
-pub mod registry;
-
-/// Extension traits that components can implement to expose capabilities.
-pub mod bearer_token_provider;
-
-/// Key-value store capability for persistent or ephemeral storage.
-pub mod key_value_store;
+//! [`bearer_token_provider`](crate::capability::bearer_token_provider).
 
 use crate::channel_metrics::ChannelMetricsRegistry;
 use crate::channel_mode::{SharedMode, wrap_control_channel_metrics};
@@ -217,7 +209,7 @@ pub struct Passive<E>(pub E);
 /// Decomposed result of a shared extension provider.
 #[doc(hidden)]
 pub struct SharedDecomposed {
-    pub any: Box<dyn registry::CloneAnySend>,
+    pub any: Box<dyn crate::capability::registry::CloneAnySend>,
     pub extension: Option<Box<dyn shared_ext::Extension>>,
     pub type_id: TypeId,
 }
@@ -254,7 +246,7 @@ impl<E: shared_ext::Extension + Clone + Send + 'static> sealed_provider::SealedS
 
 impl<E: shared_ext::Extension + Clone + Send + 'static> SharedProvider for Active<E> {
     fn decompose(self) -> SharedDecomposed {
-        let any: Box<dyn registry::CloneAnySend> = Box::new(self.0.clone());
+        let any: Box<dyn crate::capability::registry::CloneAnySend> = Box::new(self.0.clone());
         let ext: Box<dyn shared_ext::Extension> = Box::new(self.0);
         SharedDecomposed {
             any,
@@ -268,7 +260,7 @@ impl<E: Clone + Send + 'static> sealed_provider::SealedShared for Passive<E> {}
 
 impl<E: Clone + Send + 'static> SharedProvider for Passive<E> {
     fn decompose(self) -> SharedDecomposed {
-        let any: Box<dyn registry::CloneAnySend> = Box::new(self.0);
+        let any: Box<dyn crate::capability::registry::CloneAnySend> = Box::new(self.0);
         SharedDecomposed {
             any,
             extension: None,
@@ -340,11 +332,11 @@ pub struct ExtensionWrapper {
     /// Local extension lifecycle (Rc-based, true single instance). None for passive.
     local_extension: Option<std::rc::Rc<dyn local_ext::Extension>>,
     /// Type-erased shared instance for capability registration.
-    shared_any: Option<Box<dyn registry::CloneAnySend>>,
+    shared_any: Option<Box<dyn crate::capability::registry::CloneAnySend>>,
     /// Type-erased local instance for capability registration.
     local_any: Option<std::rc::Rc<dyn std::any::Any>>,
     /// Capabilities descriptor — set by the engine after `create()`.
-    capabilities: registry::ExtensionCapabilities,
+    capabilities: crate::capability::registry::ExtensionCapabilities,
     /// A sender for control messages. None for fully passive extensions.
     control_sender: Option<SharedSender<ExtensionControlMsg>>,
     /// A receiver for control messages. None for fully passive extensions.
@@ -369,7 +361,7 @@ pub struct ExtensionWrapperBuilder {
     runtime_config: ExtensionConfig,
     shared_extension: Option<Box<dyn shared_ext::Extension>>,
     local_extension: Option<std::rc::Rc<dyn crate::local::extension::Extension>>,
-    shared_any: Option<Box<dyn registry::CloneAnySend>>,
+    shared_any: Option<Box<dyn crate::capability::registry::CloneAnySend>>,
     local_any: Option<std::rc::Rc<dyn std::any::Any>>,
     shared_type_id: Option<TypeId>,
     local_type_id: Option<TypeId>,
@@ -472,7 +464,7 @@ impl ExtensionWrapperBuilder {
             local_extension: self.local_extension,
             shared_any: self.shared_any,
             local_any: self.local_any,
-            capabilities: registry::ExtensionCapabilities {
+            capabilities: crate::capability::registry::ExtensionCapabilities {
                 names: &[],
                 register_shared: |_| Vec::new(),
                 register_local: |_| Vec::new(),
@@ -531,7 +523,7 @@ impl ExtensionWrapper {
     }
 
     /// Sets the capabilities descriptor. Called by the engine after `create()`.
-    pub fn set_capabilities(&mut self, caps: registry::ExtensionCapabilities) {
+    pub fn set_capabilities(&mut self, caps: crate::capability::registry::ExtensionCapabilities) {
         self.capabilities = caps;
     }
 
@@ -598,7 +590,7 @@ impl ExtensionWrapper {
     ///
     /// Registers shared capabilities if a shared instance is present, and
     /// local capabilities if a local instance is present.
-    pub fn register_traits(&self, registry: &mut registry::CapabilityRegistry, name: &str) {
+    pub fn register_traits(&self, registry: &mut crate::capability::registry::CapabilityRegistry, name: &str) {
         if let Some(ref shared_any) = self.shared_any {
             otel_debug!(
                 "extension.register_traits.shared",

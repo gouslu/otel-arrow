@@ -53,7 +53,7 @@ pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory 
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
-             capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             capabilities: &otap_df_engine::capability::registry::Capabilities| {
         // Deserialize user config JSON into typed Config
         let cfg: Config = serde_json::from_value(node_config.config.clone()).map_err(|e| {
             otap_df_config::error::Error::InvalidUserConfig {
@@ -63,8 +63,8 @@ pub static AZURE_MONITOR_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory 
 
         // Resolve the auth extension at factory time
         let auth = capabilities
-            .require::<otap_df_engine::extension::bearer_token_provider::BearerTokenProvider>(
-                otap_df_engine::extension::registry::ConsumerType::Shared,
+            .require::<otap_df_engine::capability::bearer_token_provider::BearerTokenProvider>(
+                otap_df_engine::capability::registry::ConsumerType::Shared,
             )?;
 
         Ok(ExporterWrapper::local(

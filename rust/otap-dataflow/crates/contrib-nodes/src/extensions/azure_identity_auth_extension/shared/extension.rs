@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use azure_core::credentials::TokenCredential;
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::extension::bearer_token_provider::BearerToken;
-use otap_df_engine::extension::bearer_token_provider::shared::BearerTokenProvider;
+use otap_df_engine::capability::bearer_token_provider::BearerToken;
+use otap_df_engine::shared::capability::BearerTokenProvider;
 use otap_df_engine::extension::{ControlChannel, EffectHandler};
 use otap_df_engine::shared::extension::Extension;
 use otap_df_engine::terminal_state::TerminalState;
@@ -62,7 +62,7 @@ impl core::TokenBroadcaster for AzureIdentityAuthExtension {
 
 #[async_trait]
 impl BearerTokenProvider for AzureIdentityAuthExtension {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extension::registry::Error> {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::capability::registry::Error> {
         let access_token =
             core::get_token_with_retry(self.credential.as_ref(), &self.scope).await?;
 

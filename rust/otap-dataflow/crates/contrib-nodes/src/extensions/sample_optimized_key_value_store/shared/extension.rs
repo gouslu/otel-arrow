@@ -6,8 +6,8 @@
 //! Uses `Arc<RwLock<HashMap>>` — clone-safe and `Send`.
 
 use async_trait::async_trait;
-use otap_df_engine::extension::key_value_store::shared::KeyValueStore;
-use otap_df_engine::extension::registry::Error;
+use otap_df_engine::shared::capability::KeyValueStore;
+use otap_df_engine::capability::registry::Error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

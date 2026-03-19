@@ -234,7 +234,7 @@ pub fn create_signal_type_router(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capability_registry: &otap_df_engine::extension::registry::CapabilityRegistry,
+    _capability_registry: &otap_df_engine::capability::registry::CapabilityRegistry,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     // Deserialize the (currently empty) router configuration
     let router_config: SignalTypeRouterConfig = serde_json::from_value(node_config.config.clone())
@@ -265,7 +265,7 @@ pub static SIGNAL_TYPE_ROUTER_FACTORY: ProcessorFactory<OtapPdata> = ProcessorFa
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              proc_cfg: &ProcessorConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         // Deserialize the (currently empty) router configuration
         let router_config: SignalTypeRouterConfig =
             serde_json::from_value(node_config.config.clone()).map_err(|e| {
@@ -306,7 +306,7 @@ mod tests {
             test_node(processor_config.name.clone()),
             Arc::new(node_config),
             &processor_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::capability::registry::CapabilityRegistry::new(),
         );
         assert!(result.is_ok());
     }
@@ -322,7 +322,7 @@ mod tests {
             test_node(processor_config.name.clone()),
             Arc::new(node_config),
             &processor_config,
-            &otap_df_engine::extension::registry::CapabilityRegistry::new(),
+            &otap_df_engine::capability::registry::CapabilityRegistry::new(),
         );
         assert!(result.is_err());
     }

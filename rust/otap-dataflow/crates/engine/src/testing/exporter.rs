@@ -15,7 +15,7 @@ use crate::control::{
 };
 use crate::error::Error;
 use crate::exporter::ExporterWrapper;
-use crate::extension::registry::Capabilities;
+use crate::capability::registry::Capabilities;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message::{Receiver, Sender};
 use crate::node::NodeWithPDataReceiver;

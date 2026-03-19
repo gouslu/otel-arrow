@@ -104,7 +104,7 @@ pub static TOPIC_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
         let config = TopicExporter::parse_config(&node_config.config)?;
         let topic_set =
             pipeline
@@ -461,7 +461,7 @@ mod tests {
                 exporter_node.clone(),
                 Arc::new(exporter_user_cfg),
                 &ExporterConfig::new("topic_exporter"),
-                &otap_df_engine::extension::registry::Capabilities::new(),
+                &otap_df_engine::capability::registry::Capabilities::new(),
             )
             .expect("topic exporter should be created");
 

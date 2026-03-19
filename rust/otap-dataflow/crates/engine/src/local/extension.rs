@@ -2,13 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Trait for local (!Send) extensions.
-//!
-//! Local extensions do not require `Send`, allowing the use of `Rc`, `RefCell`,
-//! and other !Send types. They run on a single-threaded `LocalSet`.
-//!
-//! The `start` method takes `Rc<Self>` rather than `Box<Self>`, enabling true
-//! single-instance sharing: the same `Rc` is used for both the background task
-//! and capability trait objects, with zero-cost refcount cloning.
 
 use crate::error::Error;
 use crate::extension::{ControlChannel, EffectHandler};
@@ -20,7 +13,7 @@ use std::rc::Rc;
 ///
 /// Extensions are long-lived components that run alongside the pipeline and
 /// expose functionality (e.g., authentication, service discovery) to other
-/// components through the [`CapabilityRegistry`](crate::extension::registry::CapabilityRegistry).
+/// components through the [`CapabilityRegistry`](crate::capability::registry::CapabilityRegistry).
 ///
 /// Unlike receivers, processors, and exporters, extensions are NOT generic over
 /// PData — they never process pipeline data.

@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Trait for shared (Send) extensions.
-//!
-//! Shared extensions implement `Send`, enabling use in both single-threaded
-//! and multi-threaded runtime contexts.
 
 use crate::error::Error;
 use crate::extension::{ControlChannel, EffectHandler};
@@ -15,7 +12,7 @@ use async_trait::async_trait;
 ///
 /// Extensions are long-lived components that run alongside the pipeline and
 /// expose functionality (e.g., authentication, service discovery) to other
-/// components through the [`CapabilityRegistry`](crate::extension::registry::CapabilityRegistry).
+/// components through the [`CapabilityRegistry`](crate::capability::registry::CapabilityRegistry).
 ///
 /// Unlike receivers, processors, and exporters, extensions are NOT generic over
 /// PData — they never process pipeline data.

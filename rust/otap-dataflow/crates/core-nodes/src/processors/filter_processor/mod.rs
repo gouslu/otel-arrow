@@ -51,7 +51,7 @@ pub fn create_filter_processor(
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     processor_config: &ProcessorConfig,
-    _capabilities: &otap_df_engine::extension::registry::Capabilities,
+    _capabilities: &otap_df_engine::capability::registry::Capabilities,
 ) -> Result<ProcessorWrapper<OtapPdata>, ConfigError> {
     Ok(ProcessorWrapper::local(
         FilterProcessor::from_config(pipeline_ctx, &node_config.config)?,
@@ -72,7 +72,7 @@ pub static FILTER_PROCESSOR_FACTORY: otap_df_engine::ProcessorFactory<OtapPdata>
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              proc_cfg: &ProcessorConfig,
-             _capabilities: &otap_df_engine::extension::registry::Capabilities| {
+             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
                 create_filter_processor(pipeline_ctx, node, node_config, proc_cfg, _capabilities)
             },
         wiring_contract: otap_df_engine::wiring_contract::WiringContract::UNRESTRICTED,

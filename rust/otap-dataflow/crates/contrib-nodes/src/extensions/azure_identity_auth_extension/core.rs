@@ -14,7 +14,7 @@ use azure_identity::{
 use otap_df_engine::control::ExtensionControlMsg;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::extension::ControlChannel;
-use otap_df_engine::extension::bearer_token_provider::BearerToken;
+use otap_df_engine::capability::bearer_token_provider::BearerToken;
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;

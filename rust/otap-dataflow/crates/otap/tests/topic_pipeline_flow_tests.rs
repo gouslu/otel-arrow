@@ -82,7 +82,7 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
             exporter_node.clone(),
             Arc::new(exporter_user_cfg),
             &ExporterConfig::new("topic_exporter"),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
         .expect("topic exporter should be created");
 
@@ -91,7 +91,7 @@ fn topic_exporter_to_topic_receiver_transfers_pdata() {
             receiver_node.clone(),
             Arc::new(receiver_user_cfg),
             &ReceiverConfig::new("topic_receiver"),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
         .expect("topic receiver should be created");
 
@@ -217,7 +217,7 @@ fn topic_receiver_applies_source_tag_when_enabled() {
             exporter_node.clone(),
             Arc::new(exporter_user_cfg),
             &ExporterConfig::new("topic_exporter"),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
         .expect("topic exporter should be created");
 
@@ -226,7 +226,7 @@ fn topic_receiver_applies_source_tag_when_enabled() {
             receiver_node.clone(),
             Arc::new(receiver_user_cfg),
             &ReceiverConfig::new("topic_receiver"),
-            &otap_df_engine::extension::registry::Capabilities::new(),
+            &otap_df_engine::capability::registry::Capabilities::new(),
         )
         .expect("topic receiver should be created");
 
