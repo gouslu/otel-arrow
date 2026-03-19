@@ -164,13 +164,13 @@ pub(crate) trait TokenBroadcaster {
 ///
 /// Generic over the token broadcaster — local uses direct `watch::Sender`,
 /// shared uses `Arc<watch::Sender>`.
-pub(crate) async fn run_event_loop(
+pub(crate) async fn run_event_loop<T: TokenBroadcaster>(
     name: &str,
     credential_type: &str,
     scope: &str,
     client_id: Option<&str>,
     credential: &dyn TokenCredential,
-    token_broadcaster: &dyn TokenBroadcaster,
+    token_broadcaster: &T,
     mut ctrl_chan: ControlChannel,
 ) -> Result<TerminalState, EngineError> {
     otel_info!(

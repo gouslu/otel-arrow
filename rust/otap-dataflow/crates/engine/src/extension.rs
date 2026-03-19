@@ -226,105 +226,67 @@ pub struct ExtensionWrapper {
     telemetry: Option<NodeTelemetryGuard>,
 }
 
-impl ExtensionWrapper {
-    /// Create an extension with both local and shared variants from a single instance.
-    ///
-    /// The type must implement both `local::Extension` and `shared::Extension`,
-    /// plus `Clone + Send`. The constructor creates both lifecycle variants
-    /// and both capability registration instances internally.
-    pub fn new<E>(
-        extension: E,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> Self
-    where
-        E: shared_ext::Extension
-            + crate::local::extension::Extension
-            + Clone
-            + Send
-            + 'static,
-    {
-        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
-        let local_rc = std::rc::Rc::new(extension.clone());
-        let local_any: std::rc::Rc<dyn std::any::Any> = local_rc.clone();
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(config.control_channel.capacity);
+// ── Builder ──────────────────────────────────────────────────────────────────
 
-        Self {
-            node_id,
-            user_config,
-            runtime_config: config.clone(),
-            shared_extension: Some(Box::new(extension)),
-            local_extension: Some(local_rc),
-            shared_any: Some(shared_any),
-            local_any: Some(local_any),
-            capabilities: registry::ExtensionCapabilities {
-                names: &[],
-                register_shared: |_| Vec::new(),
-                register_local: |_| Vec::new(),
-            },
-            control_sender: SharedSender::mpsc(control_sender),
-            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
-            telemetry: None,
-        }
-    }
+/// Builder for `ExtensionWrapper`. Shared parameters are set once, then
+/// local/shared extension variants are added via `with_local`/`with_shared`.
+///
+/// At least one variant must be added before calling `build()`.
+pub struct ExtensionWrapperBuilder {
+    node_id: NodeId,
+    user_config: Arc<NodeUserConfig>,
+    runtime_config: ExtensionConfig,
+    shared_extension: Option<Box<dyn shared_ext::Extension>>,
+    local_extension: Option<std::rc::Rc<dyn crate::local::extension::Extension>>,
+    shared_any: Option<Box<dyn registry::CloneAnySend>>,
+    local_any: Option<std::rc::Rc<dyn std::any::Any>>,
+}
 
-    /// Create a **shared-only** extension (Send, clone-based).
-    pub fn shared<E>(
-        extension: E,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> Self
-    where
-        E: shared_ext::Extension + Clone + Send + 'static,
-    {
-        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(config.control_channel.capacity);
-
-        Self {
-            node_id,
-            user_config,
-            runtime_config: config.clone(),
-            shared_extension: Some(Box::new(extension)),
-            local_extension: None,
-            shared_any: Some(shared_any),
-            local_any: None,
-            capabilities: registry::ExtensionCapabilities {
-                names: &[],
-                register_shared: |_| Vec::new(),
-                register_local: |_| Vec::new(),
-            },
-            control_sender: SharedSender::mpsc(control_sender),
-            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
-            telemetry: None,
-        }
-    }
-
-    /// Create a **local-only** extension (Rc-based, true single instance).
-    pub fn local<E>(
-        extension: std::rc::Rc<E>,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> Self
+impl ExtensionWrapperBuilder {
+    /// Add a **local** (!Send) extension variant.
+    pub fn with_local<E>(mut self, extension: std::rc::Rc<E>) -> Self
     where
         E: crate::local::extension::Extension + 'static,
     {
         let local_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(config.control_channel.capacity);
+        self.local_extension = Some(extension);
+        self.local_any = Some(local_any);
+        self
+    }
 
-        Self {
-            node_id,
-            user_config,
-            runtime_config: config.clone(),
-            shared_extension: None,
-            local_extension: Some(extension),
-            shared_any: None,
-            local_any: Some(local_any),
+    /// Add a **shared** (Send) extension variant.
+    pub fn with_shared<E>(mut self, extension: E) -> Self
+    where
+        E: shared_ext::Extension + Clone + Send + 'static,
+    {
+        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
+        self.shared_extension = Some(Box::new(extension));
+        self.shared_any = Some(shared_any);
+        self
+    }
+
+    /// Build the `ExtensionWrapper`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if neither `with_local` nor `with_shared` was called.
+    pub fn build(self) -> ExtensionWrapper {
+        assert!(
+            self.shared_extension.is_some() || self.local_extension.is_some(),
+            "ExtensionWrapper must have at least one variant (local or shared)"
+        );
+
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
+
+        ExtensionWrapper {
+            node_id: self.node_id,
+            user_config: self.user_config,
+            runtime_config: self.runtime_config,
+            shared_extension: self.shared_extension,
+            local_extension: self.local_extension,
+            shared_any: self.shared_any,
+            local_any: self.local_any,
             capabilities: registry::ExtensionCapabilities {
                 names: &[],
                 register_shared: |_| Vec::new(),
@@ -333,6 +295,47 @@ impl ExtensionWrapper {
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
+        }
+    }
+}
+
+impl ExtensionWrapper {
+    /// Start building an `ExtensionWrapper` with shared parameters.
+    ///
+    /// Call `.with_local()`, `.with_shared()`, or both, then `.build()`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Both variants
+    /// ExtensionWrapper::builder(node, config, ext_config)
+    ///     .with_local(Rc::new(local_ext))
+    ///     .with_shared(shared_ext)
+    ///     .build()
+    ///
+    /// // Local only
+    /// ExtensionWrapper::builder(node, config, ext_config)
+    ///     .with_local(Rc::new(local_ext))
+    ///     .build()
+    ///
+    /// // Shared only
+    /// ExtensionWrapper::builder(node, config, ext_config)
+    ///     .with_shared(shared_ext)
+    ///     .build()
+    /// ```
+    pub fn builder(
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> ExtensionWrapperBuilder {
+        ExtensionWrapperBuilder {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            shared_extension: None,
+            local_extension: None,
+            shared_any: None,
+            local_any: None,
         }
     }
 
@@ -521,11 +524,8 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        let _wrapper = ExtensionWrapper::shared(
-            extension,
-            node_id,
-            user_config,
-            &config,
-        );
+        let _wrapper = ExtensionWrapper::builder(node_id, user_config, &config)
+            .with_shared(extension)
+            .build();
     }
 }

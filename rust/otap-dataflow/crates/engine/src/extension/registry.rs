@@ -664,14 +664,24 @@ pub struct ExtensionCapabilities {
 /// Produces an extension capabilities descriptor with both shared and local
 /// registration functions.
 ///
-/// Takes the concrete extension type and one or more capability handles.
-/// The type must implement both the local and shared trait variants for each handle.
+/// # Single-type usage (one type implements both local and shared traits):
 ///
 /// ```ignore
-/// capabilities: extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
+/// extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck)
+/// ```
+///
+/// # Dual-type usage (separate local and shared implementations):
+///
+/// ```ignore
+/// extension_capabilities!(
+///     shared: shared::MyExtension,
+///     local: local::MyExtension
+///     => BearerTokenProvider, HealthCheck
+/// )
 /// ```
 #[macro_export]
 macro_rules! extension_capabilities {
+    // Single type — implements both local and shared traits
     ($type:ty => $($handle:path),+ $(,)?) => {
         $crate::extension::registry::ExtensionCapabilities {
             names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
@@ -684,6 +694,26 @@ macro_rules! extension_capabilities {
             },
             register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
                 let rc = rc_any.downcast::<$type>()
+                    .expect("extension type mismatch — this is a bug");
+                let mut caps = Vec::new();
+                $(caps.extend(<$handle>::local_capabilities(&rc));)+
+                caps
+            },
+        }
+    };
+    // Dual types — separate local and shared implementations
+    (shared: $shared_type:ty, local: $local_type:ty => $($handle:path),+ $(,)?) => {
+        $crate::extension::registry::ExtensionCapabilities {
+            names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
+            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::extension::registry::shared::CapabilityRegistration> {
+                let ext = any.downcast_ref::<$shared_type>()
+                    .expect("extension type mismatch — this is a bug");
+                let mut caps = Vec::new();
+                $(caps.extend(<$handle>::shared_capabilities(ext));)+
+                caps
+            },
+            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
+                let rc = rc_any.downcast::<$local_type>()
                     .expect("extension type mismatch — this is a bug");
                 let mut caps = Vec::new();
                 $(caps.extend(<$handle>::local_capabilities(&rc));)+

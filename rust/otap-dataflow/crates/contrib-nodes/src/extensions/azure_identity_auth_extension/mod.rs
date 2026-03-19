@@ -74,7 +74,9 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     description: "Azure Identity authentication via managed identity or developer tools",
     documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
     capabilities: otap_df_engine::extension_capabilities!(
-        AzureIdentityAuthExtension => BearerTokenProvider
+        shared: shared::AzureIdentityAuthExtension,
+        local: local::AzureIdentityAuthExtension
+        => BearerTokenProvider
     ),
     create: |_: PipelineContext,
              node: NodeId,
@@ -87,34 +89,30 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
             }
         })?;
 
-        // Validate the configuration
         cfg.validate()
             .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
             })?;
 
-        // Create the extension
-        let extension =
-            AzureIdentityAuthExtension::new(node.name.to_string(), cfg).map_err(|e| {
-                otap_df_config::error::Error::InvalidUserConfig {
-                    error: e.to_string(),
-                }
-            })?;
+        // Create both variants from the same config
+        let local_ext = local::AzureIdentityAuthExtension::new(
+            node.name.to_string(),
+            cfg.clone(),
+        ).map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+            error: e.to_string(),
+        })?;
 
-        Ok((
-            ExtensionWrapper::local(
-                Rc::new(extension.clone()),
-                node.clone(),
-                node_config.clone(),
-                extension_config,
-            ),
-            ExtensionWrapper::shared(
-                extension,
-                node,
-                node_config,
-                extension_config,
-            ),
-        ))
+        let shared_ext = shared::AzureIdentityAuthExtension::new(
+            node.name.to_string(),
+            cfg,
+        ).map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+            error: e.to_string(),
+        })?;
+
+        Ok(ExtensionWrapper::builder(node, node_config, extension_config)
+            .with_local(Rc::new(local_ext))
+            .with_shared(shared_ext)
+            .build())
     },
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };

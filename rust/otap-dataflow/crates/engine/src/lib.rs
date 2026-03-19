@@ -235,7 +235,7 @@ pub struct ExtensionFactory {
         node: NodeId,
         node_config: Arc<NodeUserConfig>,
         extension_config: &ExtensionConfig,
-    ) -> Result<(ExtensionWrapper, ExtensionWrapper), otap_df_config::error::Error>,
+    ) -> Result<ExtensionWrapper, otap_df_config::error::Error>,
     /// Validates the node-specific config statically, without creating the component.
     ///
     /// Use [`otap_df_config::validation::validate_typed_config`] for components with a
@@ -719,19 +719,13 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 otap_df_config::node::NodeKind::Extension,
                 node_config.identity_attributes(),
             );
-            // Create the local wrapper via build_node_wrapper (handles telemetry).
-            // create_extension now returns a pair — we split it inside the closure.
-            let (local_wrapper, shared_wrapper) = {
-                let (local_ext, shared_ext) = self.create_extension(
-                    &base_ctx,
-                    node_id.clone(),
-                    node_config.clone(),
-                    channel_capacity_policy.control.node,
-                )?;
-                (local_ext, shared_ext)
-            };
-            extensions.push(local_wrapper);
-            extensions.push(shared_wrapper);
+            let wrapper = self.create_extension(
+                &base_ctx,
+                node_id.clone(),
+                node_config.clone(),
+                channel_capacity_policy.control.node,
+            )?;
+            extensions.push(wrapper);
         }
 
         // Build capability registry from extension trait registrations.
@@ -1740,7 +1734,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         node_id: NodeId,
         node_config: Arc<NodeUserConfig>,
         control_channel_capacity: usize,
-    ) -> Result<(ExtensionWrapper, ExtensionWrapper), Error> {
+    ) -> Result<ExtensionWrapper, Error> {
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
         let core_id = pipeline_ctx.core_id();
@@ -1771,7 +1765,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             ExtensionConfig::with_control_channel_capacity(name.clone(), control_channel_capacity);
         let create = factory.create;
 
-        let (mut local_ext, mut shared_ext) = create(
+        let mut extension = create(
             (*pipeline_ctx).clone(),
             node_id.clone(),
             node_config,
@@ -1780,9 +1774,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         .map_err(|e| Error::ConfigError(Box::new(e)))?;
 
         // Wire up capabilities from the factory descriptor.
-        let caps = factory.capabilities;
-        local_ext.set_capabilities(caps);
-        shared_ext.set_capabilities(caps);
+        extension.set_capabilities(factory.capabilities);
 
         otel_debug!(
             "extension.create.complete",
@@ -1792,7 +1784,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             node_id = name.as_ref(),
         );
 
-        Ok((local_ext, shared_ext))
+        Ok(extension)
     }
 }
 
