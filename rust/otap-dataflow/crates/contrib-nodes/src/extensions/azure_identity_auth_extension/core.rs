@@ -157,7 +157,6 @@ pub(crate) fn get_next_token_refresh(token: &BearerToken) -> tokio::time::Instan
 /// Trait for broadcasting token updates — abstracts over Arc<watch::Sender> vs watch::Sender.
 pub(crate) trait TokenBroadcaster {
     fn send_token(&self, token: Option<BearerToken>);
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
 }
 
 /// Runs the extension event loop.
@@ -206,13 +205,13 @@ pub(crate) async fn run_event_loop<T: TokenBroadcaster>(
                         let seconds = total_secs % 60;
 
                         otel_info!(
-                            "azure_identity_auth.token_refreshed",
+                            "azure_identity_auth.token_acquired",
                             refresh_in = format!("{}h {}m {}s", hours, minutes, seconds)
                         );
                     }
                     Err(e) => {
                         otel_error!(
-                            "azure_identity_auth.token_refresh_loop_failed",
+                            "azure_identity_auth.token_acquisition_failed",
                             error = ?e,
                             retry_secs = TOKEN_REFRESH_RETRY_SECS
                         );

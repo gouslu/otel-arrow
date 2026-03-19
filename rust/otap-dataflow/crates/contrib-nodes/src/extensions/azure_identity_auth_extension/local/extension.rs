@@ -62,10 +62,6 @@ impl core::TokenBroadcaster for AzureIdentityAuthExtension {
     fn send_token(&self, token: Option<BearerToken>) {
         let _ = self.token_sender.send(token);
     }
-
-    fn subscribe(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
-    }
 }
 
 #[async_trait(?Send)]
