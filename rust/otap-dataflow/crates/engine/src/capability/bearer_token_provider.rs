@@ -1,30 +1,29 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bearer token provider extension capability.
+//! Bearer token provider capability.
 //!
-//! The local and shared trait variants live in their natural homes:
-//! - [`crate::local::bearer_token_provider::BearerTokenProvider`]
-//! - [`crate::shared::bearer_token_provider::BearerTokenProvider`]
-//!
-//! This module defines the handle enum that dispatches to whichever
-//! variant the engine selects, plus shared data types (`BearerToken`, `Secret`).
+//! Types, local/shared traits, and the dispatch handle — all in one place.
+//! Use `local::BearerTokenProvider` or `shared::BearerTokenProvider` for
+//! trait implementations. Use the top-level `BearerTokenProvider` handle
+//! in consumers.
 
+use async_trait::async_trait;
 use std::borrow::Cow;
 use std::rc::Rc;
 
-// Register the capability: handle type, local/shared traits, name, description.
+// Register the capability.
 crate::register_capability!(
     BearerTokenProvider,
-    crate::local::capability::BearerTokenProvider,
-    crate::shared::capability::BearerTokenProvider,
+    local::BearerTokenProvider,
+    shared::BearerTokenProvider,
     "bearer_token_provider",
     "Provides bearer tokens for authenticated HTTP/gRPC requests",
 );
 
+// ── Shared data types ───────────────────────────────────────────────────────
+
 /// Represents a secret value that should not be exposed in logs or debug output.
-///
-/// The [`Debug`] implementation will not print the actual secret value.
 #[derive(Clone, Eq)]
 pub struct Secret(Cow<'static, str>);
 
@@ -70,14 +69,10 @@ impl std::fmt::Debug for Secret {
 }
 
 /// Represents a bearer token with its expiration time.
-///
-/// The token value is wrapped in [`Secret`] to prevent accidental exposure
-/// in logs or debug output.
 #[derive(Debug, Clone)]
 pub struct BearerToken {
     /// The token value.
     pub token: Secret,
-
     /// The expiration time as a UNIX timestamp (seconds since epoch).
     pub expires_on: i64,
 }
@@ -96,16 +91,57 @@ impl BearerToken {
     }
 }
 
+// ── Local trait ─────────────────────────────────────────────────────────────
+
+// The local/shared trait variants are defined inline here so that types
+// (BearerToken, Secret, Error) and traits live together without cross-folder
+// dependencies. However, extension authors should import via the root-level
+// re-exports at `local::capability::BearerTokenProvider` and
+// `shared::capability::BearerTokenProvider` — not through these inline mods.
+// The #[doc(hidden)] attribute steers discovery toward the re-exports.
+
+/// Local (!Send) bearer token provider trait.
+#[doc(hidden)]
+pub mod local {
+    use super::*;
+
+    /// A bearer token provider for local (!Send) contexts.
+    #[async_trait(?Send)]
+    pub trait BearerTokenProvider {
+        /// Returns an authentication token.
+        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
+
+        /// Subscribes to token refresh events.
+        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+    }
+}
+
+// ── Shared trait ────────────────────────────────────────────────────────────
+
+/// Shared (Send) bearer token provider trait.
+#[doc(hidden)]
+pub mod shared {
+    use super::*;
+
+    /// A bearer token provider for shared (Send) contexts.
+    #[async_trait]
+    pub trait BearerTokenProvider: Send {
+        /// Returns an authentication token.
+        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
+
+        /// Subscribes to token refresh events.
+        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+    }
+}
+
+// ── Handle ──────────────────────────────────────────────────────────────────
+
 /// Handle that dispatches to either the local or shared variant.
-///
-/// Consumers call methods on the handle without knowing which variant
-/// they received. The engine selects the variant at pipeline build time
-/// based on extension scope and consumer node type.
 pub enum BearerTokenProvider {
-    /// Rc-based variant — true single-instance sharing for local consumers.
-    Local(Rc<dyn crate::local::capability::BearerTokenProvider>),
-    /// Box-based variant — clone-distributed for shared consumers.
-    Shared(Box<dyn crate::shared::capability::BearerTokenProvider>),
+    /// Rc-based variant for local consumers.
+    Local(Rc<dyn local::BearerTokenProvider>),
+    /// Box-based variant for shared consumers.
+    Shared(Box<dyn shared::BearerTokenProvider>),
 }
 
 impl BearerTokenProvider {
@@ -130,10 +166,10 @@ impl super::registry::CapabilityHandle for BearerTokenProvider {
     const CAPABILITY_NAME: &'static str =
         <Self as super::registry::ExtensionCapability>::NAME;
 
-    type Local = dyn crate::local::capability::BearerTokenProvider;
-    type Shared = dyn crate::shared::capability::BearerTokenProvider;
+    type Local = dyn local::BearerTokenProvider;
+    type Shared = dyn shared::BearerTokenProvider;
 
-    fn from_local(local: Rc<dyn crate::local::capability::BearerTokenProvider>) -> Self {
+    fn from_local(local: Rc<dyn local::BearerTokenProvider>) -> Self {
         Self::Local(local)
     }
 
