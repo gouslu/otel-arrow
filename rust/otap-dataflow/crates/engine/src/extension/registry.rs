@@ -505,53 +505,29 @@ impl std::fmt::Debug for CapabilityRegistry {
     }
 }
 
-/// Registers a trait as a known extension capability.
+/// Registers a capability: seals the handle type, sets metadata, registers in
+/// [`KNOWN_CAPABILITIES`], and generates `shared_capabilities()` /
+/// `local_capabilities()` glue code.
 ///
-/// This macro does three things:
-/// 1. `impl Sealed for dyn $trait` — seals the trait
-/// 2. `impl ExtensionCapability for dyn $trait` — sets `NAME`
-/// 3. Registers the name in [`KNOWN_CAPABILITIES`] via `distributed_slice`
+/// This is the **only** way to declare a new capability type. A single macro
+/// call does everything — sealing, metadata, link-time registration, and
+/// coercion functions — so nothing can be forgotten.
 ///
-/// This is the only way to declare a new capability type. Using one macro
-/// for all three steps makes it impossible to forget the static registration.
-///
-/// # Usage (in each extension trait file inside `extension/`)
+/// # Usage
 ///
 /// ```ignore
 /// crate::register_capability!(
-///     BearerTokenProvider,
-///     "bearer_token_provider",
-///     "Provides bearer tokens for authenticated requests",
+///     BearerTokenProvider,          // handle type (the enum)
+///     local::BearerTokenProvider,   // local (!Send) trait
+///     shared::BearerTokenProvider,  // shared (Send) trait
+///     "bearer_token_provider",      // stable name for config bindings
+///     "Provides bearer tokens for authenticated HTTP/gRPC requests",
 /// );
 /// ```
 #[macro_export]
 macro_rules! register_capability {
-    ($trait:path, $name:literal, $description:literal, $static_name:ident $(,)?) => {
-        impl $crate::extension::registry::private::Sealed for dyn $trait {
-            const MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
-                $crate::extension::registry::private::MACRO_SEAL;
-        }
-        impl $crate::extension::registry::ExtensionCapability for dyn $trait {
-            const NAME: &'static str = $name;
-            const DESCRIPTION: &'static str = $description;
-        }
-
-        #[allow(unsafe_code)]
-        #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
-        static $static_name: &str = $name;
-    };
-    ($trait:path, $name:literal, $description:literal $(,)?) => {
-        $crate::register_capability!($trait, $name, $description, _KNOWN_CAP);
-    };
-}
-
-/// Registers a capability handle type as a known extension capability.
-///
-/// This is the preferred registration path for public capability exposure,
-/// because capability lookup is handle-based (`Capabilities::require::<Handle>()`).
-#[macro_export]
-macro_rules! register_capability_handle {
-    ($handle:ty, $name:literal, $description:literal, $static_name:ident $(,)?) => {
+    ($handle:ident, $local_trait:path, $shared_trait:path, $name:literal, $description:literal $(,)?) => {
+        // ── Seal the handle type ────────────────────────────────────────
         impl $crate::extension::registry::private::Sealed for $handle {
             const MACRO_TOKEN: $crate::extension::registry::private::MacroToken =
                 $crate::extension::registry::private::MACRO_SEAL;
@@ -565,23 +541,14 @@ macro_rules! register_capability_handle {
             const DESCRIPTION: &'static str = $description;
         }
 
-        #[allow(unsafe_code)]
-        #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
-        static $static_name: &str = $name;
-    };
-    ($handle:ty, $name:literal, $description:literal $(,)?) => {
-        $crate::register_capability_handle!($handle, $name, $description, _KNOWN_CAP_HANDLE);
-    };
-}
+        // ── Link-time capability name registration ──────────────────────
+        ::paste::paste! {
+            #[allow(unsafe_code)]
+            #[$crate::distributed_slice($crate::extension::registry::KNOWN_CAPABILITIES)]
+            static [<_KNOWN_CAP_ $handle:upper>]: &str = $name;
+        }
 
-/// Registers the local/shared trait mappings for a capability handle.
-///
-/// Generates two associated functions:
-/// - `shared_capabilities(&T)` — shared registrations (clone-based)
-/// - `local_capabilities(&Rc<T>)` — local registrations (Rc-based)
-#[macro_export]
-macro_rules! register_capability_handle_traits {
-    ($handle:ty, $local_trait:path, $shared_trait:path $(,)?) => {
+        // ── Coercion glue: shared_capabilities / local_capabilities ─────
         impl $handle {
             /// Build shared capability registrations for this handle.
             pub fn shared_capabilities<T>(instance: &T) -> Vec<$crate::extension::registry::shared::CapabilityRegistration>

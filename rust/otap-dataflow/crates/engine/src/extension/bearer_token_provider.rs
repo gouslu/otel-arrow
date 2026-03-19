@@ -11,19 +11,13 @@ use async_trait::async_trait;
 use std::borrow::Cow;
 use std::rc::Rc;
 
-// Register the public capability at the handle level. Local/shared trait
-// variants are internal implementation details selected by the engine.
-crate::register_capability_handle!(
-    BearerTokenProvider,
-    "bearer_token_provider",
-    "Provides bearer tokens for authenticated HTTP/gRPC requests",
-    _KNOWN_CAP_BEARER_HANDLE,
-);
-
-crate::register_capability_handle_traits!(
+// Register the capability: handle type, local/shared traits, name, description.
+crate::register_capability!(
     BearerTokenProvider,
     local::BearerTokenProvider,
     shared::BearerTokenProvider,
+    "bearer_token_provider",
+    "Provides bearer tokens for authenticated HTTP/gRPC requests",
 );
 
 /// Represents a secret value that should not be exposed in logs or debug output.

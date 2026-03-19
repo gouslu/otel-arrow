@@ -23,6 +23,9 @@ pub mod registry;
 /// Extension traits that components can implement to expose capabilities.
 pub mod bearer_token_provider;
 
+/// Key-value store capability for persistent or ephemeral storage.
+pub mod key_value_store;
+
 use crate::channel_metrics::ChannelMetricsRegistry;
 use crate::channel_mode::{SharedMode, wrap_control_channel_metrics};
 use crate::config::ExtensionConfig;
