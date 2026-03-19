@@ -51,6 +51,15 @@ impl TerminalState {
     pub const fn is_empty(&self) -> bool {
         self.metrics.is_empty()
     }
+
+    /// Merges two terminal states, taking the earlier deadline and
+    /// combining all metric snapshots.
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        self.deadline = self.deadline.min(other.deadline);
+        self.metrics.extend(other.metrics);
+        self
+    }
 }
 
 impl Default for TerminalState {

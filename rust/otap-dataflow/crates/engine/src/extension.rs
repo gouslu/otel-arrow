@@ -38,6 +38,7 @@ use crate::terminal_state::TerminalState;
 use otap_df_channel::error::RecvError;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_telemetry::reporter::MetricsReporter;
+use std::any::TypeId;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -219,10 +220,15 @@ pub struct ExtensionWrapper {
     local_any: Option<std::rc::Rc<dyn std::any::Any>>,
     /// Capabilities descriptor — set by the engine after `create()`.
     capabilities: registry::ExtensionCapabilities,
-    /// A sender for control messages.
+    /// A sender for control messages (used by local variant, or the sole variant).
     control_sender: SharedSender<ExtensionControlMsg>,
-    /// A receiver for control messages.
+    /// A receiver for control messages (used by local variant, or the sole variant).
     control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
+    /// A second sender for control messages (used by the shared variant when
+    /// both local and shared are present as independent types).
+    shared_control_sender: Option<SharedSender<ExtensionControlMsg>>,
+    /// A second receiver for control messages (shared variant, independent mode).
+    shared_control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
     /// Telemetry guard for node lifecycle cleanup.
     telemetry: Option<NodeTelemetryGuard>,
 }
@@ -241,6 +247,8 @@ pub struct ExtensionWrapperBuilder {
     local_extension: Option<std::rc::Rc<dyn crate::local::extension::Extension>>,
     shared_any: Option<Box<dyn registry::CloneAnySend>>,
     local_any: Option<std::rc::Rc<dyn std::any::Any>>,
+    shared_type_id: Option<TypeId>,
+    local_type_id: Option<TypeId>,
 }
 
 impl ExtensionWrapperBuilder {
@@ -256,6 +264,7 @@ impl ExtensionWrapperBuilder {
         let local_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
         self.local_extension = Some(extension);
         self.local_any = Some(local_any);
+        self.local_type_id = Some(TypeId::of::<E>());
         self
     }
 
@@ -271,6 +280,7 @@ impl ExtensionWrapperBuilder {
         let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
         self.shared_extension = Some(Box::new(extension));
         self.shared_any = Some(shared_any);
+        self.shared_type_id = Some(TypeId::of::<E>());
         self
     }
 
@@ -278,15 +288,46 @@ impl ExtensionWrapperBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if neither `with_local` nor `with_shared` was called.
+    /// - Panics if neither `with_local` nor `with_shared` was called.
+    /// - Panics if both `with_local` and `with_shared` were called with the
+    ///   same concrete type. Use `with_shared()` alone when a single shared
+    ///   type should serve both local and shared consumers.
     pub fn build(self) -> ExtensionWrapper {
         assert!(
             self.shared_extension.is_some() || self.local_extension.is_some(),
             "ExtensionWrapper must have at least one variant (local or shared)"
         );
 
+        let both_present = self.local_extension.is_some() && self.shared_extension.is_some();
+
+        // When both variants are provided, they must be different concrete types.
+        if let (Some(local_tid), Some(shared_tid)) = (self.local_type_id, self.shared_type_id) {
+            assert!(
+                local_tid != shared_tid,
+                "with_local() and with_shared() called with the same concrete type — \
+                 use with_shared() alone when a single type should serve both \
+                 local and shared consumers"
+            );
+        }
+
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
+
+        // Create a second control channel when both variants are present
+        // (they are always independent types per the TypeId check above).
+        let (shared_control_sender, shared_control_receiver) = if both_present {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
+            (Some(SharedSender::mpsc(tx)), Some(SharedReceiver::mpsc(rx)))
+        } else {
+            (None, None)
+        };
+
+        otel_debug!(
+            "extension.builder.build",
+            node_id = self.node_id.name.as_ref(),
+            both_variants = both_present,
+        );
 
         ExtensionWrapper {
             node_id: self.node_id,
@@ -303,6 +344,8 @@ impl ExtensionWrapperBuilder {
             },
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            shared_control_sender,
+            shared_control_receiver,
             telemetry: None,
         }
     }
@@ -345,6 +388,8 @@ impl ExtensionWrapper {
             local_extension: None,
             shared_any: None,
             local_any: None,
+            shared_type_id: None,
+            local_type_id: None,
         }
     }
 
@@ -457,22 +502,54 @@ impl ExtensionWrapper {
             );
         self.control_sender = control_sender;
         self.control_receiver = Some(control_receiver);
+
+        // Wrap the second control channel if present (independent lifecycles).
+        if let (Some(shared_sender), Some(shared_receiver)) =
+            (self.shared_control_sender.take(), self.shared_control_receiver.take())
+        {
+            let (wrapped_sender, wrapped_receiver) =
+                wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
+                    &self.node_id,
+                    pipeline_ctx,
+                    channel_metrics,
+                    channel_metrics_enabled,
+                    self.runtime_config.control_channel.capacity as u64,
+                    shared_sender,
+                    shared_receiver,
+                );
+            self.shared_control_sender = Some(wrapped_sender);
+            self.shared_control_receiver = Some(wrapped_receiver);
+        }
+
         self
     }
 
-    /// Returns an `ExtensionControlSender` for sending control messages.
-    pub(crate) fn extension_control_sender(
+    /// Returns `ExtensionControlSender`(s) for sending control messages.
+    ///
+    /// Returns one sender for single-variant or piggyback mode, two senders
+    /// for independent-lifecycle mode (one per variant).
+    pub(crate) fn extension_control_senders(
         &self,
-    ) -> crate::control::ExtensionControlSender {
-        crate::control::ExtensionControlSender {
+    ) -> Vec<crate::control::ExtensionControlSender> {
+        let mut senders = vec![crate::control::ExtensionControlSender {
             node_id: self.node_id.clone(),
             sender: crate::message::Sender::Shared(self.control_sender.clone()),
+        }];
+        if let Some(ref shared_sender) = self.shared_control_sender {
+            senders.push(crate::control::ExtensionControlSender {
+                node_id: self.node_id.clone(),
+                sender: crate::message::Sender::Shared(shared_sender.clone()),
+            });
         }
+        senders
     }
 
-    /// Starts the extension lifecycle.
+    /// Starts the extension lifecycle(s).
     ///
-    /// Prefers the local lifecycle if available, otherwise uses shared.
+    /// - If both local and shared variants are present (always independent
+    ///   types per the TypeId guard), spawns the shared variant as a background
+    ///   task and awaits the local variant on the current thread.
+    /// - If only one variant is present, runs it directly.
     pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
         let node_name = self.node_id.name.clone();
         let effect_handler = EffectHandler::new(self.node_id, metrics_reporter);
@@ -481,20 +558,66 @@ impl ExtensionWrapper {
             .expect("control_receiver missing from ExtensionWrapper");
         let ctrl_chan = ControlChannel::new(control_receiver);
 
-        if let Some(local_ext) = self.local_extension {
-            otel_debug!(
-                "extension.start.local",
-                node_id = node_name.as_ref(),
-            );
-            local_ext.start(ctrl_chan, effect_handler).await
-        } else if let Some(shared_ext) = self.shared_extension {
-            otel_debug!(
-                "extension.start.shared",
-                node_id = node_name.as_ref(),
-            );
-            shared_ext.start(ctrl_chan, effect_handler).await
-        } else {
-            panic!("ExtensionWrapper has no extension instance — this is a bug")
+        match (self.local_extension, self.shared_extension) {
+            (Some(local_ext), Some(shared_ext)) => {
+                otel_debug!(
+                    "extension.start.both",
+                    node_id = node_name.as_ref(),
+                );
+
+                // Shared variant gets its own control channel and runs
+                // on a spawned Send task.
+                let shared_ctrl_rx = self
+                    .shared_control_receiver
+                    .expect("shared_control_receiver missing — both variants present");
+                let shared_ctrl_chan = ControlChannel::new(shared_ctrl_rx);
+                let shared_effect = effect_handler.clone();
+                let shared_node_name = node_name.clone();
+                let shared_handle = tokio::task::spawn(async move {
+                    otel_debug!(
+                        "extension.start.shared_task",
+                        node_id = shared_node_name.as_ref(),
+                    );
+                    shared_ext.start(shared_ctrl_chan, shared_effect).await
+                });
+
+                // Local variant runs on the current LocalSet thread.
+                otel_debug!(
+                    "extension.start.local_task",
+                    node_id = node_name.as_ref(),
+                );
+                let local_result = local_ext.start(ctrl_chan, effect_handler).await;
+
+                // Wait for the shared variant to finish too.
+                let shared_result = shared_handle
+                    .await
+                    .map_err(|e| Error::InternalError {
+                        message: format!("shared extension task panicked: {e}"),
+                    })?;
+
+                // Return the first error, or merge terminal states.
+                match (local_result, shared_result) {
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    (Ok(local_ts), Ok(shared_ts)) => Ok(local_ts.merge(shared_ts)),
+                }
+            }
+            (Some(local_ext), None) => {
+                otel_debug!(
+                    "extension.start.local",
+                    node_id = node_name.as_ref(),
+                );
+                local_ext.start(ctrl_chan, effect_handler).await
+            }
+            (None, Some(shared_ext)) => {
+                otel_debug!(
+                    "extension.start.shared",
+                    node_id = node_name.as_ref(),
+                );
+                shared_ext.start(ctrl_chan, effect_handler).await
+            }
+            (None, None) => {
+                panic!("ExtensionWrapper has no extension instance — this is a bug")
+            }
         }
     }
 }

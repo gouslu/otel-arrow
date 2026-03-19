@@ -210,7 +210,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable> RuntimePipeli
         // Instead, their control senders are tracked separately for shutdown-last.
         for extension in extensions {
             let mut extension = extension;
-            extension_control_senders.push(extension.extension_control_sender());
+            extension_control_senders.extend(extension.extension_control_senders());
             let telemetry_guard = extension.take_telemetry_guard();
             let node_entity_key = telemetry_guard.as_ref().map(|t| t.entity_key());
             let telemetry_handle = telemetry_guard.as_ref().map(|t| t.handle());
