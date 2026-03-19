@@ -8,7 +8,7 @@
 //! deep-copies each stored extension (which is cheap when the extension itself
 //! wraps shared state in `Arc`).
 //!
-//! Extensions that publish traits use the [`shared_extension_capabilities!`] macro,
+//! Extensions that publish traits use the [`extension_capabilities!`] macro,
 //!
 //! # Extension writer contract
 //!
@@ -654,119 +654,53 @@ macro_rules! register_capability_handle_traits {
     };
 }
 
-/// Shared extension capabilities descriptor.
+/// Extension capabilities descriptor.
 ///
-/// Carries both the capability names (for documentation/validation) and a
-/// registration function that produces `Vec<shared::CapabilityRegistration>`
-/// from an extension instance.
-pub struct SharedExtensionCapabilities {
+/// Carries capability names (for documentation/validation) and registration
+/// functions for both shared and local variants. Produced by
+/// [`extension_capabilities!`](crate::extension_capabilities).
+///
+/// Both `register_shared` and `register_local` are always present. The engine
+/// calls whichever is needed based on what the `create` fn returned.
+#[derive(Clone, Copy)]
+pub struct ExtensionCapabilities {
     /// Human-readable capability names.
     pub names: &'static [&'static str],
-    /// Registration function: takes a type-erased `&dyn Any` pointing at
-    /// the concrete extension type, produces shared capability registrations.
-    pub register: fn(&dyn Any) -> Vec<shared::CapabilityRegistration>,
+    /// Registration function for shared capabilities.
+    pub register_shared: fn(&dyn Any) -> Vec<shared::CapabilityRegistration>,
+    /// Registration function for local capabilities (Rc-based).
+    pub register_local: fn(Rc<dyn Any>) -> Vec<local::CapabilityRegistration>,
 }
 
-/// Local extension capabilities descriptor.
-///
-/// Carries both the capability names (for documentation/validation) and a
-/// registration function that produces `Vec<local::CapabilityRegistration>`
-/// from an `Rc`-wrapped extension instance.
-pub struct LocalExtensionCapabilities {
-    /// Human-readable capability names.
-    pub names: &'static [&'static str],
-    /// Registration function: takes a type-erased `Rc<dyn Any>`,
-    /// downcasts to the concrete extension type, produces local capability
-    /// registrations with Rc-based single-instance sharing.
-    pub register: fn(Rc<dyn Any>) -> Vec<local::CapabilityRegistration>,
-}
-
-/// Extension capabilities — either local or shared.
-///
-/// Used as the `capabilities` field in [`ExtensionFactory`](crate::ExtensionFactory).
-/// Produced by [`local_extension_capabilities!`](crate::local_extension_capabilities)
-/// or [`shared_extension_capabilities!`](crate::shared_extension_capabilities).
-pub enum ExtensionCapabilities {
-    /// Local capabilities (Rc-based, single instance).
-    Local(LocalExtensionCapabilities),
-    /// Shared capabilities (clone-based).
-    Shared(SharedExtensionCapabilities),
-}
-
-impl ExtensionCapabilities {
-    /// Returns the capability names.
-    pub fn names(&self) -> &'static [&'static str] {
-        match self {
-            Self::Local(caps) => caps.names,
-            Self::Shared(caps) => caps.names,
-        }
-    }
-}
-
-impl Clone for ExtensionCapabilities {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Local(caps) => Self::Local(LocalExtensionCapabilities {
-                names: caps.names,
-                register: caps.register,
-            }),
-            Self::Shared(caps) => Self::Shared(SharedExtensionCapabilities {
-                names: caps.names,
-                register: caps.register,
-            }),
-        }
-    }
-}
-
-/// Produces a shared extension capabilities descriptor.
+/// Produces an extension capabilities descriptor with both shared and local
+/// registration functions.
 ///
 /// Takes the concrete extension type and one or more capability handles.
-/// Returns an `ExtensionCapabilities::Shared` with names and registration fn.
+/// The type must implement both the local and shared trait variants for each handle.
 ///
 /// ```ignore
-/// capabilities: shared_extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
+/// capabilities: extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
 /// ```
 #[macro_export]
-macro_rules! shared_extension_capabilities {
+macro_rules! extension_capabilities {
     ($type:ty => $($handle:path),+ $(,)?) => {
-        $crate::extension::registry::ExtensionCapabilities::Shared(
-            $crate::extension::registry::SharedExtensionCapabilities {
-                names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
-                register: |any: &dyn std::any::Any| -> Vec<$crate::extension::registry::shared::CapabilityRegistration> {
-                    let ext = any.downcast_ref::<$type>()
-                        .expect("extension type mismatch — this is a bug");
-                    let mut caps = Vec::new();
-                    $(caps.extend(<$handle>::shared_capabilities(ext));)+
-                    caps
-                },
-            }
-        )
-    };
-}
-
-/// Produces a local extension capabilities descriptor.
-///
-/// Takes the concrete extension type and one or more capability handles.
-/// Returns an `ExtensionCapabilities::Local` with names and registration fn.
-///
-/// ```ignore
-/// capabilities: local_extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
-/// ```
-#[macro_export]
-macro_rules! local_extension_capabilities {
-    ($type:ty => $($handle:path),+ $(,)?) => {
-        $crate::extension::registry::ExtensionCapabilities::Local(
-            $crate::extension::registry::LocalExtensionCapabilities {
-                names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
-                register: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
-                    let rc = rc_any.downcast::<$type>()
-                        .expect("extension type mismatch — this is a bug");
-                    let mut caps = Vec::new();
-                    $(caps.extend(<$handle>::local_capabilities(&rc));)+
-                    caps
-                },
-            }
-        )
+        $crate::extension::registry::ExtensionCapabilities {
+            names: &[$(<$handle as $crate::extension::registry::ExtensionCapability>::NAME),+],
+            register_shared: |any: &dyn std::any::Any| -> Vec<$crate::extension::registry::shared::CapabilityRegistration> {
+                let ext = any.downcast_ref::<$type>()
+                    .expect("extension type mismatch — this is a bug");
+                let mut caps = Vec::new();
+                $(caps.extend(<$handle>::shared_capabilities(ext));)+
+                caps
+            },
+            register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::extension::registry::local::CapabilityRegistration> {
+                let rc = rc_any.downcast::<$type>()
+                    .expect("extension type mismatch — this is a bug");
+                let mut caps = Vec::new();
+                $(caps.extend(<$handle>::local_capabilities(&rc));)+
+                caps
+            },
+        }
     };
 }
 
@@ -1029,6 +963,19 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
+    impl LocalBearerTokenProvider for TestTokenProvider {
+        async fn get_token(&self) -> Result<BearerToken, Error> {
+            Ok(BearerToken::new(self.token.clone(), 0))
+        }
+
+        fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+            let (tx, rx) = watch::channel(None);
+            drop(tx);
+            rx
+        }
+    }
+
     #[derive(Clone)]
     struct DualTokenProvider {
         local_token: String,
@@ -1079,20 +1026,28 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl SharedBearerTokenProvider for LocalOnlyTokenProvider {
+        async fn get_token(&self) -> Result<BearerToken, Error> {
+            Ok(BearerToken::new(self.token.clone(), 0))
+        }
+
+        fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+            let (tx, rx) = watch::channel(None);
+            drop(tx);
+            rx
+        }
+    }
+
     /// Helper: register a shared TestTokenProvider with the given name.
     fn register_provider(registry: &mut CapabilityRegistry, name: &str, token: &str) {
         let instance = TestTokenProvider {
             token: token.to_string(),
         };
-        let caps = crate::shared_extension_capabilities!(
+        let caps = crate::extension_capabilities!(
             TestTokenProvider => BearerTokenProviderHandle
         );
-        match caps {
-            ExtensionCapabilities::Shared(ref s) => {
-                registry.register_all_shared(name, (s.register)(&instance));
-            }
-            _ => unreachable!(),
-        }
+        registry.register_all_shared(name, (caps.register_shared)(&instance));
     }
 
     fn register_dual_provider(
@@ -1106,44 +1061,26 @@ mod tests {
             shared_token: shared_token.to_string(),
         };
 
-        let shared_caps = crate::shared_extension_capabilities!(
+        let caps = crate::extension_capabilities!(
             DualTokenProvider => BearerTokenProviderHandle
         );
-        match shared_caps {
-            ExtensionCapabilities::Shared(ref s) => {
-                registry.register_all_shared(name, (s.register)(&instance));
-            }
-            _ => unreachable!(),
-        }
+        registry.register_all_shared(name, (caps.register_shared)(&instance));
 
         let rc: Rc<dyn Any> = Rc::new(DualTokenProvider {
             local_token: local_token.to_string(),
             shared_token: shared_token.to_string(),
         });
-        let local_caps = crate::local_extension_capabilities!(
-            DualTokenProvider => BearerTokenProviderHandle
-        );
-        match local_caps {
-            ExtensionCapabilities::Local(ref l) => {
-                registry.register_all_local(name, (l.register)(rc));
-            }
-            _ => unreachable!(),
-        }
+        registry.register_all_local(name, (caps.register_local)(rc));
     }
 
     fn register_local_only_provider(registry: &mut CapabilityRegistry, name: &str, token: &str) {
         let rc: Rc<dyn Any> = Rc::new(LocalOnlyTokenProvider {
             token: token.to_string(),
         });
-        let caps = crate::local_extension_capabilities!(
+        let caps = crate::extension_capabilities!(
             LocalOnlyTokenProvider => BearerTokenProviderHandle
         );
-        match caps {
-            ExtensionCapabilities::Local(ref l) => {
-                registry.register_all_local(name, (l.register)(rc));
-            }
-            _ => unreachable!(),
-        }
+        registry.register_all_local(name, (caps.register_local)(rc));
     }
 
     #[test]
@@ -1153,13 +1090,8 @@ mod tests {
         let instance = TestTokenProvider {
             token: "shared_token".to_string(),
         };
-        let caps = crate::shared_extension_capabilities!(TestTokenProvider => BearerTokenProviderHandle);
-        match caps {
-            ExtensionCapabilities::Shared(ref s) => {
-                registry.register_all_shared("ext", (s.register)(&instance));
-            }
-            _ => unreachable!(),
-        }
+        let caps = crate::extension_capabilities!(TestTokenProvider => BearerTokenProviderHandle);
+        registry.register_all_shared("ext", (caps.register_shared)(&instance));
 
         let provider: Box<dyn SharedBearerTokenProvider> =
             registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
@@ -1176,13 +1108,8 @@ mod tests {
         let rc: Rc<dyn Any> = Rc::new(LocalOnlyTokenProvider {
             token: "local_token".to_string(),
         });
-        let caps = crate::local_extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
-        match caps {
-            ExtensionCapabilities::Local(ref l) => {
-                registry.register_all_local("ext", (l.register)(Rc::clone(&rc)));
-            }
-            _ => unreachable!(),
-        }
+        let caps = crate::extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
+        registry.register_all_local("ext", (caps.register_local)(Rc::clone(&rc)));
 
         let bindings = HashMap::from([(
             "bearer_token_provider".to_string(),

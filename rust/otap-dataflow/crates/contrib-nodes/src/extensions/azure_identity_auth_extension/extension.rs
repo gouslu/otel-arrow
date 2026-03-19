@@ -38,7 +38,8 @@ use tokio::sync::watch;
 use otap_df_engine::control::ExtensionControlMsg;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::extension::{ControlChannel, EffectHandler};
-use otap_df_engine::local::extension::Extension;
+use otap_df_engine::local::extension::Extension as LocalExtension;
+use otap_df_engine::shared::extension::Extension as SharedExtension;
 use otap_df_engine::terminal_state::TerminalState;
 
 use super::config::{AuthMethod, Config};
@@ -349,9 +350,20 @@ impl LocalBearerTokenProvider for AzureIdentityAuthExtension {
 }
 
 #[async_trait(?Send)]
-impl Extension for AzureIdentityAuthExtension {
+impl LocalExtension for AzureIdentityAuthExtension {
     async fn start(
         self: std::rc::Rc<Self>,
+        ctrl_chan: ControlChannel,
+        _: EffectHandler,
+    ) -> Result<TerminalState, EngineError> {
+        self.run(ctrl_chan).await
+    }
+}
+
+#[async_trait]
+impl SharedExtension for AzureIdentityAuthExtension {
+    async fn start(
+        self: Box<Self>,
         ctrl_chan: ControlChannel,
         _: EffectHandler,
     ) -> Result<TerminalState, EngineError> {

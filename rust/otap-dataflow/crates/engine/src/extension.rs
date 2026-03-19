@@ -31,6 +31,7 @@ use crate::control::ExtensionControlMsg;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
 use crate::node::NodeId;
+use crate::shared::extension as shared_ext;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::terminal_state::TerminalState;
 use otap_df_channel::error::RecvError;
@@ -189,86 +190,77 @@ impl EffectHandler {
 /// [`ExtensionControlMsg`], keeping the extension system entirely decoupled
 /// from the data-plane type.
 ///
-/// An extension is either **local** or **shared**, never both:
-///
-/// - **Local** — `Rc<Self>` lifecycle, `Rc<dyn Trait>` capabilities.
-/// - **Shared** — `Box<Self>` lifecycle, `Box<dyn Trait>` capabilities.
+/// An extension may provide a shared lifecycle, a local lifecycle, or both.
+/// The engine registers capabilities and starts lifecycles for whichever
+/// variants are present.
 ///
 /// # Constructors
 ///
 /// ```ignore
-/// ExtensionWrapper::local(rc_ext, caps, node, config, ext_config)
-/// ExtensionWrapper::shared(ext, caps, node, config, ext_config)
+/// ExtensionWrapper::shared(ext, node, config, ext_config)
+/// ExtensionWrapper::local(Rc::new(ext), node, config, ext_config)
+/// ExtensionWrapper::dual(ext.clone(), Rc::new(ext), node, config, ext_config)
 /// ```
-pub enum ExtensionWrapper {
-    /// A local (!Send) extension.
-    ///
-    /// Uses `Rc` for true single-instance sharing — the extension task and
-    /// all capability consumers share the same allocation.
-    Local {
-        /// Index identifier for the node.
-        node_id: NodeId,
-        /// The user configuration for the node.
-        user_config: Arc<NodeUserConfig>,
-        /// The runtime configuration for the extension.
-        runtime_config: ExtensionConfig,
-        /// The extension instance (Rc for true single instance).
-        extension: std::rc::Rc<dyn crate::local::extension::Extension>,
-        /// The extension as `Rc<dyn Any>` for capability registration.
-        extension_any: std::rc::Rc<dyn std::any::Any>,
-        /// Capabilities descriptor with names + registration fn.
-        capabilities: registry::ExtensionCapabilities,
-        /// A sender for control messages.
-        control_sender: SharedSender<ExtensionControlMsg>,
-        /// A receiver for control messages.
-        control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
-        /// Telemetry guard for node lifecycle cleanup.
-        telemetry: Option<NodeTelemetryGuard>,
-    },
-    /// A shared (Send) extension.
-    ///
-    /// Uses clone-based distribution — consumers get clones that share
-    /// `Arc`-wrapped internal state.
-    Shared {
-        /// Index identifier for the node.
-        node_id: NodeId,
-        /// The user configuration for the node.
-        user_config: Arc<NodeUserConfig>,
-        /// The runtime configuration for the extension.
-        runtime_config: ExtensionConfig,
-        /// The extension instance.
-        extension: Box<dyn crate::shared::extension::Extension>,
-        /// Type-erased clone of the extension for capability registration.
-        extension_any: Box<dyn registry::CloneAnySend>,
-        /// Capabilities descriptor with names + registration fn.
-        capabilities: registry::ExtensionCapabilities,
-        /// A sender for control messages.
-        control_sender: SharedSender<ExtensionControlMsg>,
-        /// A receiver for control messages.
-        control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
-        /// Telemetry guard for node lifecycle cleanup.
-        telemetry: Option<NodeTelemetryGuard>,
-    },
+pub struct ExtensionWrapper {
+    /// Index identifier for the node.
+    node_id: NodeId,
+    /// The user configuration for the node.
+    user_config: Arc<NodeUserConfig>,
+    /// The runtime configuration for the extension.
+    runtime_config: ExtensionConfig,
+    /// Shared extension lifecycle (Send, clone-based).
+    shared_extension: Option<Box<dyn shared_ext::Extension>>,
+    /// Local extension lifecycle (Rc-based, true single instance).
+    local_extension: Option<std::rc::Rc<dyn crate::local::extension::Extension>>,
+    /// Type-erased shared instance for capability registration.
+    shared_any: Option<Box<dyn registry::CloneAnySend>>,
+    /// Type-erased local instance for capability registration.
+    local_any: Option<std::rc::Rc<dyn std::any::Any>>,
+    /// Capabilities descriptor — set by the engine after `create()`.
+    capabilities: registry::ExtensionCapabilities,
+    /// A sender for control messages.
+    control_sender: SharedSender<ExtensionControlMsg>,
+    /// A receiver for control messages.
+    control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
+    /// Telemetry guard for node lifecycle cleanup.
+    telemetry: Option<NodeTelemetryGuard>,
 }
 
 impl ExtensionWrapper {
-    /// Create a **local** extension.
-    ///
-    /// Uses `Rc` for true single-instance sharing — the same allocation serves
-    /// both the extension task and all capability consumers.
-    ///
-    /// The `capabilities` closure receives `&Rc<E>` so it can produce
-    /// capability registrations without the caller needing to clone the Rc.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// ExtensionWrapper::local(
-    ///     Rc::new(extension),
-    ///     |rc| local_extension_capabilities!(rc => BearerTokenProvider),
-    ///     node, config, ext_config,
-    /// )
-    /// ```
+    /// Create a **shared** extension (Send, clone-based).
+    pub fn shared<E>(
+        extension: E,
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> Self
+    where
+        E: shared_ext::Extension + Clone + Send + 'static,
+    {
+        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(config.control_channel.capacity);
+
+        Self {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            shared_extension: Some(Box::new(extension)),
+            local_extension: None,
+            shared_any: Some(shared_any),
+            local_any: None,
+            capabilities: registry::ExtensionCapabilities {
+                names: &[],
+                register_shared: |_| Vec::new(),
+                register_local: |_| Vec::new(),
+            },
+            control_sender: SharedSender::mpsc(control_sender),
+            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            telemetry: None,
+        }
+    }
+
+    /// Create a **local** extension (Rc-based, true single instance).
     pub fn local<E>(
         extension: std::rc::Rc<E>,
         node_id: NodeId,
@@ -278,70 +270,58 @@ impl ExtensionWrapper {
     where
         E: crate::local::extension::Extension + 'static,
     {
-        let extension_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
+        let local_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
 
-        ExtensionWrapper::Local {
+        Self {
             node_id,
             user_config,
             runtime_config: config.clone(),
-            extension,
-            extension_any,
-            capabilities: registry::ExtensionCapabilities::Local(
-                registry::LocalExtensionCapabilities {
-                    names: &[],
-                    register: |_| Vec::new(),
-                },
-            ),
+            shared_extension: None,
+            local_extension: Some(extension),
+            shared_any: None,
+            local_any: Some(local_any),
+            capabilities: registry::ExtensionCapabilities {
+                names: &[],
+                register_shared: |_| Vec::new(),
+                register_local: |_| Vec::new(),
+            },
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
         }
     }
 
-    /// Create a **shared** extension.
-    ///
-    /// Uses clone-based distribution — the extension type must be `Clone + Send`.
-    /// Consumers get clones that share `Arc`-wrapped internal state.
-    ///
-    /// The `capabilities` closure receives `&E` so it can produce
-    /// capability registrations without the caller needing to bind a variable.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// ExtensionWrapper::shared(
-    ///     extension,
-    ///     |ext| shared_extension_capabilities!(ext => BearerTokenProvider),
-    ///     node, config, ext_config,
-    /// )
-    /// ```
-    pub fn shared<E>(
-        extension: E,
+    /// Create a **dual** extension with both shared and local lifecycles.
+    pub fn dual<E>(
+        shared: E,
+        local: std::rc::Rc<E>,
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,
         config: &ExtensionConfig,
     ) -> Self
     where
-        E: crate::shared::extension::Extension + Clone + Send + 'static,
+        E: shared_ext::Extension + crate::local::extension::Extension + Clone + Send + 'static,
     {
-        let extension_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
+        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(shared.clone());
+        let local_any: std::rc::Rc<dyn std::any::Any> = local.clone();
         let (control_sender, control_receiver) =
             tokio::sync::mpsc::channel(config.control_channel.capacity);
 
-        ExtensionWrapper::Shared {
+        Self {
             node_id,
             user_config,
             runtime_config: config.clone(),
-            extension: Box::new(extension),
-            extension_any,
-            capabilities: registry::ExtensionCapabilities::Shared(
-                registry::SharedExtensionCapabilities {
-                    names: &[],
-                    register: |_| Vec::new(),
-                },
-            ),
+            shared_extension: Some(Box::new(shared)),
+            local_extension: Some(local),
+            shared_any: Some(shared_any),
+            local_any: Some(local_any),
+            capabilities: registry::ExtensionCapabilities {
+                names: &[],
+                register_shared: |_| Vec::new(),
+                register_local: |_| Vec::new(),
+            },
             control_sender: SharedSender::mpsc(control_sender),
             control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
             telemetry: None,
@@ -350,200 +330,96 @@ impl ExtensionWrapper {
 
     /// Sets the capabilities descriptor. Called by the engine after `create()`.
     pub fn set_capabilities(&mut self, caps: registry::ExtensionCapabilities) {
-        match self {
-            ExtensionWrapper::Local { capabilities, .. }
-            | ExtensionWrapper::Shared { capabilities, .. } => {
-                *capabilities = caps;
-            }
-        }
+        self.capabilities = caps;
     }
 
     /// Returns the node ID of this extension.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
-        match self {
-            ExtensionWrapper::Local { node_id, .. }
-            | ExtensionWrapper::Shared { node_id, .. } => node_id.clone(),
-        }
+        self.node_id.clone()
     }
 
     /// Returns the user configuration for this extension.
     #[must_use]
     pub fn user_config(&self) -> Arc<NodeUserConfig> {
-        match self {
-            ExtensionWrapper::Local { user_config, .. }
-            | ExtensionWrapper::Shared { user_config, .. } => user_config.clone(),
-        }
+        self.user_config.clone()
     }
 
     /// Materializes capability registrations and inserts them into the registry.
-    pub fn register_traits(&mut self, registry: &mut registry::CapabilityRegistry, name: &str) {
-        match self {
-            ExtensionWrapper::Local {
-                extension_any,
-                capabilities: registry::ExtensionCapabilities::Local(caps),
-                ..
-            } => {
-                let regs = (caps.register)(std::rc::Rc::clone(extension_any));
-                registry.register_all_local(name, regs);
-            }
-            ExtensionWrapper::Shared {
-                extension_any,
-                capabilities: registry::ExtensionCapabilities::Shared(caps),
-                ..
-            } => {
-                let regs = (caps.register)(extension_any.as_any_ref());
-                registry.register_all_shared(name, regs);
-            }
-            _ => {
-                panic!("ExtensionWrapper variant does not match capabilities variant — this is a bug");
-            }
+    ///
+    /// Registers shared capabilities if a shared instance is present, and
+    /// local capabilities if a local instance is present.
+    pub fn register_traits(&self, registry: &mut registry::CapabilityRegistry, name: &str) {
+        if let Some(ref shared_any) = self.shared_any {
+            let regs = (self.capabilities.register_shared)(shared_any.as_ref().as_any_ref());
+            registry.register_all_shared(name, regs);
+        }
+        if let Some(ref local_any) = self.local_any {
+            let regs = (self.capabilities.register_local)(std::rc::Rc::clone(local_any));
+            registry.register_all_local(name, regs);
         }
     }
 
     pub(crate) fn with_node_telemetry_guard(mut self, guard: NodeTelemetryGuard) -> Self {
-        match &mut self {
-            ExtensionWrapper::Local { telemetry, .. }
-            | ExtensionWrapper::Shared { telemetry, .. } => {
-                *telemetry = Some(guard);
-            }
-        }
+        self.telemetry = Some(guard);
         self
     }
 
     pub(crate) fn take_telemetry_guard(&mut self) -> Option<NodeTelemetryGuard> {
-        match self {
-            ExtensionWrapper::Local { telemetry, .. }
-            | ExtensionWrapper::Shared { telemetry, .. } => telemetry.take(),
-        }
+        self.telemetry.take()
     }
 
     pub(crate) fn with_control_channel_metrics(
-        self,
+        mut self,
         pipeline_ctx: &PipelineContext,
         channel_metrics: &mut ChannelMetricsRegistry,
         channel_metrics_enabled: bool,
     ) -> Self {
-        match self {
-            ExtensionWrapper::Local {
-                node_id,
-                user_config,
-                runtime_config,
-                extension,
-                extension_any,
-                capabilities,
-                control_sender,
+        let control_receiver = self
+            .control_receiver
+            .take()
+            .expect("control_receiver already taken");
+        let (control_sender, control_receiver) =
+            wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
+                &self.node_id,
+                pipeline_ctx,
+                channel_metrics,
+                channel_metrics_enabled,
+                self.runtime_config.control_channel.capacity as u64,
+                self.control_sender,
                 control_receiver,
-                telemetry,
-            } => {
-                let control_receiver = control_receiver.expect("control_receiver already taken");
-                let (control_sender, control_receiver) =
-                    wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
-                        &node_id,
-                        pipeline_ctx,
-                        channel_metrics,
-                        channel_metrics_enabled,
-                        runtime_config.control_channel.capacity as u64,
-                        control_sender,
-                        control_receiver,
-                    );
-                ExtensionWrapper::Local {
-                    node_id,
-                    user_config,
-                    runtime_config,
-                    extension,
-                    extension_any,
-                    capabilities,
-                    control_sender,
-                    control_receiver: Some(control_receiver),
-                    telemetry,
-                }
-            }
-            ExtensionWrapper::Shared {
-                node_id,
-                user_config,
-                runtime_config,
-                extension,
-                extension_any,
-                capabilities,
-                control_sender,
-                control_receiver,
-                telemetry,
-            } => {
-                let control_receiver = control_receiver.expect("control_receiver already taken");
-                let (control_sender, control_receiver) =
-                    wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
-                        &node_id,
-                        pipeline_ctx,
-                        channel_metrics,
-                        channel_metrics_enabled,
-                        runtime_config.control_channel.capacity as u64,
-                        control_sender,
-                        control_receiver,
-                    );
-                ExtensionWrapper::Shared {
-                    node_id,
-                    user_config,
-                    runtime_config,
-                    extension,
-                    extension_any,
-                    capabilities,
-                    control_sender,
-                    control_receiver: Some(control_receiver),
-                    telemetry,
-                }
-            }
-        }
+            );
+        self.control_sender = control_sender;
+        self.control_receiver = Some(control_receiver);
+        self
     }
 
     /// Returns an `ExtensionControlSender` for sending control messages.
     pub(crate) fn extension_control_sender(
         &self,
     ) -> crate::control::ExtensionControlSender {
-        match self {
-            ExtensionWrapper::Local {
-                node_id,
-                control_sender,
-                ..
-            }
-            | ExtensionWrapper::Shared {
-                node_id,
-                control_sender,
-                ..
-            } => crate::control::ExtensionControlSender {
-                node_id: node_id.clone(),
-                sender: crate::message::Sender::Shared(control_sender.clone()),
-            },
+        crate::control::ExtensionControlSender {
+            node_id: self.node_id.clone(),
+            sender: crate::message::Sender::Shared(self.control_sender.clone()),
         }
     }
 
-    /// Starts the extension and begins its operation.
+    /// Starts the extension lifecycle.
+    ///
+    /// Prefers the local lifecycle if available, otherwise uses shared.
     pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
-        match self {
-            ExtensionWrapper::Local {
-                node_id,
-                extension,
-                control_receiver,
-                ..
-            } => {
-                let effect_handler = EffectHandler::new(node_id, metrics_reporter);
-                let control_receiver =
-                    control_receiver.expect("control_receiver missing from ExtensionWrapper");
-                let ctrl_chan = ControlChannel::new(control_receiver);
-                extension.start(ctrl_chan, effect_handler).await
-            }
-            ExtensionWrapper::Shared {
-                node_id,
-                extension,
-                control_receiver,
-                ..
-            } => {
-                let effect_handler = EffectHandler::new(node_id, metrics_reporter);
-                let control_receiver =
-                    control_receiver.expect("control_receiver missing from ExtensionWrapper");
-                let ctrl_chan = ControlChannel::new(control_receiver);
-                extension.start(ctrl_chan, effect_handler).await
-            }
+        let effect_handler = EffectHandler::new(self.node_id, metrics_reporter);
+        let control_receiver = self
+            .control_receiver
+            .expect("control_receiver missing from ExtensionWrapper");
+        let ctrl_chan = ControlChannel::new(control_receiver);
+
+        if let Some(local_ext) = self.local_extension {
+            local_ext.start(ctrl_chan, effect_handler).await
+        } else if let Some(shared_ext) = self.shared_extension {
+            shared_ext.start(ctrl_chan, effect_handler).await
+        } else {
+            panic!("ExtensionWrapper has no extension instance — this is a bug")
         }
     }
 }

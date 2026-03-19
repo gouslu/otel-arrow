@@ -735,7 +735,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         // Build capability registry from extension trait registrations.
         let mut extension_registry = CapabilityRegistry::new();
-        for ext in &mut extensions {
+        for ext in &extensions {
             let name = ext.node_id().name.as_ref().to_string();
             ext.register_traits(&mut extension_registry, &name);
         }

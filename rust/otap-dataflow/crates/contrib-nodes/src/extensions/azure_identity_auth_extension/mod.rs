@@ -70,7 +70,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     name: AZURE_IDENTITY_AUTH_EXTENSION_URN,
     description: "Azure Identity authentication via managed identity or developer tools",
     documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
-    capabilities: otap_df_engine::local_extension_capabilities!(
+    capabilities: otap_df_engine::extension_capabilities!(
         AzureIdentityAuthExtension => BearerTokenProvider
     ),
     create: |_: PipelineContext,
