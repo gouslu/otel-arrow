@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use std::borrow::Cow;
+use std::rc::Rc;
 
 // Register the public capability at the handle level. Local/shared trait
 // variants are internal implementation details selected by the engine.
@@ -140,9 +141,9 @@ pub mod shared {
 /// they received. The engine selects the variant at pipeline build time
 /// based on extension scope and consumer node type.
 pub enum BearerTokenProvider {
-    /// !Send variant — used for local consumers of pipeline-scoped extensions.
-    Local(Box<dyn local::BearerTokenProvider>),
-    /// Send variant — used for shared consumers or cross-scope extensions.
+    /// Rc-based variant — true single-instance sharing for local consumers.
+    Local(Rc<dyn local::BearerTokenProvider>),
+    /// Box-based variant — clone-distributed for shared consumers.
     Shared(Box<dyn shared::BearerTokenProvider>),
 }
 
@@ -171,7 +172,7 @@ impl super::registry::CapabilityHandle for BearerTokenProvider {
     type Local = dyn local::BearerTokenProvider;
     type Shared = dyn shared::BearerTokenProvider;
 
-    fn from_local(local: Box<<Self as super::registry::CapabilityHandle>::Local>) -> Self {
+    fn from_local(local: Rc<dyn local::BearerTokenProvider>) -> Self {
         Self::Local(local)
     }
 

@@ -31,7 +31,6 @@ use crate::control::ExtensionControlMsg;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
 use crate::node::NodeId;
-use crate::shared::extension as shared_ext;
 use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::terminal_state::TerminalState;
 use otap_df_channel::error::RecvError;
@@ -182,148 +181,6 @@ impl EffectHandler {
     }
 }
 
-// ── Builder types ───────────────────────────────────────────────────────────
-
-/// Builder for active extensions (with a background task).
-///
-/// Obtained via [`ExtensionWrapper::active()`]. Select registration mode with
-/// `.cloned()`, then call `.shared(...)`.
-pub struct ActiveBuilder;
-
-/// Active extension builder after selecting cloned registration mode.
-pub struct ActiveClonedBuilder;
-
-/// Builder for passive extensions (no background task, capabilities only).
-///
-/// Obtained via [`ExtensionWrapper::passive()`]. Select registration mode with
-/// `.cloned()` or `.instance()`, then call `.shared(...)`.
-pub struct PassiveBuilder;
-
-/// Passive extension builder after selecting registration source mode.
-pub struct PassiveModeBuilder {
-    source: registry::RegistrationSource,
-}
-
-impl ActiveBuilder {
-    /// Select cloned registration mode for active extensions.
-    #[must_use]
-    pub const fn cloned(self) -> ActiveClonedBuilder {
-        ActiveClonedBuilder
-    }
-
-    /// Backward-compatible alias. Prefer `active().cloned().shared(...)`.
-    pub fn shared_cloned<E>(
-        self,
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
-        extension: E,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> ExtensionWrapper
-    where
-        E: shared_ext::Extension + 'static,
-    {
-        self.cloned()
-            .shared(capabilities, extension, node_id, user_config, config)
-    }
-}
-
-impl ActiveClonedBuilder {
-    /// Creates an active extension with shared (Send) cloned registrations.
-    pub fn shared<E>(
-        self,
-        mut capabilities: Vec<registry::shared::CapabilityRegistration>,
-        extension: E,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-        config: &ExtensionConfig,
-    ) -> ExtensionWrapper
-    where
-        E: shared_ext::Extension + 'static,
-    {
-        for reg in &mut capabilities {
-            reg.source = registry::RegistrationSource::Cloned;
-        }
-
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(config.control_channel.capacity);
-
-        ExtensionWrapper::ActiveShared {
-            node_id,
-            user_config,
-            runtime_config: config.clone(),
-            extension: Box::new(extension),
-            registration_source: registry::RegistrationSource::Cloned,
-            shared_capabilities: capabilities,
-            local_capabilities: Vec::new(),
-            control_sender: SharedSender::mpsc(control_sender),
-            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
-            telemetry: None,
-        }
-    }
-}
-
-impl PassiveBuilder {
-    /// Select cloned registration mode for passive extensions.
-    #[must_use]
-    pub const fn cloned(self) -> PassiveModeBuilder {
-        PassiveModeBuilder {
-            source: registry::RegistrationSource::Cloned,
-        }
-    }
-
-    /// Select instance registration mode for passive extensions.
-    #[must_use]
-    pub const fn instance(self) -> PassiveModeBuilder {
-        PassiveModeBuilder {
-            source: registry::RegistrationSource::Instance,
-        }
-    }
-
-    /// Backward-compatible alias. Prefer `passive().cloned().shared(...)`.
-    pub fn shared_cloned(
-        self,
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-    ) -> ExtensionWrapper {
-        self.cloned().shared(capabilities, node_id, user_config)
-    }
-
-    /// Backward-compatible alias. Prefer `passive().instance().shared(...)`.
-    pub fn shared_instance(
-        self,
-        capabilities: Vec<registry::shared::CapabilityRegistration>,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-    ) -> ExtensionWrapper {
-        self.instance().shared(capabilities, node_id, user_config)
-    }
-}
-
-impl PassiveModeBuilder {
-    /// Creates a passive extension with shared registrations for the selected source mode.
-    pub fn shared(
-        self,
-        mut capabilities: Vec<registry::shared::CapabilityRegistration>,
-        node_id: NodeId,
-        user_config: Arc<NodeUserConfig>,
-    ) -> ExtensionWrapper {
-        for reg in &mut capabilities {
-            reg.source = self.source;
-        }
-
-        ExtensionWrapper::PassiveShared {
-            node_id,
-            user_config,
-            registration_source: self.source,
-            shared_capabilities: capabilities,
-            local_capabilities: Vec::new(),
-            telemetry: None,
-        }
-    }
-}
-
 // ── ExtensionWrapper ────────────────────────────────────────────────────────
 
 /// Wrapper for extension instances in the pipeline engine.
@@ -332,36 +189,33 @@ impl PassiveModeBuilder {
 /// [`ExtensionControlMsg`], keeping the extension system entirely decoupled
 /// from the data-plane type.
 ///
-/// Two variants exist, combining lifecycle (active/passive) with shared-first
-/// capability registration:
+/// An extension is either **local** or **shared**, never both:
 ///
-/// - **ActiveShared** — a Send extension with a background task.
-/// - **PassiveShared** — no background task, Send capabilities only.
+/// - **Local** — `Rc<Self>` lifecycle, `Rc<dyn Trait>` capabilities.
+/// - **Shared** — `Box<Self>` lifecycle, `Box<dyn Trait>` capabilities.
 ///
-/// Use the builder API to construct:
+/// # Constructors
+///
 /// ```ignore
-/// ExtensionWrapper::active().cloned().shared(caps, ext, node_id, user_config, &config)
-/// ExtensionWrapper::active().cloned().shared(shared_caps, ext, node_id, user_config, &config).local(local_caps)
-/// ExtensionWrapper::passive().cloned().shared(shared_caps, node_id, user_config).local(local_caps)
-/// ExtensionWrapper::passive().instance().shared(shared_caps, node_id, user_config).local(local_caps)
+/// ExtensionWrapper::local(rc_ext, caps, node, config, ext_config)
+/// ExtensionWrapper::shared(ext, caps, node, config, ext_config)
 /// ```
 pub enum ExtensionWrapper {
-    /// A shared (Send) extension with a background task.
-    ActiveShared {
+    /// A local (!Send) extension.
+    ///
+    /// Uses `Rc` for true single-instance sharing — the extension task and
+    /// all capability consumers share the same allocation.
+    Local {
         /// Index identifier for the node.
         node_id: NodeId,
         /// The user configuration for the node.
         user_config: Arc<NodeUserConfig>,
         /// The runtime configuration for the extension.
         runtime_config: ExtensionConfig,
-        /// The extension instance (Send).
-        extension: Box<dyn shared_ext::Extension>,
-        /// Registration source mode for shared/local capabilities on this wrapper.
-        registration_source: registry::RegistrationSource,
-        /// Shared capability registrations to publish.
-        shared_capabilities: Vec<registry::shared::CapabilityRegistration>,
-        /// Optional local capability registrations to publish.
-        local_capabilities: Vec<registry::local::CapabilityRegistration>,
+        /// The extension instance (Rc for true single instance).
+        extension: std::rc::Rc<dyn crate::local::extension::Extension>,
+        /// Local capability registrations to publish (Rc-backed).
+        capabilities: Vec<registry::local::CapabilityRegistration>,
         /// A sender for control messages.
         control_sender: SharedSender<ExtensionControlMsg>,
         /// A receiver for control messages.
@@ -369,104 +223,123 @@ pub enum ExtensionWrapper {
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
     },
-    /// A shared (Send) extension that only provides capabilities, no background task.
-    PassiveShared {
+    /// A shared (Send) extension.
+    ///
+    /// Uses clone-based distribution — consumers get clones that share
+    /// `Arc`-wrapped internal state.
+    Shared {
         /// Index identifier for the node.
         node_id: NodeId,
         /// The user configuration for the node.
         user_config: Arc<NodeUserConfig>,
-        /// Registration source mode for shared/local capabilities on this wrapper.
-        registration_source: registry::RegistrationSource,
+        /// The runtime configuration for the extension.
+        runtime_config: ExtensionConfig,
+        /// The extension instance.
+        extension: Box<dyn crate::shared::extension::Extension>,
         /// Shared capability registrations to publish.
-        shared_capabilities: Vec<registry::shared::CapabilityRegistration>,
-        /// Optional local capability registrations to publish.
-        local_capabilities: Vec<registry::local::CapabilityRegistration>,
+        capabilities: Vec<registry::shared::CapabilityRegistration>,
+        /// A sender for control messages.
+        control_sender: SharedSender<ExtensionControlMsg>,
+        /// A receiver for control messages.
+        control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
         /// Telemetry guard for node lifecycle cleanup.
         telemetry: Option<NodeTelemetryGuard>,
     },
 }
 
 impl ExtensionWrapper {
-    /// Start building an **active** extension (with a background task).
+    /// Create a **local** extension.
     ///
-    /// Chain with `.cloned().shared()` to finalize:
+    /// Uses `Rc` for true single-instance sharing — the same allocation serves
+    /// both the extension task and all capability consumers.
+    ///
+    /// The `capabilities` closure receives `&Rc<E>` so it can produce
+    /// capability registrations without the caller needing to clone the Rc.
+    ///
+    /// # Example
+    ///
     /// ```ignore
-    /// ExtensionWrapper::active().cloned().shared(caps, ext, node_id, user_config, &config)
+    /// ExtensionWrapper::local(
+    ///     Rc::new(extension),
+    ///     |rc| local_extension_capabilities!(rc => BearerTokenProvider),
+    ///     node, config, ext_config,
+    /// )
     /// ```
-    #[must_use]
-    pub fn active() -> ActiveBuilder {
-        ActiveBuilder
-    }
+    pub fn local<E>(
+        extension: std::rc::Rc<E>,
+        capabilities: impl FnOnce(&std::rc::Rc<E>) -> Vec<registry::local::CapabilityRegistration>,
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> Self
+    where
+        E: crate::local::extension::Extension + 'static,
+    {
+        let caps = capabilities(&extension);
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(config.control_channel.capacity);
 
-    /// Start building a **passive** extension (capabilities only, no background task).
-    ///
-    /// Chain with `.cloned().shared()` or `.instance().shared()` to finalize:
-    /// ```ignore
-    /// ExtensionWrapper::passive().cloned().shared(caps, node_id, user_config)
-    /// ExtensionWrapper::passive().instance().shared(caps, node_id, user_config)
-    /// ```
-    #[must_use]
-    pub fn passive() -> PassiveBuilder {
-        PassiveBuilder
-    }
-
-    /// Augments a shared extension wrapper with optional local capability
-    /// registrations.
-    ///
-    /// Add local capability registrations in shared-first construction flow.
-    ///
-    /// Local registration mode must match the wrapper's selected source mode.
-    #[must_use]
-    pub fn local(
-        mut self,
-        mut local_capabilities: Vec<registry::local::CapabilityRegistration>,
-    ) -> Self {
-        match &mut self {
-            ExtensionWrapper::ActiveShared {
-                registration_source,
-                local_capabilities: local_regs,
-                ..
-            }
-            | ExtensionWrapper::PassiveShared {
-                registration_source,
-                local_capabilities: local_regs,
-                ..
-            } => {
-                for reg in &mut local_capabilities {
-                    reg.source = *registration_source;
-                }
-                local_regs.extend(local_capabilities);
-                self
-            }
+        ExtensionWrapper::Local {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            extension,
+            capabilities: caps,
+            control_sender: SharedSender::mpsc(control_sender),
+            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            telemetry: None,
         }
     }
 
-    /// Backward-compatible alias. Prefer `local(...)`.
-    #[must_use]
-    pub fn local_cloned(self, local_capabilities: Vec<registry::local::CapabilityRegistration>) -> Self {
-        self.local(local_capabilities)
-    }
-
-    /// Backward-compatible alias for cloned local registration.
+    /// Create a **shared** extension.
     ///
-    /// Prefer [`ExtensionWrapper::local`].
-    #[must_use]
-    pub fn local_instance(self, local_capabilities: Vec<registry::local::CapabilityRegistration>) -> Self {
-        self.local(local_capabilities)
-    }
+    /// Uses clone-based distribution — the extension type must be `Clone + Send`.
+    /// Consumers get clones that share `Arc`-wrapped internal state.
+    ///
+    /// The `capabilities` closure receives `&E` so it can produce
+    /// capability registrations without the caller needing to bind a variable.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// ExtensionWrapper::shared(
+    ///     extension,
+    ///     |ext| shared_extension_capabilities!(ext => BearerTokenProvider),
+    ///     node, config, ext_config,
+    /// )
+    /// ```
+    pub fn shared<E>(
+        extension: E,
+        capabilities: impl FnOnce(&E) -> Vec<registry::shared::CapabilityRegistration>,
+        node_id: NodeId,
+        user_config: Arc<NodeUserConfig>,
+        config: &ExtensionConfig,
+    ) -> Self
+    where
+        E: crate::shared::extension::Extension + 'static,
+    {
+        let caps = capabilities(&extension);
+        let (control_sender, control_receiver) =
+            tokio::sync::mpsc::channel(config.control_channel.capacity);
 
-    /// Returns `true` if this is an Active extension that needs to be spawned.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        matches!(self, ExtensionWrapper::ActiveShared { .. })
+        ExtensionWrapper::Shared {
+            node_id,
+            user_config,
+            runtime_config: config.clone(),
+            extension: Box::new(extension),
+            capabilities: caps,
+            control_sender: SharedSender::mpsc(control_sender),
+            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            telemetry: None,
+        }
     }
 
     /// Returns the node ID of this extension.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         match self {
-            ExtensionWrapper::ActiveShared { node_id, .. }
-            | ExtensionWrapper::PassiveShared { node_id, .. } => node_id.clone(),
+            ExtensionWrapper::Local { node_id, .. }
+            | ExtensionWrapper::Shared { node_id, .. } => node_id.clone(),
         }
     }
 
@@ -474,37 +347,32 @@ impl ExtensionWrapper {
     #[must_use]
     pub fn user_config(&self) -> Arc<NodeUserConfig> {
         match self {
-            ExtensionWrapper::ActiveShared { user_config, .. }
-            | ExtensionWrapper::PassiveShared { user_config, .. } => user_config.clone(),
+            ExtensionWrapper::Local { user_config, .. }
+            | ExtensionWrapper::Shared { user_config, .. } => user_config.clone(),
         }
     }
 
     /// Drains the stored capability registrations and inserts them into
     /// the registry under the given name.
     pub fn register_traits(&mut self, registry: &mut registry::CapabilityRegistry, name: &str) {
-        let (shared_regs, local_regs) = match self {
-            ExtensionWrapper::ActiveShared {
-                shared_capabilities,
-                local_capabilities,
-                ..
+        match self {
+            ExtensionWrapper::Local {
+                capabilities, ..
+            } => {
+                registry.register_all_local(name, std::mem::take(capabilities));
             }
-            | ExtensionWrapper::PassiveShared {
-                shared_capabilities,
-                local_capabilities,
-                ..
-            } => (
-                std::mem::take(shared_capabilities),
-                std::mem::take(local_capabilities),
-            ),
-        };
-        registry.register_all_shared(name, shared_regs);
-        registry.register_all_local(name, local_regs);
+            ExtensionWrapper::Shared {
+                capabilities, ..
+            } => {
+                registry.register_all_shared(name, std::mem::take(capabilities));
+            }
+        }
     }
 
     pub(crate) fn with_node_telemetry_guard(mut self, guard: NodeTelemetryGuard) -> Self {
         match &mut self {
-            ExtensionWrapper::ActiveShared { telemetry, .. }
-            | ExtensionWrapper::PassiveShared { telemetry, .. } => {
+            ExtensionWrapper::Local { telemetry, .. }
+            | ExtensionWrapper::Shared { telemetry, .. } => {
                 *telemetry = Some(guard);
             }
         }
@@ -513,8 +381,8 @@ impl ExtensionWrapper {
 
     pub(crate) fn take_telemetry_guard(&mut self) -> Option<NodeTelemetryGuard> {
         match self {
-            ExtensionWrapper::ActiveShared { telemetry, .. }
-            | ExtensionWrapper::PassiveShared { telemetry, .. } => telemetry.take(),
+            ExtensionWrapper::Local { telemetry, .. }
+            | ExtensionWrapper::Shared { telemetry, .. } => telemetry.take(),
         }
     }
 
@@ -525,14 +393,12 @@ impl ExtensionWrapper {
         channel_metrics_enabled: bool,
     ) -> Self {
         match self {
-            ExtensionWrapper::ActiveShared {
+            ExtensionWrapper::Local {
                 node_id,
                 user_config,
                 runtime_config,
                 extension,
-                registration_source,
-                shared_capabilities,
-                local_capabilities,
+                capabilities,
                 control_sender,
                 control_receiver,
                 telemetry,
@@ -548,54 +414,77 @@ impl ExtensionWrapper {
                         control_sender,
                         control_receiver,
                     );
-                ExtensionWrapper::ActiveShared {
+                ExtensionWrapper::Local {
                     node_id,
                     user_config,
                     runtime_config,
                     extension,
-                    registration_source,
-                    shared_capabilities,
-                    local_capabilities,
+                    capabilities,
                     control_sender,
                     control_receiver: Some(control_receiver),
                     telemetry,
                 }
             }
-            // Passive extensions have no control channel — nothing to wrap.
-            passive @ ExtensionWrapper::PassiveShared { .. } => passive,
+            ExtensionWrapper::Shared {
+                node_id,
+                user_config,
+                runtime_config,
+                extension,
+                capabilities,
+                control_sender,
+                control_receiver,
+                telemetry,
+            } => {
+                let control_receiver = control_receiver.expect("control_receiver already taken");
+                let (control_sender, control_receiver) =
+                    wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
+                        &node_id,
+                        pipeline_ctx,
+                        channel_metrics,
+                        channel_metrics_enabled,
+                        runtime_config.control_channel.capacity as u64,
+                        control_sender,
+                        control_receiver,
+                    );
+                ExtensionWrapper::Shared {
+                    node_id,
+                    user_config,
+                    runtime_config,
+                    extension,
+                    capabilities,
+                    control_sender,
+                    control_receiver: Some(control_receiver),
+                    telemetry,
+                }
+            }
         }
     }
 
     /// Returns an `ExtensionControlSender` for sending control messages.
-    ///
-    /// Returns `Some` for Active extensions and `None` for Passive extensions.
     pub(crate) fn extension_control_sender(
         &self,
-    ) -> Option<crate::control::ExtensionControlSender> {
+    ) -> crate::control::ExtensionControlSender {
         match self {
-            ExtensionWrapper::ActiveShared {
+            ExtensionWrapper::Local {
                 node_id,
                 control_sender,
                 ..
-            } => Some(crate::control::ExtensionControlSender {
+            }
+            | ExtensionWrapper::Shared {
+                node_id,
+                control_sender,
+                ..
+            } => crate::control::ExtensionControlSender {
                 node_id: node_id.clone(),
                 sender: crate::message::Sender::Shared(control_sender.clone()),
-            }),
-            ExtensionWrapper::PassiveShared { .. } => None,
+            },
         }
     }
 
     /// Starts the extension and begins its operation.
-    ///
-    /// Only valid for Active extensions. Passive extensions do not have a
-    /// background task.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called on a Passive extension.
     pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
         match self {
-            ExtensionWrapper::ActiveShared {
+            ExtensionWrapper::Local {
                 node_id,
                 extension,
                 control_receiver,
@@ -607,10 +496,17 @@ impl ExtensionWrapper {
                 let ctrl_chan = ControlChannel::new(control_receiver);
                 extension.start(ctrl_chan, effect_handler).await
             }
-            ExtensionWrapper::PassiveShared { .. } => {
-                panic!(
-                    "start() called on a Passive extension — Passive extensions have no background task"
-                )
+            ExtensionWrapper::Shared {
+                node_id,
+                extension,
+                control_receiver,
+                ..
+            } => {
+                let effect_handler = EffectHandler::new(node_id, metrics_reporter);
+                let control_receiver =
+                    control_receiver.expect("control_receiver missing from ExtensionWrapper");
+                let ctrl_chan = ControlChannel::new(control_receiver);
+                extension.start(ctrl_chan, effect_handler).await
             }
         }
     }
@@ -642,7 +538,6 @@ impl crate::TelemetryWrapped for ExtensionWrapper {
 mod tests {
     use super::*;
     use crate::control::ExtensionControlMsg;
-    use crate::extension::registry::RegistrationSource;
     use crate::shared::extension::Extension;
     use crate::testing::{CtrlMsgCounters, test_node};
     use async_trait::async_trait;
@@ -684,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extension_wrapper_creation() {
+    fn test_shared_wrapper_creation() {
         let counter = CtrlMsgCounters::new();
         let extension = TestExtension::new(counter);
         let node_id = test_node("test_extension");
@@ -694,154 +589,12 @@ mod tests {
         ));
         let config = ExtensionConfig::new("test_extension");
 
-        let _wrapper = ExtensionWrapper::active().shared_cloned(
-            Vec::new(),
+        let _wrapper = ExtensionWrapper::shared(
             extension,
+            |_| Vec::new(),
             node_id,
             user_config,
             &config,
         );
-    }
-
-    #[test]
-    fn test_extension_wrapper_shared_then_local() {
-        let counter = CtrlMsgCounters::new();
-        let extension = TestExtension::new(counter);
-        let node_id = test_node("test_extension_dual");
-        let user_config = Arc::new(NodeUserConfig::with_user_config(
-            "urn:otap:extension:test".into(),
-            Value::Null,
-        ));
-        let config = ExtensionConfig::new("test_extension_dual");
-
-        let wrapper = ExtensionWrapper::active()
-            .cloned()
-            .shared(Vec::new(), extension, node_id, user_config, &config)
-            .local(Vec::new());
-
-        assert!(wrapper.is_active());
-    }
-
-    #[test]
-    fn test_passive_wrapper_shared_then_local() {
-        let node_id = test_node("test_passive_extension_dual");
-        let user_config = Arc::new(NodeUserConfig::with_user_config(
-            "urn:otap:extension:test".into(),
-            Value::Null,
-        ));
-
-        let wrapper = ExtensionWrapper::passive()
-            .cloned()
-            .shared(Vec::new(), node_id, user_config)
-            .local(Vec::new());
-
-        assert!(!wrapper.is_active());
-    }
-
-    fn shared_instance_registration_for_tests() -> registry::shared::CapabilityRegistration {
-        registry::shared::CapabilityRegistration::new_with_source(
-            std::any::TypeId::of::<Box<dyn std::fmt::Debug + Send>>(),
-            1usize,
-            |any| {
-                let value = any.downcast_ref::<usize>().unwrap();
-                Box::new(Box::new(*value) as Box<dyn std::fmt::Debug + Send>)
-            },
-            "test_capability",
-            RegistrationSource::Instance,
-        )
-    }
-
-    fn local_instance_registration_for_tests() -> registry::local::CapabilityRegistration {
-        registry::local::CapabilityRegistration::new_with_source(
-            std::any::TypeId::of::<Box<dyn std::fmt::Debug>>(),
-            1usize,
-            |any| {
-                let value = any.downcast_ref::<usize>().unwrap();
-                Box::new(Box::new(*value) as Box<dyn std::fmt::Debug>)
-            },
-            "test_capability",
-            RegistrationSource::Instance,
-        )
-    }
-
-    #[test]
-    fn test_active_normalizes_shared_registration_mode_to_cloned() {
-        let counter = CtrlMsgCounters::new();
-        let extension = TestExtension::new(counter);
-        let node_id = test_node("test_active_instance_shared_rejected");
-        let user_config = Arc::new(NodeUserConfig::with_user_config(
-            "urn:otap:extension:test".into(),
-            Value::Null,
-        ));
-        let config = ExtensionConfig::new("test_active_instance_shared_rejected");
-
-        let wrapper = ExtensionWrapper::active().cloned().shared(
-            vec![shared_instance_registration_for_tests()],
-            extension,
-            node_id,
-            user_config,
-            &config,
-        );
-
-        match wrapper {
-            ExtensionWrapper::ActiveShared {
-                shared_capabilities,
-                ..
-            } => {
-                assert!(shared_capabilities
-                    .iter()
-                    .all(|reg| reg.source == RegistrationSource::Cloned));
-            }
-            ExtensionWrapper::PassiveShared { .. } => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn test_active_normalizes_local_registration_mode_to_cloned() {
-        let counter = CtrlMsgCounters::new();
-        let extension = TestExtension::new(counter);
-        let node_id = test_node("test_active_instance_local_rejected");
-        let user_config = Arc::new(NodeUserConfig::with_user_config(
-            "urn:otap:extension:test".into(),
-            Value::Null,
-        ));
-        let config = ExtensionConfig::new("test_active_instance_local_rejected");
-
-        let wrapper = ExtensionWrapper::active()
-            .cloned()
-            .shared(Vec::new(), extension, node_id, user_config, &config)
-            .local(vec![local_instance_registration_for_tests()]);
-
-        match wrapper {
-            ExtensionWrapper::ActiveShared {
-                local_capabilities,
-                ..
-            } => {
-                assert!(local_capabilities
-                    .iter()
-                    .all(|reg| reg.source == RegistrationSource::Cloned));
-            }
-            ExtensionWrapper::PassiveShared { .. } => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn test_passive_accepts_instance_registration_modes() {
-        let node_id = test_node("test_passive_instance_allowed");
-        let user_config = Arc::new(NodeUserConfig::with_user_config(
-            "urn:otap:extension:test".into(),
-            Value::Null,
-        ));
-
-        let wrapper = ExtensionWrapper::passive()
-            .instance()
-            .shared(
-                vec![shared_instance_registration_for_tests()],
-                node_id,
-                user_config,
-            )
-            .local(vec![local_instance_registration_for_tests()]);
-
-        assert!(!wrapper.is_active());
     }
 }

@@ -32,7 +32,7 @@
 //!
 //! ```ignore
 //! let auth = capabilities.require::<
-//!     otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
+//!     BearerTokenProvider
 //! >()?;
 //! let mut token_rx = auth.subscribe_token_refresh();
 //! ```
@@ -43,9 +43,11 @@ use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::ExtensionWrapper;
-use otap_df_engine::extension::bearer_token_provider::shared::BearerTokenProvider;
 use otap_df_engine::node::NodeId;
+use otap_df_engine::local_extension_capabilities;
+use std::rc::Rc;
 use std::sync::Arc;
+use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
 
 use otap_df_otap::OTAP_EXTENSION_FACTORIES;
 
@@ -69,11 +71,11 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     name: AZURE_IDENTITY_AUTH_EXTENSION_URN,
     description: "Azure Identity authentication via managed identity or developer tools",
     documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
-    // NOTE: The trait list here duplicates the one in `extension_capabilities!`
+    // NOTE: The trait list here duplicates the one in `shared_extension_capabilities!`
     // below. A declarative macro could unify both, but isn't worth the rigidity
     // until there are multiple extensions following the same pattern.
     capabilities: otap_df_engine::extension_capability_names!(
-        otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
+        BearerTokenProvider
     ),
     create: |_: PipelineContext,
              node: NodeId,
@@ -100,11 +102,9 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
                 }
             })?;
 
-        Ok(ExtensionWrapper::active().cloned().shared(
-            otap_df_engine::extension_capabilities!(
-                extension => otap_df_engine::extension::bearer_token_provider::BearerTokenProvider
-            ),
-            extension,
+        Ok(ExtensionWrapper::local(
+            Rc::new(extension),
+            local_extension_capabilities!(AzureIdentityAuthExtension => BearerTokenProvider),
             node,
             node_config,
             extension_config,

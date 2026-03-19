@@ -651,7 +651,7 @@ mod tests {
     }
 
     fn create_mock_auth() -> HandleBearerTokenProvider {
-        HandleBearerTokenProvider::Local(Box::new(MockTokenProvider::new()))
+        HandleBearerTokenProvider::Local(Rc::new(MockTokenProvider::new()))
     }
 
     fn create_test_pipeline_ctx() -> PipelineContext {

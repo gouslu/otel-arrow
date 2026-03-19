@@ -8,7 +8,7 @@
 //! deep-copies each stored extension (which is cheap when the extension itself
 //! wraps shared state in `Arc`).
 //!
-//! Extensions that publish traits use the [`extension_capabilities!`] macro,
+//! Extensions that publish traits use the [`shared_extension_capabilities!`] macro,
 //!
 //! # Extension writer contract
 //!
@@ -34,6 +34,7 @@
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use linkme::distributed_slice;
 
@@ -117,47 +118,13 @@ pub trait ExtensionCapability: private::Sealed {
 /// Thread-safe error type compatible with any `thiserror`-derived error.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// Source mode used to build a capability registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrationSource {
-    /// Registration was produced from a borrowed instance (`cloned(...)` mode).
-    Cloned,
-    /// Registration was produced from an owned instance (`instance(...)` mode).
-    Instance,
-}
-
-// ── CloneAny helper trait (!Send local storage) ─────────────────────────────
-
-/// Internal trait for type-erased, cloneable, local (!Send) storage.
-pub(crate) trait CloneAny {
-    /// Deep-clone into a new boxed trait object.
-    fn clone_box(&self) -> Box<dyn CloneAny>;
-    /// Access the concrete value as `&dyn Any` for downcasting.
-    fn as_any_ref(&self) -> &dyn Any;
-}
-
-impl<T: Clone + 'static> CloneAny for T {
-    fn clone_box(&self) -> Box<dyn CloneAny> {
-        Box::new(self.clone())
-    }
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl Clone for Box<dyn CloneAny> {
-    fn clone(&self) -> Self {
-        (**self).clone_box()
-    }
-}
-
 // ── CloneAnySend helper trait ────────────────────────────────────────────────
 
-/// Internal trait for type-erased, cloneable, `Send` storage.
+/// Trait for type-erased, cloneable, `Send` storage.
 ///
 /// Each concrete `T: Clone + Send + 'static` gets a blanket implementation.
 /// `Box<dyn CloneAnySend>` implements `Clone` via `clone_box()`.
-pub(crate) trait CloneAnySend: Send {
+pub trait CloneAnySend: Send {
     /// Deep-clone into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn CloneAnySend>;
     /// Access the concrete value as `&dyn Any` for downcasting.
@@ -175,100 +142,51 @@ impl<T: Clone + Send + 'static> CloneAnySend for T {
 
 impl Clone for Box<dyn CloneAnySend> {
     fn clone(&self) -> Self {
-        // Explicit double-deref so method resolution dispatches through the
-        // vtable of `dyn CloneAnySend` (→ concrete type), NOT through the
-        // blanket `CloneAnySend for Box<dyn CloneAnySend>` which would recurse.
         (**self).clone_box()
     }
 }
 
-// ── local::RegistryEntry / local::CapabilityRegistration ─────────────────────
+// ── local module ─────────────────────────────────────────────────────────────
 
 /// Local (!Send) capability registry types.
 ///
-/// Used for pipeline-scoped extension implementations that may use `Rc`/`RefCell`
-/// and run on a single-threaded local runtime.
+/// Entries store `Rc<dyn Any>` — all consumers share the same allocation via
+/// `Rc::clone`. True single-instance.
 pub mod local {
-    pub(crate) use super::CloneAny;
-    use super::{Any, TypeId};
+    use std::any::{Any, TypeId};
+    use std::rc::Rc;
 
-    /// A single local registry entry storing a clone-erased value and trait coercion function.
+    /// A single local registry entry: Rc-backed, single instance.
     #[derive(Clone)]
     pub struct RegistryEntry {
-        pub(crate) value: Box<dyn CloneAny>,
-        pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any>,
+        pub(crate) value: Rc<dyn Any>,
+        pub(crate) coerce: fn(Rc<dyn Any>) -> Box<dyn Any>,
         pub(crate) capability_name: &'static str,
     }
 
-    /// A self-contained registration for one local (!Send) capability trait implementation.
+    /// A registration for one local capability trait implementation.
     pub struct CapabilityRegistration {
         pub(crate) trait_id: TypeId,
-        pub(crate) value: Box<dyn CloneAny>,
-        pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any>,
+        pub(crate) value: Rc<dyn Any>,
+        pub(crate) coerce: fn(Rc<dyn Any>) -> Box<dyn Any>,
         pub(crate) capability_name: &'static str,
-        pub(crate) source: super::RegistrationSource,
-    }
-
-    impl CapabilityRegistration {
-        #[doc(hidden)]
-        pub fn new(
-            trait_id: TypeId,
-            value: impl Clone + 'static,
-            coerce: fn(&dyn Any) -> Box<dyn Any>,
-            capability_name: &'static str,
-        ) -> Self {
-            Self::new_with_source(
-                trait_id,
-                value,
-                coerce,
-                capability_name,
-                super::RegistrationSource::Cloned,
-            )
-        }
-
-        #[doc(hidden)]
-        pub fn new_with_source(
-            trait_id: TypeId,
-            value: impl Clone + 'static,
-            coerce: fn(&dyn Any) -> Box<dyn Any>,
-            capability_name: &'static str,
-            source: super::RegistrationSource,
-        ) -> Self {
-            Self {
-                trait_id,
-                value: Box::new(value),
-                coerce,
-                capability_name,
-                source,
-            }
-        }
     }
 }
 
-// ── shared::RegistryEntry / shared::CapabilityRegistration ───────────────────
+// ── shared module ────────────────────────────────────────────────────────────
 
 /// Shared (Send) capability registry types.
 ///
-/// Used for shared extension implementations that are safe to access from
-/// multi-threaded runtime contexts.
+/// Entries store `Box<dyn CloneAnySend>` — each consumer gets a clone (cheap
+/// when the extension wraps shared state in `Arc`).
 pub mod shared {
     pub(crate) use super::CloneAnySend;
-    use super::{Any, TypeId};
+    use std::any::{Any, TypeId};
 
-    /// A single entry in the registry: a cloneable concrete value plus a coerce
-    /// function that knows how to produce `Box<dyn Any + Send>` (containing a
-    /// `Box<dyn Trait>`) from a `&dyn Any` reference pointing at the concrete type.
-    ///
-    /// The `coerce` function pointer is monomorphised at registration time (inside
-    /// the [`extension_capabilities!`] macro) and is `Copy`, so the entry is
-    /// cheaply cloneable.
+    /// A single shared registry entry: clone-based.
     pub struct RegistryEntry {
-        /// The concrete extension value, type-erased but cloneable.
         pub(crate) value: Box<dyn CloneAnySend>,
-        /// Clones the concrete value out of `&dyn Any` and wraps it as
-        /// `Box<Box<dyn Trait>>` erased to `Box<dyn Any + Send>`.
         pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
-        /// Human-readable capability name (from `ExtensionCapability::NAME`).
         pub(crate) capability_name: &'static str,
     }
 
@@ -282,69 +200,12 @@ pub mod shared {
         }
     }
 
-    /// A self-contained registration for one trait that an extension implements.
-    ///
-    /// Produced by the [`extension_capabilities!`] macro. Each registration carries:
-    /// - A cloned copy of the concrete extension value (type-erased)
-    /// - A monomorphised `coerce` function pointer for producing `Box<dyn Trait>`
-    /// - The `TypeId` of `Box<dyn Trait>` for registry lookup
-    ///
-    /// Extension factories produce these and pass them to
-    /// [`ExtensionWrapper::active_shared`](crate::extension::ExtensionWrapper::active_shared) or
-    /// [`ExtensionWrapper::passive`](crate::extension::ExtensionWrapper::passive);
-    /// the engine drains them during pipeline build.
+    /// A registration for one shared capability trait implementation.
     pub struct CapabilityRegistration {
-        /// `TypeId` of `Box<dyn Trait>` — used as registry lookup key.
         pub(crate) trait_id: TypeId,
-        /// The concrete extension value, type-erased but cloneable.
         pub(crate) value: Box<dyn CloneAnySend>,
-        /// Monomorphised fn: given `&dyn Any` pointing at the concrete extension
-        /// type, clone it, wrap in `Box<dyn Trait>`, and return as
-        /// `Box<dyn Any + Send>`.
         pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
-        /// Human-readable capability name (from `ExtensionCapability::NAME`).
         pub(crate) capability_name: &'static str,
-        /// Registration source mode used by the declaring macro.
-        pub(crate) source: super::RegistrationSource,
-    }
-
-    impl CapabilityRegistration {
-        /// Creates a new trait registration.
-        ///
-        /// This is intended for use by the [`extension_capabilities!`] macro — not for
-        /// direct use by extension writers.
-        #[doc(hidden)]
-        pub fn new(
-            trait_id: TypeId,
-            value: impl Clone + Send + 'static,
-            coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
-            capability_name: &'static str,
-        ) -> Self {
-            Self::new_with_source(
-                trait_id,
-                value,
-                coerce,
-                capability_name,
-                super::RegistrationSource::Cloned,
-            )
-        }
-
-        #[doc(hidden)]
-        pub fn new_with_source(
-            trait_id: TypeId,
-            value: impl Clone + Send + 'static,
-            coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
-            capability_name: &'static str,
-            source: super::RegistrationSource,
-        ) -> Self {
-            Self {
-                trait_id,
-                value: Box::new(value),
-                coerce,
-                capability_name,
-                source,
-            }
-        }
     }
 }
 
@@ -416,8 +277,9 @@ impl CapabilityRegistry {
 
     /// Insert pre-built trait registrations for an extension.
     ///
-    /// Each [`CapabilityRegistration`] carries a cloned value and coerce function.
-    /// This method inserts them into the registry keyed by `(name, trait_id)`.
+    /// Each [`CapabilityRegistration`] carries either a cloned value + coerce function
+    /// or a factory function. This method inserts them into the registry keyed by
+    /// `(name, trait_id)`.
     ///
     /// Called by the engine during pipeline build — not intended for direct use
     /// by extension writers.
@@ -449,44 +311,21 @@ impl CapabilityRegistry {
                 coerce: reg.coerce,
                 capability_name: reg.capability_name,
             };
-            let _ = self.local_handles.insert((name.to_string(), reg.trait_id), entry);
+            let _ = self
+                .local_handles
+                .insert((name.to_string(), reg.trait_id), entry);
         }
     }
 
-    /// Get an owned clone of a trait implementation by extension name.
-    ///
-    /// Returns `Some(Box<dyn Trait>)` if found, `None` if no extension with
-    /// that name exists or if it doesn't expose the requested trait.
-    ///
-    /// The returned value is a fresh clone produced from the stored extension
-    /// value. The clone shares any `Arc`-wrapped state with the original and
-    /// with other clones.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The trait type (e.g., `dyn shared::BearerTokenProvider`).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let provider: Box<dyn shared::BearerTokenProvider> = registry
-    ///     .get::<dyn shared::BearerTokenProvider>("azure_auth")
-    ///     .expect("auth extension required");
-    /// provider.get_token().await?;
-    /// ```
+    /// Get a shared trait implementation by extension name.
     pub fn get<T: ?Sized + 'static>(&self, name: &str) -> Option<Box<T>> {
         let key = (name.to_string(), TypeId::of::<Box<T>>());
         let entry = self.shared_handles.get(&key)?;
-
-        // Coerce produces Box<dyn Any + Send> that is actually Box<Box<dyn Trait>>.
-        // Explicit deref (*entry.value) ensures we dispatch through the vtable
-        // of `dyn CloneAnySend` to reach the concrete type, not the blanket
-        // impl on `Box<dyn CloneAnySend>` itself.
-        let erased = (entry.coerce)((*entry.value).as_any_ref());
+        // Deref chain: &Box<dyn CloneAnySend> → &dyn CloneAnySend → concrete type.
+        let erased = (entry.coerce)(entry.value.as_ref().as_any_ref());
         let double_boxed = erased
             .downcast::<Box<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
-
         Some(*double_boxed)
     }
 
@@ -747,14 +586,14 @@ macro_rules! register_capability_handle {
 
 /// Registers the local/shared trait mappings for a capability handle.
 ///
-/// This enables handle-only capability registration calls such as:
-/// `extension_capabilities!(instance => MyHandle)` and
-/// `extension_local_capabilities!(instance => MyHandle)`.
+/// Generates two associated functions:
+/// - `shared_capabilities(&T)` — shared registrations (clone-based)
+/// - `local_capabilities(&Rc<T>)` — local registrations (Rc-based)
 #[macro_export]
 macro_rules! register_capability_handle_traits {
     ($handle:ty, $local_trait:path, $shared_trait:path $(,)?) => {
         impl $handle {
-            /// Build shared capability registrations for this handle from a cloned source.
+            /// Build shared capability registrations for this handle.
             pub fn shared_capabilities<T>(instance: &T) -> Vec<$crate::extension::registry::shared::CapabilityRegistration>
             where
                 T: Clone + Send + 'static + $shared_trait,
@@ -772,41 +611,41 @@ macro_rules! register_capability_handle_traits {
                         Box::new(boxed) as Box<dyn std::any::Any + Send>
                     }
 
-                    $crate::extension::registry::shared::CapabilityRegistration::new(
-                        std::any::TypeId::of::<Box<dyn $shared_trait>>(),
-                        val.clone(),
-                        coerce::<TInner>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                    )
+                    $crate::extension::registry::shared::CapabilityRegistration {
+                        trait_id: std::any::TypeId::of::<Box<dyn $shared_trait>>(),
+                        value: Box::new(val.clone()),
+                        coerce: coerce::<TInner>,
+                        capability_name: <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
+                    }
                 }
 
                 vec![make_registration(instance)]
             }
 
-            /// Build local capability registrations for this handle from a cloned source.
-            pub fn local_capabilities<T>(instance: &T) -> Vec<$crate::extension::registry::local::CapabilityRegistration>
+            /// Build local capability registrations (Rc-based) for this handle.
+            pub fn local_capabilities<T>(instance: &std::rc::Rc<T>) -> Vec<$crate::extension::registry::local::CapabilityRegistration>
             where
-                T: Clone + 'static + $local_trait,
+                T: 'static + $local_trait,
             {
-                fn make_registration<TInner: Clone + 'static + $local_trait>(
-                    val: &TInner,
+                fn make_registration<TInner: 'static + $local_trait>(
+                    rc: &std::rc::Rc<TInner>,
                 ) -> $crate::extension::registry::local::CapabilityRegistration {
-                    fn coerce<TInner: Clone + 'static + $local_trait>(
-                        any: &dyn std::any::Any,
+                    fn coerce<TInner: 'static + $local_trait>(
+                        rc_any: std::rc::Rc<dyn std::any::Any>,
                     ) -> Box<dyn std::any::Any> {
-                        let concrete = any
-                            .downcast_ref::<TInner>()
+                        let concrete: std::rc::Rc<TInner> = rc_any
+                            .downcast::<TInner>()
                             .expect("registry entry type mismatch — this is a bug");
-                        let boxed: Box<dyn $local_trait> = Box::new(concrete.clone());
-                        Box::new(boxed) as Box<dyn std::any::Any>
+                        let trait_obj: std::rc::Rc<dyn $local_trait> = concrete;
+                        Box::new(trait_obj) as Box<dyn std::any::Any>
                     }
 
-                    $crate::extension::registry::local::CapabilityRegistration::new(
-                        std::any::TypeId::of::<Box<dyn $local_trait>>(),
-                        val.clone(),
-                        coerce::<TInner>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                    )
+                    $crate::extension::registry::local::CapabilityRegistration {
+                        trait_id: std::any::TypeId::of::<std::rc::Rc<dyn $local_trait>>(),
+                        value: std::rc::Rc::clone(rc) as std::rc::Rc<dyn std::any::Any>,
+                        coerce: coerce::<TInner>,
+                        capability_name: <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
+                    }
                 }
 
                 vec![make_registration(instance)]
@@ -815,195 +654,50 @@ macro_rules! register_capability_handle_traits {
     };
 }
 
-/// Declares which trait objects an extension instance can expose for a specific
-/// capability handle type.
+/// Produces a closure that generates shared capability registrations.
 ///
-/// Returns `Vec<shared::CapabilityRegistration>` — self-contained registrations each
-/// carrying a cloned copy of the extension and a monomorphised coerce function.
-///
-/// Capability identity is sourced from the handle type, not from individual
-/// trait object types. This makes handle registration the single public gate
-/// for capability exposure.
-///
-/// # Usage
+/// Takes the concrete extension type and one or more capability handles.
+/// Returns a closure suitable for `ExtensionWrapper::shared(ext, capabilities, ...)`.
 ///
 /// ```ignore
-/// let ext = MyExtension::new(config)?;
-/// let caps = extension_capabilities!(
-///     ext => crate::extension::bearer_token_provider::BearerTokenProvider;
-///     shared::BearerTokenProvider
-/// );
-/// ```
-///
-/// # Registration source modes
-///
-/// By default, this macro uses `cloned(...)` behavior:
-///
-/// ```ignore
-/// let regs = extension_capabilities!(my_ext => MyHandle; shared::MyTrait);
-/// // equivalent to:
-/// let regs = extension_capabilities!(cloned(my_ext) => MyHandle; shared::MyTrait);
-/// ```
-///
-/// You can also use `instance(...)` when you want to move an owned instance
-/// into registration construction:
-///
-/// ```ignore
-/// let regs = extension_capabilities!(instance(my_ext) => MyHandle; shared::MyTrait);
+/// ExtensionWrapper::shared(
+///     extension,
+///     shared_extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
+///     node, node_config, extension_config,
+/// )
 /// ```
 #[macro_export]
-macro_rules! extension_capabilities {
-    ($instance:expr => $handle:path $(,)?) => {{
-        <$handle>::shared_capabilities(&$instance)
-    }};
-    (instance($instance:expr) => $handle:path; $($trait:path),+ $(,)?) => {{
-        let instance = $instance;
-        let mut registrations = Vec::<$crate::extension::registry::shared::CapabilityRegistration>::new();
-        $(
-            {
-                fn make_registration<T: Clone + Send + 'static + $trait>(
-                    val: &T,
-                ) -> $crate::extension::registry::shared::CapabilityRegistration {
-                    fn coerce<T: Clone + Send + 'static + $trait>(
-                        any: &dyn std::any::Any,
-                    ) -> Box<dyn std::any::Any + Send> {
-                        let concrete = any
-                            .downcast_ref::<T>()
-                            .expect("registry entry type mismatch — this is a bug");
-                        let boxed: Box<dyn $trait> = Box::new(concrete.clone());
-                        Box::new(boxed) as Box<dyn std::any::Any + Send>
-                    }
-
-                    $crate::extension::registry::shared::CapabilityRegistration::new_with_source(
-                        std::any::TypeId::of::<Box<dyn $trait>>(),
-                        val.clone(),
-                        coerce::<T>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                        $crate::extension::registry::RegistrationSource::Instance,
-                    )
-                }
-
-                registrations.push(make_registration(&instance));
-            }
-        )+
-        registrations
-    }};
-    (cloned($instance:expr) => $handle:path; $($trait:path),+ $(,)?) => {{
-        // Bind once — avoids multiple evaluations if $instance is an expression.
-        let instance = &$instance;
-        let mut registrations = Vec::<$crate::extension::registry::shared::CapabilityRegistration>::new();
-        $(
-            {
-                // Single generic helper — T is inferred from `instance`.
-                fn make_registration<T: Clone + Send + 'static + $trait>(
-                    val: &T,
-                ) -> $crate::extension::registry::shared::CapabilityRegistration {
-                    fn coerce<T: Clone + Send + 'static + $trait>(
-                        any: &dyn std::any::Any,
-                    ) -> Box<dyn std::any::Any + Send> {
-                        let concrete = any
-                            .downcast_ref::<T>()
-                            .expect("registry entry type mismatch — this is a bug");
-                        let boxed: Box<dyn $trait> = Box::new(concrete.clone());
-                        Box::new(boxed) as Box<dyn std::any::Any + Send>
-                    }
-
-                    $crate::extension::registry::shared::CapabilityRegistration::new_with_source(
-                        std::any::TypeId::of::<Box<dyn $trait>>(),
-                        val.clone(),
-                        coerce::<T>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                        $crate::extension::registry::RegistrationSource::Cloned,
-                    )
-                }
-
-                registrations.push(make_registration(instance));
-            }
-        )+
-        registrations
-    }};
-    ($instance:expr => $handle:path; $($trait:path),+ $(,)?) => {{
-        $crate::extension_capabilities!(cloned($instance) => $handle; $($trait),+)
-    }};
+macro_rules! shared_extension_capabilities {
+    ($type:ty => $($handle:path),+ $(,)?) => {
+        |ext: &$type| {
+            let mut caps = Vec::new();
+            $(caps.extend(<$handle>::shared_capabilities(ext));)+
+            caps
+        }
+    };
 }
 
-/// Declares which trait objects an extension instance can expose as local (!Send)
-/// variants for a specific capability handle type.
+/// Produces a closure that generates local capability registrations.
 ///
-/// Returns `Vec<local::CapabilityRegistration>`.
+/// Takes the concrete extension type and one or more capability handles.
+/// Returns a closure suitable for `ExtensionWrapper::local(rc, capabilities, ...)`.
+///
+/// ```ignore
+/// ExtensionWrapper::local(
+///     Rc::new(extension),
+///     local_extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck),
+///     node, node_config, extension_config,
+/// )
+/// ```
 #[macro_export]
-macro_rules! extension_local_capabilities {
-    ($instance:expr => $handle:path $(,)?) => {{
-        <$handle>::local_capabilities(&$instance)
-    }};
-    (instance($instance:expr) => $handle:path; $($trait:path),+ $(,)?) => {{
-        let instance = $instance;
-        let mut registrations = Vec::<$crate::extension::registry::local::CapabilityRegistration>::new();
-        $(
-            {
-                fn make_registration<T: Clone + 'static + $trait>(
-                    val: &T,
-                ) -> $crate::extension::registry::local::CapabilityRegistration {
-                    fn coerce<T: Clone + 'static + $trait>(
-                        any: &dyn std::any::Any,
-                    ) -> Box<dyn std::any::Any> {
-                        let concrete = any
-                            .downcast_ref::<T>()
-                            .expect("registry entry type mismatch — this is a bug");
-                        let boxed: Box<dyn $trait> = Box::new(concrete.clone());
-                        Box::new(boxed) as Box<dyn std::any::Any>
-                    }
-
-                    $crate::extension::registry::local::CapabilityRegistration::new_with_source(
-                        std::any::TypeId::of::<Box<dyn $trait>>(),
-                        val.clone(),
-                        coerce::<T>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                        $crate::extension::registry::RegistrationSource::Instance,
-                    )
-                }
-
-                registrations.push(make_registration(&instance));
-            }
-        )+
-        registrations
-    }};
-    (cloned($instance:expr) => $handle:path; $($trait:path),+ $(,)?) => {{
-        // Bind once — avoids multiple evaluations if $instance is an expression.
-        let instance = &$instance;
-        let mut registrations = Vec::<$crate::extension::registry::local::CapabilityRegistration>::new();
-        $(
-            {
-                fn make_registration<T: Clone + 'static + $trait>(
-                    val: &T,
-                ) -> $crate::extension::registry::local::CapabilityRegistration {
-                    fn coerce<T: Clone + 'static + $trait>(
-                        any: &dyn std::any::Any,
-                    ) -> Box<dyn std::any::Any> {
-                        let concrete = any
-                            .downcast_ref::<T>()
-                            .expect("registry entry type mismatch — this is a bug");
-                        let boxed: Box<dyn $trait> = Box::new(concrete.clone());
-                        Box::new(boxed) as Box<dyn std::any::Any>
-                    }
-
-                    $crate::extension::registry::local::CapabilityRegistration::new_with_source(
-                        std::any::TypeId::of::<Box<dyn $trait>>(),
-                        val.clone(),
-                        coerce::<T>,
-                        <$handle as $crate::extension::registry::ExtensionCapability>::NAME,
-                        $crate::extension::registry::RegistrationSource::Cloned,
-                    )
-                }
-
-                registrations.push(make_registration(instance));
-            }
-        )+
-        registrations
-    }};
-    ($instance:expr => $handle:path; $($trait:path),+ $(,)?) => {{
-        $crate::extension_local_capabilities!(cloned($instance) => $handle; $($trait),+)
-    }};
+macro_rules! local_extension_capabilities {
+    ($type:ty => $($handle:path),+ $(,)?) => {
+        |rc: &std::rc::Rc<$type>| {
+            let mut caps = Vec::new();
+            $(caps.extend(<$handle>::local_capabilities(rc));)+
+            caps
+        }
+    };
 }
 
 /// Produces a `&'static [&'static str]` of capability names from trait types.
@@ -1011,7 +705,7 @@ macro_rules! extension_local_capabilities {
 /// Use this in [`ExtensionFactory`](crate::ExtensionFactory) definitions so
 /// the `capabilities` field is derived from the same sealed
 /// [`ExtensionCapability::NAME`] constants — no hand-written strings that
-/// could drift from what [`extension_capabilities!`](crate::extension_capabilities)
+/// could drift from what [`shared_extension_capabilities!`](crate::shared_extension_capabilities)
 /// actually registers at runtime.
 ///
 /// # Usage
@@ -1041,17 +735,8 @@ macro_rules! extension_capability_names {
 /// Implement this on handle enums (e.g., `BearerTokenProvider`) so the
 /// registry can construct the right variant based on consumer context.
 ///
-/// # Example
-///
-/// ```ignore
-/// impl CapabilityHandle for BearerTokenProvider {
-///     type Local = dyn local::BearerTokenProvider;
-///     type Shared = dyn shared::BearerTokenProvider;
-///
-///     fn from_local(local: Box<Self::Local>) -> Self { Self::Local(local) }
-///     fn from_shared(shared: Box<Self::Shared>) -> Self { Self::Shared(shared) }
-/// }
-/// ```
+/// Local variants use `Rc<dyn Trait>` for true single-instance sharing.
+/// Shared variants use `Box<dyn Trait>` with clone-based distribution.
 pub trait CapabilityHandle: private::HandleSealed + Sized {
     /// Stable capability name used in node config bindings.
     const CAPABILITY_NAME: &'static str;
@@ -1061,9 +746,9 @@ pub trait CapabilityHandle: private::HandleSealed + Sized {
     /// The Send trait type for shared consumers.
     type Shared: ?Sized + 'static;
 
-    /// Construct the handle wrapping a local variant.
-    fn from_local(local: Box<Self::Local>) -> Self;
-    /// Construct the handle wrapping a shared variant.
+    /// Construct the handle wrapping a local variant (`Rc`-based).
+    fn from_local(local: Rc<Self::Local>) -> Self;
+    /// Construct the handle wrapping a shared variant (`Box`-based).
     fn from_shared(shared: Box<Self::Shared>) -> Self;
 }
 
@@ -1238,22 +923,22 @@ impl Capabilities {
         resolved
     }
 
-    /// Internal local typed lookup — clones via the stored coerce function.
-    fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
-        let key = TypeId::of::<Box<T>>();
+    /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
+    fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Rc<T>> {
+        let key = TypeId::of::<Rc<T>>();
         let entry = self.local_resolved.get(&key)?;
-        let erased = (entry.coerce)((*entry.value).as_any_ref());
-        let double_boxed = erased
-            .downcast::<Box<T>>()
+        let erased = (entry.coerce)(Rc::clone(&entry.value));
+        let inner = erased
+            .downcast::<Rc<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
-        Some(*double_boxed)
+        Some(*inner)
     }
 
-    /// Internal shared typed lookup — clones via the stored coerce function.
+    /// Internal shared typed lookup — returns `Box<dyn Trait>`.
     fn get_shared_raw<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         let key = TypeId::of::<Box<T>>();
         let entry = self.shared_resolved.get(&key)?;
-        let erased = (entry.coerce)((*entry.value).as_any_ref());
+        let erased = (entry.coerce)(entry.value.as_ref().as_any_ref());
         let double_boxed = erased
             .downcast::<Box<T>>()
             .expect("TypeId matched but downcast failed — this is a bug");
@@ -1344,16 +1029,15 @@ mod tests {
         }
     }
 
-    /// Helper: register a TestTokenProvider with the given name.
+    /// Helper: register a shared TestTokenProvider with the given name.
     fn register_provider(registry: &mut CapabilityRegistry, name: &str, token: &str) {
         let instance = TestTokenProvider {
             token: token.to_string(),
         };
-        let regs = crate::extension_capabilities!(
-            instance => BearerTokenProviderHandle;
-            SharedBearerTokenProvider
+        let make_caps = crate::shared_extension_capabilities!(
+            TestTokenProvider => BearerTokenProviderHandle
         );
-        registry.register_all_shared(name, regs);
+        registry.register_all_shared(name, make_caps(&instance));
     }
 
     fn register_dual_provider(
@@ -1367,91 +1051,65 @@ mod tests {
             shared_token: shared_token.to_string(),
         };
 
-        let shared_regs = crate::extension_capabilities!(
-            instance => BearerTokenProviderHandle;
-            SharedBearerTokenProvider
+        let make_shared = crate::shared_extension_capabilities!(
+            DualTokenProvider => BearerTokenProviderHandle
         );
-        let local_regs = crate::extension_local_capabilities!(
-            instance => BearerTokenProviderHandle;
-            LocalBearerTokenProvider
-        );
+        registry.register_all_shared(name, make_shared(&instance));
 
-        registry.register_all_shared(name, shared_regs);
-        registry.register_all_local(name, local_regs);
+        let rc = Rc::new(DualTokenProvider {
+            local_token: local_token.to_string(),
+            shared_token: shared_token.to_string(),
+        });
+        let make_local = crate::local_extension_capabilities!(
+            DualTokenProvider => BearerTokenProviderHandle
+        );
+        registry.register_all_local(name, make_local(&rc));
     }
 
     fn register_local_only_provider(registry: &mut CapabilityRegistry, name: &str, token: &str) {
-        let instance = LocalOnlyTokenProvider {
+        let rc = Rc::new(LocalOnlyTokenProvider {
             token: token.to_string(),
-        };
-        let local_regs = crate::extension_local_capabilities!(
-            instance => BearerTokenProviderHandle;
-            LocalBearerTokenProvider
+        });
+        let make_caps = crate::local_extension_capabilities!(
+            LocalOnlyTokenProvider => BearerTokenProviderHandle
         );
-        registry.register_all_local(name, local_regs);
+        registry.register_all_local(name, make_caps(&rc));
     }
 
     #[test]
-    fn test_extension_capabilities_source_modes_shared() {
+    fn test_shared_registration_and_get() {
         let mut registry = CapabilityRegistry::new();
 
-        let cloned_src = TestTokenProvider {
-            token: "cloned_mode".to_string(),
+        let instance = TestTokenProvider {
+            token: "shared_token".to_string(),
         };
-        let cloned_regs = crate::extension_capabilities!(
-            cloned(cloned_src) => BearerTokenProviderHandle;
-            SharedBearerTokenProvider
-        );
-        registry.register_all_shared("cloned_ext", cloned_regs);
+        let make_caps = crate::shared_extension_capabilities!(TestTokenProvider => BearerTokenProviderHandle);
+        registry.register_all_shared("ext", make_caps(&instance));
 
-        let instance_regs = crate::extension_capabilities!(
-            instance(TestTokenProvider {
-                token: "instance_mode".to_string(),
-            }) => BearerTokenProviderHandle;
-            SharedBearerTokenProvider
-        );
-        registry.register_all_shared("instance_ext", instance_regs);
-
-        let cloned_provider: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("cloned_ext").unwrap();
-        let instance_provider: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("instance_ext").unwrap();
+        let provider: Box<dyn SharedBearerTokenProvider> =
+            registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let cloned_token = rt.block_on(cloned_provider.get_token()).unwrap();
-        let instance_token = rt.block_on(instance_provider.get_token()).unwrap();
-
-        assert_eq!(cloned_token.token.secret(), "cloned_mode");
-        assert_eq!(instance_token.token.secret(), "instance_mode");
+        let token = rt.block_on(provider.get_token()).unwrap();
+        assert_eq!(token.token.secret(), "shared_token");
     }
 
     #[test]
-    fn test_extension_capabilities_source_modes_local() {
+    fn test_local_registration_and_resolve() {
         let mut registry = CapabilityRegistry::new();
 
-        let cloned_src = LocalOnlyTokenProvider {
-            token: "local_cloned_mode".to_string(),
-        };
-        let cloned_regs = crate::extension_local_capabilities!(
-            cloned(cloned_src) => BearerTokenProviderHandle;
-            LocalBearerTokenProvider
-        );
-        registry.register_all_local("local_cloned_ext", cloned_regs);
+        let rc = Rc::new(LocalOnlyTokenProvider {
+            token: "local_token".to_string(),
+        });
+        let make_caps = crate::local_extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
+        registry.register_all_local("ext", make_caps(&rc));
 
-        let instance_regs = crate::extension_local_capabilities!(
-            instance(LocalOnlyTokenProvider {
-                token: "local_instance_mode".to_string(),
-            }) => BearerTokenProviderHandle;
-            LocalBearerTokenProvider
-        );
-        registry.register_all_local("local_instance_ext", instance_regs);
-
-        let local_bindings = HashMap::from([(
+        let bindings = HashMap::from([(
             "bearer_token_provider".to_string(),
-            "local_instance_ext".to_string(),
+            "ext".to_string(),
         )]);
         let caps = registry
-            .resolve_bindings(&local_bindings, ConsumerType::Local)
+            .resolve_bindings(&bindings, ConsumerType::Local)
             .unwrap();
         let handle = caps.require::<BearerTokenProviderHandle>().unwrap();
 
@@ -1460,19 +1118,7 @@ mod tests {
             .build()
             .unwrap();
         let token = rt.block_on(handle.get_token()).unwrap();
-        assert_eq!(token.token.secret(), "local_instance_mode");
-
-        // Ensure cloned local mode also registers and resolves.
-        let local_bindings = HashMap::from([(
-            "bearer_token_provider".to_string(),
-            "local_cloned_ext".to_string(),
-        )]);
-        let caps = registry
-            .resolve_bindings(&local_bindings, ConsumerType::Local)
-            .unwrap();
-        let handle = caps.require::<BearerTokenProviderHandle>().unwrap();
-        let token = rt.block_on(handle.get_token()).unwrap();
-        assert_eq!(token.token.secret(), "local_cloned_mode");
+        assert_eq!(token.token.secret(), "local_token");
     }
 
     #[test]
@@ -1658,17 +1304,15 @@ mod tests {
             token: "fake".to_string(),
         };
         // Build a registration but override the capability_name.
-        let reg = shared::CapabilityRegistration::new(
-            // Use a different TypeId so it doesn't collide with BearerTokenProvider.
-            // We use TypeId::of::<Box<dyn std::fmt::Debug>>() as a stand-in.
-            TypeId::of::<Box<dyn std::fmt::Debug>>(),
-            instance,
-            |any| {
+        let reg = shared::CapabilityRegistration {
+            trait_id: TypeId::of::<Box<dyn std::fmt::Debug>>(),
+            value: Box::new(instance),
+            coerce: |any: &dyn Any| -> Box<dyn Any + Send> {
                 let concrete = any.downcast_ref::<TestTokenProvider>().unwrap();
                 Box::new(Box::new(concrete.clone()) as Box<dyn SharedBearerTokenProvider>)
             },
-            cap_name,
-        );
+            capability_name: cap_name,
+        };
         registry.register_all_shared(ext_name, vec![reg]);
     }
 

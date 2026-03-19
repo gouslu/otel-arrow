@@ -26,7 +26,11 @@ use azure_identity::{
     DeveloperToolsCredential, DeveloperToolsCredentialOptions, ManagedIdentityCredential,
     ManagedIdentityCredentialOptions, UserAssignedId,
 };
-use otap_df_engine::extension::bearer_token_provider::{BearerToken, shared::BearerTokenProvider};
+use otap_df_engine::extension::bearer_token_provider::{
+    BearerToken,
+    local::BearerTokenProvider as LocalBearerTokenProvider,
+    shared::BearerTokenProvider,
+};
 use otap_df_telemetry::{otel_debug, otel_error, otel_info, otel_warn};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -34,7 +38,7 @@ use tokio::sync::watch;
 use otap_df_engine::control::ExtensionControlMsg;
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::extension::{ControlChannel, EffectHandler};
-use otap_df_engine::shared::extension::Extension;
+use otap_df_engine::local::extension::Extension;
 use otap_df_engine::terminal_state::TerminalState;
 
 use super::config::{AuthMethod, Config};
@@ -223,30 +227,11 @@ impl AzureIdentityAuthExtension {
     pub fn scope(&self) -> &str {
         &self.scope
     }
-}
 
-#[async_trait]
-impl BearerTokenProvider for AzureIdentityAuthExtension {
-    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extension::registry::Error> {
-        let access_token = self.get_token_with_retry().await?;
-
-        Ok(BearerToken::new(
-            access_token.token.secret().to_string(),
-            access_token.expires_on.unix_timestamp(),
-        ))
-    }
-
-    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
-        self.token_sender.subscribe()
-    }
-}
-
-#[async_trait]
-impl Extension for AzureIdentityAuthExtension {
-    async fn start(
-        self: Box<Self>,
+    /// Runs the extension event loop (shared between local and shared modes).
+    async fn run(
+        &self,
         mut ctrl_chan: ControlChannel,
-        _: EffectHandler,
     ) -> Result<TerminalState, EngineError> {
         otel_info!(
             "azure_identity_auth.start",
@@ -328,6 +313,49 @@ impl Extension for AzureIdentityAuthExtension {
         }
 
         Ok(TerminalState::default())
+    }
+}
+
+#[async_trait]
+impl BearerTokenProvider for AzureIdentityAuthExtension {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extension::registry::Error> {
+        let access_token = self.get_token_with_retry().await?;
+
+        Ok(BearerToken::new(
+            access_token.token.secret().to_string(),
+            access_token.expires_on.unix_timestamp(),
+        ))
+    }
+
+    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+        self.token_sender.subscribe()
+    }
+}
+
+#[async_trait(?Send)]
+impl LocalBearerTokenProvider for AzureIdentityAuthExtension {
+    async fn get_token(&self) -> Result<BearerToken, otap_df_engine::extension::registry::Error> {
+        let access_token = self.get_token_with_retry().await?;
+
+        Ok(BearerToken::new(
+            access_token.token.secret().to_string(),
+            access_token.expires_on.unix_timestamp(),
+        ))
+    }
+
+    fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>> {
+        self.token_sender.subscribe()
+    }
+}
+
+#[async_trait(?Send)]
+impl Extension for AzureIdentityAuthExtension {
+    async fn start(
+        self: std::rc::Rc<Self>,
+        ctrl_chan: ControlChannel,
+        _: EffectHandler,
+    ) -> Result<TerminalState, EngineError> {
+        self.run(ctrl_chan).await
     }
 }
 
