@@ -33,6 +33,7 @@ use crate::context::PipelineContext;
 use crate::control::ExtensionControlMsg;
 use crate::entity_context::NodeTelemetryGuard;
 use crate::error::Error;
+use crate::local::extension as local_ext;
 use crate::node::NodeId;
 use crate::shared::extension as shared_ext;
 use crate::shared::message::{SharedReceiver, SharedSender};
@@ -187,6 +188,122 @@ impl EffectHandler {
     }
 }
 
+// ── Active / Passive wrappers ────────────────────────────────────────────────
+
+/// Wraps an extension type to signal it has an active event loop.
+///
+/// The engine spawns a task and creates a control channel for active extensions.
+/// The inner type must implement the appropriate `Extension` trait.
+///
+/// # Usage
+/// ```ignore
+/// builder.with_shared(Active(ext)).build()
+/// builder.with_local(Active(Rc::new(ext))).build()
+/// ```
+pub struct Active<E>(pub E);
+
+/// Wraps an extension type to signal it is passive (capabilities only).
+///
+/// No task is spawned, no control channel is created. The extension only
+/// provides capabilities for consumers to look up.
+///
+/// # Usage
+/// ```ignore
+/// builder.with_shared(Passive(ext)).build()
+/// builder.with_local(Passive(Rc::new(ext))).build()
+/// ```
+pub struct Passive<E>(pub E);
+
+/// Decomposed result of a shared extension provider.
+#[doc(hidden)]
+pub struct SharedDecomposed {
+    pub any: Box<dyn registry::CloneAnySend>,
+    pub extension: Option<Box<dyn shared_ext::Extension>>,
+    pub type_id: TypeId,
+}
+
+/// Decomposed result of a local extension provider.
+#[doc(hidden)]
+pub struct LocalDecomposed {
+    pub any: std::rc::Rc<dyn std::any::Any>,
+    pub extension: Option<std::rc::Rc<dyn local_ext::Extension>>,
+    pub type_id: TypeId,
+}
+
+/// Sealed trait for shared extension providers (Active or Passive).
+pub trait SharedProvider: sealed_provider::SealedShared {
+    /// Decompose into type-erased components.
+    fn decompose(self) -> SharedDecomposed;
+}
+
+/// Sealed trait for local extension providers (Active or Passive).
+pub trait LocalProvider: sealed_provider::SealedLocal {
+    /// Decompose into type-erased components.
+    fn decompose(self) -> LocalDecomposed;
+}
+
+mod sealed_provider {
+    pub trait SealedShared {}
+    pub trait SealedLocal {}
+}
+
+impl<E: shared_ext::Extension + Clone + Send + 'static> sealed_provider::SealedShared
+    for Active<E>
+{
+}
+
+impl<E: shared_ext::Extension + Clone + Send + 'static> SharedProvider for Active<E> {
+    fn decompose(self) -> SharedDecomposed {
+        let any: Box<dyn registry::CloneAnySend> = Box::new(self.0.clone());
+        let ext: Box<dyn shared_ext::Extension> = Box::new(self.0);
+        SharedDecomposed {
+            any,
+            extension: Some(ext),
+            type_id: TypeId::of::<E>(),
+        }
+    }
+}
+
+impl<E: Clone + Send + 'static> sealed_provider::SealedShared for Passive<E> {}
+
+impl<E: Clone + Send + 'static> SharedProvider for Passive<E> {
+    fn decompose(self) -> SharedDecomposed {
+        let any: Box<dyn registry::CloneAnySend> = Box::new(self.0);
+        SharedDecomposed {
+            any,
+            extension: None,
+            type_id: TypeId::of::<E>(),
+        }
+    }
+}
+
+impl<E: local_ext::Extension + 'static> sealed_provider::SealedLocal for Active<std::rc::Rc<E>> {}
+
+impl<E: local_ext::Extension + 'static> LocalProvider for Active<std::rc::Rc<E>> {
+    fn decompose(self) -> LocalDecomposed {
+        let any: std::rc::Rc<dyn std::any::Any> = self.0.clone();
+        let ext: std::rc::Rc<dyn local_ext::Extension> = self.0;
+        LocalDecomposed {
+            any,
+            extension: Some(ext),
+            type_id: TypeId::of::<E>(),
+        }
+    }
+}
+
+impl<E: 'static> sealed_provider::SealedLocal for Passive<std::rc::Rc<E>> {}
+
+impl<E: 'static> LocalProvider for Passive<std::rc::Rc<E>> {
+    fn decompose(self) -> LocalDecomposed {
+        let any: std::rc::Rc<dyn std::any::Any> = self.0;
+        LocalDecomposed {
+            any,
+            extension: None,
+            type_id: TypeId::of::<E>(),
+        }
+    }
+}
+
 // ── ExtensionWrapper ────────────────────────────────────────────────────────
 
 /// Wrapper for extension instances in the pipeline engine.
@@ -195,15 +312,20 @@ impl EffectHandler {
 /// [`ExtensionControlMsg`], keeping the extension system entirely decoupled
 /// from the data-plane type.
 ///
-/// An extension may provide a shared lifecycle, a local lifecycle, or both.
-/// The engine registers capabilities and starts lifecycles for whichever
-/// variants are present.
+/// An extension may provide capabilities (passive) or capabilities plus
+/// an active event loop. Use `Active(ext)` or `Passive(ext)` wrappers
+/// with the builder to signal the intent.
 ///
 /// Use the builder to construct:
 /// ```ignore
+/// // Active extension with event loop
 /// ExtensionWrapper::builder(node, config, ext_config)
-///     .with_local(Rc::new(local_ext))
-///     .with_shared(shared_ext)
+///     .with_shared(Active(ext))
+///     .build()
+///
+/// // Passive extension — capabilities only, no task spawned
+/// ExtensionWrapper::builder(node, config, ext_config)
+///     .with_shared(Passive(ext))
 ///     .build()
 /// ```
 pub struct ExtensionWrapper {
@@ -213,24 +335,23 @@ pub struct ExtensionWrapper {
     user_config: Arc<NodeUserConfig>,
     /// The runtime configuration for the extension.
     runtime_config: ExtensionConfig,
-    /// Shared extension lifecycle (Send, clone-based).
+    /// Shared extension lifecycle (Send, clone-based). None for passive.
     shared_extension: Option<Box<dyn shared_ext::Extension>>,
-    /// Local extension lifecycle (Rc-based, true single instance).
-    local_extension: Option<std::rc::Rc<dyn crate::local::extension::Extension>>,
+    /// Local extension lifecycle (Rc-based, true single instance). None for passive.
+    local_extension: Option<std::rc::Rc<dyn local_ext::Extension>>,
     /// Type-erased shared instance for capability registration.
     shared_any: Option<Box<dyn registry::CloneAnySend>>,
     /// Type-erased local instance for capability registration.
     local_any: Option<std::rc::Rc<dyn std::any::Any>>,
     /// Capabilities descriptor — set by the engine after `create()`.
     capabilities: registry::ExtensionCapabilities,
-    /// A sender for control messages (used by local variant, or the sole variant).
-    control_sender: SharedSender<ExtensionControlMsg>,
-    /// A receiver for control messages (used by local variant, or the sole variant).
+    /// A sender for control messages. None for fully passive extensions.
+    control_sender: Option<SharedSender<ExtensionControlMsg>>,
+    /// A receiver for control messages. None for fully passive extensions.
     control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
-    /// A second sender for control messages (used by the shared variant when
-    /// both local and shared are present as independent types).
+    /// A second sender for control messages (shared variant in dual-lifecycle mode).
     shared_control_sender: Option<SharedSender<ExtensionControlMsg>>,
-    /// A second receiver for control messages (shared variant, independent mode).
+    /// A second receiver for control messages (shared variant, dual-lifecycle mode).
     shared_control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
     /// Telemetry guard for node lifecycle cleanup.
     telemetry: Option<NodeTelemetryGuard>,
@@ -256,34 +377,36 @@ pub struct ExtensionWrapperBuilder {
 
 impl ExtensionWrapperBuilder {
     /// Add a **local** (!Send) extension variant.
-    pub fn with_local<E>(mut self, extension: std::rc::Rc<E>) -> Self
-    where
-        E: crate::local::extension::Extension + 'static,
-    {
+    ///
+    /// Use `Active(Rc::new(ext))` for extensions with an event loop,
+    /// or `Passive(Rc::new(ext))` for capability-only extensions.
+    pub fn with_local(mut self, provider: impl LocalProvider) -> Self {
+        let decomposed = provider.decompose();
         otel_debug!(
             "extension.builder.with_local",
             node_id = self.node_id.name.as_ref(),
+            active = decomposed.extension.is_some(),
         );
-        let local_any: std::rc::Rc<dyn std::any::Any> = extension.clone();
-        self.local_extension = Some(extension);
-        self.local_any = Some(local_any);
-        self.local_type_id = Some(TypeId::of::<E>());
+        self.local_any = Some(decomposed.any);
+        self.local_extension = decomposed.extension;
+        self.local_type_id = Some(decomposed.type_id);
         self
     }
 
     /// Add a **shared** (Send) extension variant.
-    pub fn with_shared<E>(mut self, extension: E) -> Self
-    where
-        E: shared_ext::Extension + Clone + Send + 'static,
-    {
+    ///
+    /// Use `Active(ext)` for extensions with an event loop,
+    /// or `Passive(ext)` for capability-only extensions.
+    pub fn with_shared(mut self, provider: impl SharedProvider) -> Self {
+        let decomposed = provider.decompose();
         otel_debug!(
             "extension.builder.with_shared",
             node_id = self.node_id.name.as_ref(),
+            active = decomposed.extension.is_some(),
         );
-        let shared_any: Box<dyn registry::CloneAnySend> = Box::new(extension.clone());
-        self.shared_extension = Some(Box::new(extension));
-        self.shared_any = Some(shared_any);
-        self.shared_type_id = Some(TypeId::of::<E>());
+        self.shared_any = Some(decomposed.any);
+        self.shared_extension = decomposed.extension;
+        self.shared_type_id = Some(decomposed.type_id);
         self
     }
 
@@ -297,11 +420,9 @@ impl ExtensionWrapperBuilder {
     ///   type should serve both local and shared consumers.
     pub fn build(self) -> ExtensionWrapper {
         assert!(
-            self.shared_extension.is_some() || self.local_extension.is_some(),
+            self.shared_any.is_some() || self.local_any.is_some(),
             "ExtensionWrapper must have at least one variant (local or shared)"
         );
-
-        let both_present = self.local_extension.is_some() && self.shared_extension.is_some();
 
         // When both variants are provided, they must be different concrete types.
         if let (Some(local_tid), Some(shared_tid)) = (self.local_type_id, self.shared_type_id) {
@@ -313,12 +434,22 @@ impl ExtensionWrapperBuilder {
             );
         }
 
-        let (control_sender, control_receiver) =
-            tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
+        let has_local_lifecycle = self.local_extension.is_some();
+        let has_shared_lifecycle = self.shared_extension.is_some();
+        let has_any_lifecycle = has_local_lifecycle || has_shared_lifecycle;
+        let has_both_lifecycles = has_local_lifecycle && has_shared_lifecycle;
 
-        // Create a second control channel when both variants are present
-        // (they are always independent types per the TypeId check above).
-        let (shared_control_sender, shared_control_receiver) = if both_present {
+        // Only create control channels when at least one active lifecycle exists.
+        let (control_sender, control_receiver) = if has_any_lifecycle {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
+            (Some(SharedSender::mpsc(tx)), Some(SharedReceiver::mpsc(rx)))
+        } else {
+            (None, None)
+        };
+
+        // Create a second control channel when both variants have active lifecycles.
+        let (shared_control_sender, shared_control_receiver) = if has_both_lifecycles {
             let (tx, rx) =
                 tokio::sync::mpsc::channel(self.runtime_config.control_channel.capacity);
             (Some(SharedSender::mpsc(tx)), Some(SharedReceiver::mpsc(rx)))
@@ -329,7 +460,8 @@ impl ExtensionWrapperBuilder {
         otel_debug!(
             "extension.builder.build",
             node_id = self.node_id.name.as_ref(),
-            both_variants = both_present,
+            has_local_lifecycle = has_local_lifecycle,
+            has_shared_lifecycle = has_shared_lifecycle,
         );
 
         ExtensionWrapper {
@@ -345,8 +477,8 @@ impl ExtensionWrapperBuilder {
                 register_shared: |_| Vec::new(),
                 register_local: |_| Vec::new(),
             },
-            control_sender: SharedSender::mpsc(control_sender),
-            control_receiver: Some(SharedReceiver::mpsc(control_receiver)),
+            control_sender,
+            control_receiver,
             shared_control_sender,
             shared_control_receiver,
             telemetry: None,
@@ -358,24 +490,26 @@ impl ExtensionWrapper {
     /// Start building an `ExtensionWrapper` with shared parameters.
     ///
     /// Call `.with_local()`, `.with_shared()`, or both, then `.build()`.
+    /// Use `Active(ext)` for extensions with event loops, `Passive(ext)` for
+    /// capability-only extensions.
     ///
     /// # Examples
     ///
     /// ```ignore
-    /// // Both variants
+    /// // Active shared extension
     /// ExtensionWrapper::builder(node, config, ext_config)
-    ///     .with_local(Rc::new(local_ext))
-    ///     .with_shared(shared_ext)
+    ///     .with_shared(Active(ext))
     ///     .build()
     ///
-    /// // Local only
+    /// // Passive shared extension
     /// ExtensionWrapper::builder(node, config, ext_config)
-    ///     .with_local(Rc::new(local_ext))
+    ///     .with_shared(Passive(ext))
     ///     .build()
     ///
-    /// // Shared only
+    /// // Both variants, active
     /// ExtensionWrapper::builder(node, config, ext_config)
-    ///     .with_shared(shared_ext)
+    ///     .with_local(Active(Rc::new(local_ext)))
+    ///     .with_shared(Active(shared_ext))
     ///     .build()
     /// ```
     pub fn builder(
@@ -423,6 +557,15 @@ impl ExtensionWrapper {
     #[must_use]
     pub fn is_shared(&self) -> bool {
         self.shared_extension.is_some()
+    }
+
+    /// Returns `true` if this extension is passive (no active lifecycle).
+    ///
+    /// Passive extensions only provide capabilities — no task is spawned,
+    /// no control channel is created.
+    #[must_use]
+    pub fn is_passive(&self) -> bool {
+        self.local_extension.is_none() && self.shared_extension.is_none()
     }
 
     /// Drop the local variant if present. Called by the engine when no
@@ -489,22 +632,28 @@ impl ExtensionWrapper {
         channel_metrics: &mut ChannelMetricsRegistry,
         channel_metrics_enabled: bool,
     ) -> Self {
+        // Skip if passive (no control channels).
+        if self.control_sender.is_none() {
+            return self;
+        }
+
+        let control_sender = self.control_sender.take().expect("checked above");
         let control_receiver = self
             .control_receiver
             .take()
             .expect("control_receiver already taken");
-        let (control_sender, control_receiver) =
+        let (wrapped_sender, wrapped_receiver) =
             wrap_control_channel_metrics::<SharedMode, ExtensionControlMsg>(
                 &self.node_id,
                 pipeline_ctx,
                 channel_metrics,
                 channel_metrics_enabled,
                 self.runtime_config.control_channel.capacity as u64,
-                self.control_sender,
+                control_sender,
                 control_receiver,
             );
-        self.control_sender = control_sender;
-        self.control_receiver = Some(control_receiver);
+        self.control_sender = Some(wrapped_sender);
+        self.control_receiver = Some(wrapped_receiver);
 
         // Wrap the second control channel if present (independent lifecycles).
         if let (Some(shared_sender), Some(shared_receiver)) =
@@ -529,15 +678,18 @@ impl ExtensionWrapper {
 
     /// Returns `ExtensionControlSender`(s) for sending control messages.
     ///
-    /// Returns one sender for single-variant or piggyback mode, two senders
-    /// for independent-lifecycle mode (one per variant).
+    /// Returns empty for passive extensions, one sender for single-variant
+    /// active mode, two senders for dual-lifecycle active mode.
     pub(crate) fn extension_control_senders(
         &self,
     ) -> Vec<crate::control::ExtensionControlSender> {
-        let mut senders = vec![crate::control::ExtensionControlSender {
-            node_id: self.node_id.clone(),
-            sender: crate::message::Sender::Shared(self.control_sender.clone()),
-        }];
+        let mut senders = Vec::new();
+        if let Some(ref sender) = self.control_sender {
+            senders.push(crate::control::ExtensionControlSender {
+                node_id: self.node_id.clone(),
+                sender: crate::message::Sender::Shared(sender.clone()),
+            });
+        }
         if let Some(ref shared_sender) = self.shared_control_sender {
             senders.push(crate::control::ExtensionControlSender {
                 node_id: self.node_id.clone(),
@@ -553,12 +705,13 @@ impl ExtensionWrapper {
     ///   types per the TypeId guard), spawns the shared variant as a background
     ///   task and awaits the local variant on the current thread.
     /// - If only one variant is present, runs it directly.
+    /// - If no lifecycle is present (passive), this should not be called.
     pub async fn start(self, metrics_reporter: MetricsReporter) -> Result<TerminalState, Error> {
         let node_name = self.node_id.name.clone();
         let effect_handler = EffectHandler::new(self.node_id, metrics_reporter);
         let control_receiver = self
             .control_receiver
-            .expect("control_receiver missing from ExtensionWrapper");
+            .expect("start() called on passive extension — this is a bug");
         let ctrl_chan = ControlChannel::new(control_receiver);
 
         match (self.local_extension, self.shared_extension) {
@@ -703,7 +856,7 @@ mod tests {
         let config = ExtensionConfig::new("test_extension");
 
         let _wrapper = ExtensionWrapper::builder(node_id, user_config, &config)
-            .with_shared(extension)
+            .with_shared(Active(extension))
             .build();
     }
 }

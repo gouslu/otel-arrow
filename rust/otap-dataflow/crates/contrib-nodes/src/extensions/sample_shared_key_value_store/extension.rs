@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use otap_df_engine::extension::key_value_store::local::KeyValueStore as LocalKeyValueStore;
 use otap_df_engine::extension::key_value_store::shared::KeyValueStore;
 use otap_df_engine::extension::registry::Error;
-use otap_df_engine::shared::extension::Extension;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -69,7 +68,3 @@ impl LocalKeyValueStore for SampleSharedKeyValueStore {
         Ok(())
     }
 }
-
-// Passive extension — no background work needed, uses default start().
-#[async_trait]
-impl Extension for SampleSharedKeyValueStore {}

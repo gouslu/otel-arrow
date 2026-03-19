@@ -10,7 +10,6 @@
 //! single-instance sharing: the same `Rc` is used for both the background task
 //! and capability trait objects, with zero-cost refcount cloning.
 
-use crate::control::ExtensionControlMsg;
 use crate::error::Error;
 use crate::extension::{ControlChannel, EffectHandler};
 use crate::terminal_state::TerminalState;
@@ -65,16 +64,7 @@ pub trait Extension {
     /// Returns an [`Error`] if an unrecoverable error occurs.
     async fn start(
         self: Rc<Self>,
-        mut ctrl_chan: ControlChannel,
-        _effect_handler: EffectHandler,
-    ) -> Result<TerminalState, Error> {
-        loop {
-            match ctrl_chan.recv().await? {
-                ExtensionControlMsg::Shutdown { .. } => {
-                    return Ok(TerminalState::default());
-                }
-                _ => {}
-            }
-        }
-    }
+        ctrl_chan: ControlChannel,
+        effect_handler: EffectHandler,
+    ) -> Result<TerminalState, Error>;
 }

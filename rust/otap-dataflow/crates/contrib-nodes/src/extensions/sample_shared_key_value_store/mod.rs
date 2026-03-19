@@ -16,7 +16,7 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
-use otap_df_engine::extension::ExtensionWrapper;
+use otap_df_engine::extension::{ExtensionWrapper, Passive};
 use otap_df_engine::extension::key_value_store::KeyValueStore;
 use otap_df_engine::node::NodeId;
 use std::sync::Arc;
@@ -47,7 +47,7 @@ pub static SAMPLE_SHARED_KV_STORE: ExtensionFactory = ExtensionFactory {
         let ext = SampleSharedKeyValueStore::new();
 
         Ok(ExtensionWrapper::builder(node, node_config, extension_config)
-            .with_shared(ext)
+            .with_shared(Passive(ext))
             .build())
     },
     validate_config: otap_df_config::validation::no_config,

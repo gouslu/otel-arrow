@@ -42,7 +42,7 @@ use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ExtensionFactory;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
-use otap_df_engine::extension::ExtensionWrapper;
+use otap_df_engine::extension::{Active, ExtensionWrapper};
 use otap_df_engine::extension::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::node::NodeId;
 use std::rc::Rc;
@@ -110,8 +110,8 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
         })?;
 
         Ok(ExtensionWrapper::builder(node, node_config, extension_config)
-            .with_local(Rc::new(local_ext))
-            .with_shared(shared_ext)
+            .with_local(Active(Rc::new(local_ext)))
+            .with_shared(Active(shared_ext))
             .build())
     },
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,

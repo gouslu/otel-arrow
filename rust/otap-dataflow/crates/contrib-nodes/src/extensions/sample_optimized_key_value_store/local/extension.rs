@@ -9,7 +9,6 @@
 use async_trait::async_trait;
 use otap_df_engine::extension::key_value_store::local::KeyValueStore;
 use otap_df_engine::extension::registry::Error;
-use otap_df_engine::local::extension::Extension;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -44,7 +43,3 @@ impl KeyValueStore for SampleOptimizedKeyValueStore {
         Ok(())
     }
 }
-
-// Passive extension — no background work needed, uses default start().
-#[async_trait(?Send)]
-impl Extension for SampleOptimizedKeyValueStore {}

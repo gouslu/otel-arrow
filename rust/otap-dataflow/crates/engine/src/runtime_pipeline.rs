@@ -208,9 +208,16 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable> RuntimePipeli
         // Extensions do NOT register in control_senders (they use ExtensionControlMsg,
         // not NodeControlMsg<PData>). They do NOT receive pipeline_ctrl_msg_tx.
         // Instead, their control senders are tracked separately for shutdown-last.
+        // Passive extensions (no lifecycle) are skipped — they only provide capabilities.
         for extension in extensions {
             let mut extension = extension;
             extension_control_senders.extend(extension.extension_control_senders());
+
+            // Passive extensions have no lifecycle to start.
+            if extension.is_passive() {
+                continue;
+            }
+
             let telemetry_guard = extension.take_telemetry_guard();
             let node_entity_key = telemetry_guard.as_ref().map(|t| t.entity_key());
             let telemetry_handle = telemetry_guard.as_ref().map(|t| t.handle());
