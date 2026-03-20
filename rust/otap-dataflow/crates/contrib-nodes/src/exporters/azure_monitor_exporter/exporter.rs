@@ -88,7 +88,7 @@ impl AzureMonitorExporter {
         let transformer = Transformer::new(&config);
 
         // Create Gzip batcher
-        let gzip_batcher = GzipBatcher::new();
+        let gzip_batcher = GzipBatcher::new(config.api.gzip_compression_level);
 
         // Create heartbeat handler
         let heartbeat = Heartbeat::new(&config.api)?;
@@ -478,7 +478,8 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             endpoint = self.config.api.dcr_endpoint.as_str(),
             stream = self.config.api.stream_name.as_str(),
             dcr = self.config.api.dcr.as_str(),
-            auth_method = self.config.auth.auth_method_name()
+            auth_method = self.config.auth.auth_method_name(),
+            gzip_compression_level = self.config.api.gzip_compression_level
         );
 
         let mut msg_id = 0;
@@ -700,6 +701,7 @@ mod tests {
                     log_record_mapping: HashMap::new(),
                 },
                 azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
             },
             auth: AuthConfig::default(),
         }
