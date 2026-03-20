@@ -170,7 +170,7 @@ option. The following `Send`-compatible primitives provide
 lock-free interior mutability:
 
 | Primitive | Cost | Use case |
-|---|---|---|
+| --- | --- | --- |
 | `AtomicU64` | ~1ns | Counters, flags |
 | `ArcSwap<T>` | ~2ns read | Swapping configs, token caches |
 | `watch::Sender` | ~3ns read | Push-based state updates |
