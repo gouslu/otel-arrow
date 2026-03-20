@@ -10,7 +10,7 @@ throughput, and compression ratio to determine the optimal default.
 ## Methodology
 
 **Compression levels tested:** 1 (fastest), 6 (default), and 9 (maximum).
-Gzip levels range from 1–9, where 1 prioritizes speed and 9 prioritizes
+Gzip levels range from 1-9, where 1 prioritizes speed and 9 prioritizes
 compression ratio.
 
 **Procedure:** For each combination of (data type, entry size, compression
@@ -31,15 +31,15 @@ Three data profiles are used to sweep across entropy levels and therefore
 compressibility. This lets us isolate how compression level interacts with
 data compressibility rather than measuring only a single operating point:
 
-- **json_log** (low entropy) — Structured JSON with random field values and a
+- **json_log** (low entropy)  --  Structured JSON with random field values and a
   random lowercase-letter message body. The repeating key names, braces, and
   quoted strings create high structural redundancy, making this the most
   compressible profile. It also serves as the most realistic example, closely
   resembling actual Azure Monitor ingestion payloads.
-- **hex** (medium entropy) — Random hexadecimal characters (`0-9a-f`). With
+- **hex** (medium entropy)  --  Random hexadecimal characters (`0-9a-f`). With
   only 16 possible byte values the entropy is ~4 bits per byte, placing this
   profile in the middle of the compressibility spectrum.
-- **ascii** (high entropy) — Uniformly random printable ASCII (`0x20–0x7E`).
+- **ascii** (high entropy)  --  Uniformly random printable ASCII (`0x20-0x7E`).
   With 95 possible byte values drawn uniformly, entropy is close to the
   theoretical maximum, making the data near-incompressible. This establishes
   the worst-case performance floor.
@@ -49,12 +49,12 @@ data compressibility rather than measuring only a single operating point:
 Three entry sizes are tested to capture how per-entry overhead and compression
 window utilization change with payload length:
 
-- **256 B** — Small log entries. Typical of short structured events (e.g., a
+- **256 B**  --  Small log entries. Typical of short structured events (e.g., a
   metric data point or a brief log line with metadata). At this size,
   per-entry framing overhead is proportionally higher.
-- **512 B** — Medium log entries. Representative of a typical log record with
+- **512 B**  --  Medium log entries. Representative of a typical log record with
   a moderate-length message body and several attributes.
-- **1024 B** — Large log entries. Represents verbose log records with stack
+- **1024 B**  --  Large log entries. Represents verbose log records with stack
   traces, detailed error messages, or rich attribute sets. Larger entries give
   the compressor more context per push, which can improve throughput.
 
@@ -117,20 +117,20 @@ window utilization change with payload length:
 
 ## Analysis
 
-- **Level 1 vs 6:** Level 1 is 2.4–4.2x faster with only ~2–3 percentage points
+- **Level 1 vs 6:** Level 1 is 2.4-4.2x faster with only ~2-3 percentage points
   worse compression ratio. The throughput difference is dramatic (e.g., 271 vs
   69 MiB/s for json_log/1024B).
 - **Level 6 vs 9:** Virtually identical compression ratios across all data types,
-  but level 9 is consistently 2–5% slower. Level 9 provides no measurable
+  but level 9 is consistently 2-5% slower. Level 9 provides no measurable
   compression benefit over level 6.
-- **Data type impact:** JSON logs compress best (45–60% ratio), hex is moderate
-  (55–58%), and random ASCII barely compresses (83–84%). The data type matters
+- **Data type impact:** JSON logs compress best (45-60% ratio), hex is moderate
+  (55-58%), and random ASCII barely compresses (83-84%). The data type matters
   far more than the compression level.
 
 ## Caveats
 
 - These benchmarks measure CPU-bound compression throughput in isolation.
-  In this exporter, the bottleneck is outgoing HTTP request rate — compression
+  In this exporter, the bottleneck is outgoing HTTP request rate  --  compression
   is not the limiting factor. However, reducing CPU time per batch frees up
   cycles for other pipeline work and reduces back-pressure on upstream
   components.
