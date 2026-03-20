@@ -8,34 +8,9 @@ use std::io::Write;
 
 use super::error::Error;
 
-const ONE_MB: usize = 1024 * 1024; // 1 MB
+const ONE_MB: usize = 1024 * 1024; // 1 MiB (1,048,576 bytes) -- hard limit
+const TARGET_LIMIT: usize = 1015 * 1024; // 1015 KiB (1,039,360 bytes) -- soft target
 const MAX_GZIP_FLUSH_COUNT: usize = 100;
-/// Safety margin for gzip overhead:
-///
-/// - gzip header + trailer: ~18 bytes
-/// - worst-case deflate stored-block headers for ~1MB: ~320 bytes
-/// - sync flush overhead: ~5 bytes per flush × 100 flushes = ~500 bytes
-/// - slack: ~3KB
-///
-/// Total: ~4KB is generous.
-///
-/// Measured flush counts (worst case: 31 flushes for single-byte entries at level 9):
-///
-/// | Profile     | Entry Size | Level 1 | Level 6 | Level 9 |
-/// |-------------|------------|---------|---------|---------|
-/// | single_byte | 1 B        | 21      | 30      | 31      |
-/// | hex         | 10 B       | 12      | 12      | 12      |
-/// | json        | 256 B      | 10      | 10      | 10      |
-/// | ascii       | 256 B      | 5       | 6       | 5       |
-/// | hex         | 1 KB       | 10      | 9       | 9       |
-/// | json        | 1 KB       | 8       | 7       | 8       |
-/// | ascii       | 1 KB       | 4       | 5       | 5       |
-/// | json        | 2 KB       | 7       | 7       | 7       |
-/// | hex         | 16 KB      | 7       | 6       | 6       |
-/// | json        | 16 KB      | 6       | 5       | 6       |
-/// | ascii       | 16 KB      | 3       | 3       | 3       |
-/// | mixed       | 1B–16KB    | 6       | 6       | 6       |
-const GZIP_SAFETY_MARGIN: usize = 4096;
 
 /// Accumulates JSON entries into gzip-compressed batches that stay under a size limit.
 pub struct GzipBatcher {
@@ -43,7 +18,6 @@ pub struct GzipBatcher {
     compression: Compression,
     remaining_size: usize,
     uncompressed_size: usize,
-    total_uncompressed_size: usize,
     row_count: u64,
     flush_count: usize,
     batch_id: u64,
@@ -88,9 +62,8 @@ impl GzipBatcher {
         Self {
             buf: Self::new_encoder(compression),
             compression,
-            remaining_size: ONE_MB - GZIP_SAFETY_MARGIN,
+            remaining_size: TARGET_LIMIT,
             uncompressed_size: 0,
-            total_uncompressed_size: 0,
             row_count: 0,
             flush_count: 0,
             batch_id: 0,
@@ -121,11 +94,11 @@ impl GzipBatcher {
     fn push_internal(&mut self, data: &[u8]) -> Result<PushResult, Error> {
         // Account for structural JSON bytes: '[' or ',' prefix + ']' for finalization.
         // Reject entries that can't possibly fit in a single batch.
-        if data.len() + 2 > (ONE_MB - GZIP_SAFETY_MARGIN) {
+        if data.len() + 2 > TARGET_LIMIT {
             return Ok(PushResult::TooLarge);
         }
 
-        let is_first_entry = self.uncompressed_size == 0;
+        let is_first_entry = self.row_count == 0;
 
         if is_first_entry {
             self.batch_id += 1;
@@ -145,11 +118,13 @@ impl GzipBatcher {
             self.flush_count += 1;
             let compressed_size = self.buf.get_ref().len();
 
-            // Use the constant here
-            self.remaining_size = ONE_MB.saturating_sub(compressed_size + GZIP_SAFETY_MARGIN);
+            self.remaining_size = TARGET_LIMIT.saturating_sub(compressed_size);
             self.uncompressed_size = 0;
         }
 
+        // Recompute after flush: uncompressed_size was reset so
+        // next_size must be recalculated with current state.
+        let structural_overhead = if is_first_entry { 0 } else { 1 };
         let next_size =
             self.uncompressed_size + structural_overhead + data.len() + finalize_overhead;
         let must_finalize =
@@ -174,12 +149,10 @@ impl GzipBatcher {
         } else {
             if !is_first_entry {
                 self.buf.write_all(b",").map_err(Error::BatchPushFailed)?;
-                self.total_uncompressed_size += 1;
                 self.uncompressed_size += 1;
             }
             self.buf.write_all(data).map_err(Error::BatchPushFailed)?;
             self.uncompressed_size += data.len();
-            self.total_uncompressed_size += data.len();
             self.row_count += 1;
 
             Ok(PushResult::Ok(self.batch_id))
@@ -199,13 +172,26 @@ impl GzipBatcher {
         let old_buf = std::mem::replace(&mut self.buf, Self::new_encoder(self.compression));
 
         let compressed_data = old_buf.finish().map_err(Error::BatchFinalizeFailed)?;
+
+        // Hard limit: reject batches that exceed ONE_MB despite the TARGET_LIMIT.
+        // Reset state before returning so the batcher can recover cleanly.
+        if compressed_data.len() > ONE_MB {
+            self.remaining_size = TARGET_LIMIT;
+            self.uncompressed_size = 0;
+            self.row_count = 0;
+            self.flush_count = 0;
+            return Err(Error::BatchFinalizeFailed(std::io::Error::other(format!(
+                "batch exceeded hard limit: {} bytes (target was {TARGET_LIMIT})",
+                compressed_data.len()
+            ))));
+        }
+
         let row_count = self.row_count;
         let flush_count = self.flush_count;
 
         // Reset state
-        self.remaining_size = ONE_MB - GZIP_SAFETY_MARGIN;
+        self.remaining_size = TARGET_LIMIT;
         self.uncompressed_size = 0;
-        self.total_uncompressed_size = 0;
         self.row_count = 0;
         self.flush_count = 0;
 
@@ -340,8 +326,8 @@ mod tests {
     #[test]
     fn test_push_just_under_limit() {
         let mut batcher = GzipBatcher::new(1);
-        // Max allowed: ONE_MB - GZIP_SAFETY_MARGIN - 2 (for '[' or ',' and ']')
-        let data = vec![b'x'; ONE_MB - GZIP_SAFETY_MARGIN - 2];
+        // Max allowed: TARGET_LIMIT - 2 (for '[' and ']')
+        let data = vec![b'x'; TARGET_LIMIT - 2];
         match batcher.push(&data).unwrap() {
             PushResult::Ok(_) | PushResult::BatchReady(_) => {} // Expected
             PushResult::TooLarge => panic!("Should fit"),
@@ -577,18 +563,19 @@ mod tests {
         }
     }
 
-    /// Maximum allowed waste: 2% of 1MB.
-    /// Larger entries (e.g. 16KB) have coarser finalization granularity,
-    /// so waste can reach ~1% at the boundary.
-    const MAX_WASTE_PERCENT: f64 = 2.0;
+    /// Maximum allowed waste relative to TARGET_LIMIT.
+    /// 16KB entries with coarse finalization granularity can reach ~2%.
+    const MAX_WASTE_PERCENT: f64 = 3.0;
 
     fn assert_batch_utilization(stats: &BatchStats, label: &str) {
+        // Hard limit: must never exceed ONE_MB.
         assert!(
             stats.size <= ONE_MB,
-            "{label}: batch size {} exceeds 1MB limit",
+            "{label}: batch size {} exceeds hard limit (ONE_MB = {ONE_MB})",
             stats.size
         );
-        let utilization = stats.size as f64 / ONE_MB as f64 * 100.0;
+        // Utilization: should be close to TARGET_LIMIT.
+        let utilization = stats.size as f64 / TARGET_LIMIT as f64 * 100.0;
         let waste = 100.0 - utilization;
         assert!(
             waste <= MAX_WASTE_PERCENT,
@@ -603,67 +590,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_batch_utilization_hex_data() {
+    /// JSON with random hex payload -- near-incompressible realistic worst case.
+    fn generate_hex_json(size: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
         let hex = b"0123456789abcdef";
-        for level in [1u32, 6, 9] {
-            for entry_size in [10, 1024, 16384] {
-                let stats = fill_to_batch_ready(level, &|| {
-                    let mut rng = rand::rng();
-                    (0..entry_size)
-                        .map(|_| hex[rng.random_range(0..16usize)])
-                        .collect()
-                });
-                assert_batch_utilization(&stats, &format!("hex/{entry_size}B/level_{level}"));
-            }
-        }
-    }
-
-    /// High-entropy random printable ASCII — barely compressible, worst realistic case.
-    #[test]
-    fn test_batch_utilization_high_entropy_data() {
-        for level in [1u32, 6, 9] {
-            for entry_size in [256, 1024, 16384] {
-                let stats = fill_to_batch_ready(level, &|| {
-                    let mut rng = rand::rng();
-                    (0..entry_size)
-                        .map(|_| rng.random_range(b' '..=b'~'))
-                        .collect()
-                });
-                assert_batch_utilization(&stats, &format!("ascii/{entry_size}B/level_{level}"));
-            }
-        }
+        let base = r#"{"v":""#;
+        let closing = r#""}"#;
+        let val_len = size.saturating_sub(base.len() + closing.len());
+        let val: String = (0..val_len)
+            .map(|_| hex[rng.random_range(0..16usize)] as char)
+            .collect();
+        format!("{base}{val}{closing}").into_bytes()
     }
 
     #[test]
-    fn test_batch_utilization_json_data() {
+    fn test_batch_utilization_json_log_data() {
         for level in [1u32, 6, 9] {
             for entry_size in [256, 1024, 2048, 16384] {
                 let stats = fill_to_batch_ready(level, &|| generate_data(entry_size));
-                assert_batch_utilization(&stats, &format!("json/{entry_size}B/level_{level}"));
+                assert_batch_utilization(&stats, &format!("json_log/{entry_size}B/level_{level}"));
             }
         }
     }
 
-    /// Stress test: single-byte entries maximize the ratio of commas to data.
-    /// ~50% of the uncompressed stream is commas, exercising the structural
-    /// byte accounting heavily.
+    /// Near-incompressible JSON: minimal object with random hex value.
     #[test]
-    fn test_batch_utilization_single_byte_entries() {
+    fn test_batch_utilization_hex_json_data() {
+        for level in [1u32, 6, 9] {
+            for entry_size in [10, 256, 1024, 16384] {
+                let stats = fill_to_batch_ready(level, &|| generate_hex_json(entry_size));
+                assert_batch_utilization(&stats, &format!("hex_json/{entry_size}B/level_{level}"));
+            }
+        }
+    }
+
+    /// Stress test: smallest valid JSON entries (`1`) maximize the ratio of
+    /// commas to data, exercising the structural byte accounting heavily.
+    #[test]
+    fn test_batch_utilization_tiny_json_entries() {
         for level in [1u32, 6, 9] {
             let stats = fill_to_batch_ready(level, &|| {
                 let mut rng = rand::rng();
                 vec![rng.random_range(b'0'..=b'9')]
             });
-            assert_batch_utilization(&stats, &format!("single_byte/level_{level}"));
+            assert_batch_utilization(&stats, &format!("tiny_json/level_{level}"));
         }
     }
 
-    /// Stress test: wildly varying entry sizes within a single batch.
-    /// Mixes tiny (1–10B), medium (256–1KB), and large (8–16KB) entries
+    /// Stress test: wildly varying JSON entry sizes within a single batch.
+    /// Mixes tiny (1-10B), medium (256-1KB), and large (8-16KB) entries
     /// to exercise size accounting across granularity transitions.
     #[test]
-    fn test_batch_utilization_mixed_entry_sizes() {
+    fn test_batch_utilization_mixed_json_sizes() {
         let sizes = [1, 5, 10, 50, 256, 512, 1024, 4096, 8192, 16384];
         for level in [1u32, 6, 9] {
             let counter = std::cell::Cell::new(0usize);
@@ -672,32 +650,37 @@ mod tests {
                 counter.set(i + 1);
                 generate_data(sizes[i % sizes.len()])
             });
-            assert_batch_utilization(&stats, &format!("mixed_sizes/level_{level}"));
+            assert_batch_utilization(&stats, &format!("mixed_json/level_{level}"));
         }
     }
 
-    /// Regression test: fill with random (incompressible) data to verify the
-    /// accounting correctly prevents overflow even when deflate expands data.
-    /// This was the exact scenario that caused a CI failure with the old 30-byte margin.
+    /// Worst-case realistic scenario: minimal JSON with a random hex value.
+    /// The JSON framing (`{"v":"..."}`) provides some redundancy, but the
+    /// random hex payload is near-incompressible. This is the hardest
+    /// realistic case for the size accounting.
     #[test]
-    fn test_1mb_limit_with_incompressible_data() {
+    fn test_1mb_limit_with_near_incompressible_json() {
+        let hex = b"0123456789abcdef";
         let mut rng = rand::rng();
-        // Run multiple iterations to reduce flakiness from randomness.
         for _ in 0..5 {
             let mut batcher = GzipBatcher::new(1);
             loop {
-                let chunk: Vec<u8> = (0..10).map(|_| rng.random()).collect();
-                match batcher.push(&chunk).unwrap() {
+                // Minimal JSON: {"v":"<random hex>"}
+                let val: String = (0..200)
+                    .map(|_| hex[rng.random_range(0..16usize)] as char)
+                    .collect();
+                let entry = format!(r#"{{"v":"{val}"}}"#).into_bytes();
+                match batcher.push(&entry).unwrap() {
                     PushResult::Ok(_) => continue,
                     PushResult::BatchReady(_) => break,
-                    PushResult::TooLarge => panic!("Should not happen with small chunks"),
+                    PushResult::TooLarge => panic!("Should not happen"),
                 }
             }
 
             let batch = batcher.take_pending_batch().unwrap();
             assert!(
                 batch.compressed_data.len() <= ONE_MB,
-                "Batch size {} exceeds 1MB limit with incompressible data",
+                "Batch size {} exceeds 1MB limit with near-incompressible JSON",
                 batch.compressed_data.len()
             );
         }
@@ -709,7 +692,7 @@ mod tests {
     fn test_structural_bytes_accounting() {
         let mut batcher = GzipBatcher::new(6);
         // Push data that's just under the limit minus structural overhead
-        let data = vec![b'a'; ONE_MB - GZIP_SAFETY_MARGIN - 3]; // -3 for '[', ']', and slack
+        let data = vec![b'a'; TARGET_LIMIT - 3]; // -3 for '[', ']', and slack
         match batcher.push(&data).unwrap() {
             PushResult::Ok(_) => {}
             other => panic!("Expected Ok, got {:?}", std::mem::discriminant(&other)),
@@ -727,11 +710,99 @@ mod tests {
     #[test]
     fn test_too_large_includes_structural_overhead() {
         let mut batcher = GzipBatcher::new(1);
-        // Exactly ONE_MB - GZIP_SAFETY_MARGIN - 1: too large because +2 for structural bytes
-        let data = vec![b'x'; ONE_MB - GZIP_SAFETY_MARGIN - 1];
+        // Exactly TARGET_LIMIT - 1: too large because +2 for structural bytes
+        let data = vec![b'x'; TARGET_LIMIT - 1];
         match batcher.push(&data).unwrap() {
-            PushResult::TooLarge => {} // Expected: data.len() + 2 > ONE_MB - GZIP_SAFETY_MARGIN
+            PushResult::TooLarge => {} // Expected: data.len() + 2 > TARGET_LIMIT
             _ => panic!("Should be TooLarge"),
         }
+    }
+
+    // ==================== Edge Case Tests ====================
+
+    /// Verify JSON validity across flush boundaries: commas must separate
+    /// entries even when a sync flush occurs between them.
+    #[test]
+    fn test_comma_present_after_flush_boundary() {
+        let mut batcher = GzipBatcher::new(6);
+
+        // Fill until we trigger at least one flush, then finalize.
+        loop {
+            match batcher.push(&generate_1kb_data()).unwrap() {
+                PushResult::Ok(_) => continue,
+                PushResult::BatchReady(_) => break,
+                PushResult::TooLarge => panic!("Should not happen"),
+            }
+        }
+
+        let batch = batcher.take_pending_batch().unwrap();
+        assert!(batch.flush_count > 0, "Test requires at least one flush");
+
+        // Decompress and verify it's a valid JSON array with commas between entries.
+        let json = decompress_and_validate(&batch.compressed_data);
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("Must be valid JSON with commas between entries");
+        assert!(parsed.len() > 1, "Must have multiple entries");
+    }
+
+    /// Verify batches never exceed the ONE_MB hard limit across all
+    /// compression levels.
+    #[test]
+    fn test_hard_limit_enforced_across_levels() {
+        for level in [1u32, 6, 9] {
+            let mut batcher = GzipBatcher::new(level);
+            loop {
+                match batcher.push(&generate_1kb_data()).unwrap() {
+                    PushResult::Ok(_) => continue,
+                    PushResult::BatchReady(_) => break,
+                    PushResult::TooLarge => panic!("Should not happen"),
+                }
+            }
+            let batch = batcher.take_pending_batch().unwrap();
+            assert!(
+                batch.compressed_data.len() <= ONE_MB,
+                "level {level}: batch {} exceeds hard limit",
+                batch.compressed_data.len()
+            );
+        }
+    }
+
+    /// Verify each batch starts with '[' and produces valid JSON across
+    /// multiple consecutive batches.
+    #[test]
+    fn test_is_first_entry_correct_across_batches() {
+        let mut batcher = GzipBatcher::new(1);
+
+        // Fill first batch
+        loop {
+            if let PushResult::BatchReady(_) = batcher.push(&generate_1kb_data()).unwrap() {
+                break;
+            }
+        }
+
+        // Validate first batch
+        let b1 = batcher.take_pending_batch().unwrap();
+        let json1 = decompress_and_validate(&b1.compressed_data);
+        assert!(json1.starts_with('['));
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&json1).is_ok(),
+            "First batch must be valid JSON"
+        );
+
+        // The spillover entry already started batch 2. Add more and finalize.
+        let _ = batcher.push(b"1").unwrap();
+        let _ = batcher.finalize().unwrap();
+
+        let b2 = batcher.take_pending_batch().unwrap();
+        let json2 = decompress_and_validate(&b2.compressed_data);
+        assert!(json2.starts_with('['));
+        assert!(
+            !json2.starts_with("[,"),
+            "Second batch must not start with '[,'"
+        );
+        assert!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&json2).is_ok(),
+            "Second batch must be valid JSON"
+        );
     }
 }

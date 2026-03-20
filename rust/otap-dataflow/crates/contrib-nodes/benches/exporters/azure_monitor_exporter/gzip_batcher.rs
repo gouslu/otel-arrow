@@ -11,12 +11,14 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use otap_df_contrib_nodes::exporters::azure_monitor_exporter::{GzipBatcher, PushResult};
 use rand::RngExt;
 
-/// Pre-generate unique entries of `size` bytes with the given entropy profile.
+/// Pre-generate unique JSON entries of `size` bytes with the given entropy profile.
+/// All profiles produce valid JSON to match the batcher's design envelope.
 fn generate_entries(kind: &str, size: usize, count: usize) -> Vec<Vec<u8>> {
     let mut rng = rand::rng();
     (0..count)
         .map(|_| match kind {
             "json_log" => {
+                // Realistic structured log: repeating keys, random values, random message.
                 let id = rng.random_range(100000..999999);
                 let ts = rng.random_range(1700000000u64..1700100000);
                 let sev = ["DEBUG", "INFO", "WARN", "ERROR"][rng.random_range(0..4usize)];
@@ -30,15 +32,35 @@ fn generate_entries(kind: &str, size: usize, count: usize) -> Vec<Vec<u8>> {
                     .collect();
                 format!("{base}{msg}{closing}").into_bytes()
             }
-            "hex" => {
+            "json_hex" => {
+                // Minimal JSON with random hex value (medium entropy).
+                let base = r#"{"v":""#;
+                let closing = r#""}"#;
                 let hex = b"0123456789abcdef";
-                (0..size)
-                    .map(|_| hex[rng.random_range(0..16usize)])
-                    .collect()
+                let val_len = size.saturating_sub(base.len() + closing.len());
+                let val: String = (0..val_len)
+                    .map(|_| hex[rng.random_range(0..16usize)] as char)
+                    .collect();
+                format!("{base}{val}{closing}").into_bytes()
             }
-            "ascii" => (0..size)
-                .map(|_| rng.random_range(b' '..=b'~'))
-                .collect(),
+            "json_ascii" => {
+                // Minimal JSON with random printable ASCII value (high entropy).
+                let base = r#"{"v":""#;
+                let closing = r#""}"#;
+                let val_len = size.saturating_sub(base.len() + closing.len());
+                let val: String = (0..val_len)
+                    .map(|_| {
+                        // Printable ASCII excluding quotes and backslashes to keep valid JSON.
+                        loop {
+                            let c = rng.random_range(b' '..=b'~');
+                            if c != b'"' && c != b'\\' {
+                                return c as char;
+                            }
+                        }
+                    })
+                    .collect();
+                format!("{base}{val}{closing}").into_bytes()
+            }
             _ => unreachable!(),
         })
         .collect()
@@ -47,7 +69,7 @@ fn generate_entries(kind: &str, size: usize, count: usize) -> Vec<Vec<u8>> {
 fn bench_fill_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("gzip_batcher/fill_batch");
 
-    for kind in ["json_log", "hex", "ascii"] {
+    for kind in ["json_log", "json_hex", "json_ascii"] {
         for entry_size in [256, 512, 1024] {
             for level in [1u32, 6, 9] {
                 // Dry-run with a large pool to find how many rows fill a batch
