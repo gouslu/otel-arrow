@@ -522,7 +522,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                                 token_expiry_at = tokio::time::Instant::now()
                                     + tokio::time::Duration::from_secs(remaining_secs);
 
-                                otel_info!("azure_monitor_exporter.auth.token_refreshed");
+                                otel_info!("azure_monitor_exporter.auth.token_acquired");
                             }
                             Err(e) => {
                                 otel_error!("azure_monitor_exporter.auth.header_creation_failed", error = ?e);
