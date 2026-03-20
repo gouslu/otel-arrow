@@ -83,7 +83,7 @@ impl GzipBatcher {
 
     /// Push an entry into the batcher. Returns the push result.
     #[inline]
-    pub fn push(&mut self, data: &[u8]) -> Result<PushResult, Error> {
+    pub fn push(&mut self, data: Bytes) -> Result<PushResult, Error> {
         if self.pending_batch.is_some() {
             return Ok(PushResult::BatchReady(self.batch_id));
         }
@@ -91,7 +91,7 @@ impl GzipBatcher {
         self.push_internal(data)
     }
 
-    fn push_internal(&mut self, data: &[u8]) -> Result<PushResult, Error> {
+    fn push_internal(&mut self, data: Bytes) -> Result<PushResult, Error> {
         // Account for structural JSON bytes: '[' or ',' prefix + ']' for finalization.
         // Reject entries that can't possibly fit in a single batch.
         if data.len() + 2 > TARGET_LIMIT {
@@ -151,7 +151,7 @@ impl GzipBatcher {
                 self.buf.write_all(b",").map_err(Error::BatchPushFailed)?;
                 self.uncompressed_size += 1;
             }
-            self.buf.write_all(data).map_err(Error::BatchPushFailed)?;
+            self.buf.write_all(&data).map_err(Error::BatchPushFailed)?;
             self.uncompressed_size += data.len();
             self.row_count += 1;
 
@@ -282,7 +282,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(1);
         assert!(!batcher.has_pending_data());
 
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         assert!(batcher.has_pending_data());
 
         let _ = batcher.finalize().unwrap();
@@ -294,7 +294,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(1);
         assert!(batcher.take_pending_batch().is_none());
 
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         let _ = batcher.finalize().unwrap();
 
         let batch = batcher.take_pending_batch();
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_push_single_entry() {
         let mut batcher = GzipBatcher::new(1);
-        match batcher.push(&generate_1kb_data()).unwrap() {
+        match batcher.push(generate_1kb_data().into()).unwrap() {
             PushResult::Ok(id) => assert_eq!(id, 1),
             _ => panic!("Should be Ok"),
         }
@@ -317,7 +317,7 @@ mod tests {
     fn test_push_too_large_entry() {
         let mut batcher = GzipBatcher::new(1);
         let large_data = vec![b'x'; ONE_MB];
-        match batcher.push(&large_data).unwrap() {
+        match batcher.push(large_data.into()).unwrap() {
             PushResult::TooLarge => {} // Expected
             _ => panic!("Should be TooLarge"),
         }
@@ -328,7 +328,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(1);
         // Max allowed: TARGET_LIMIT - 2 (for '[' and ']')
         let data = vec![b'x'; TARGET_LIMIT - 2];
-        match batcher.push(&data).unwrap() {
+        match batcher.push(data.into()).unwrap() {
             PushResult::Ok(_) | PushResult::BatchReady(_) => {} // Expected
             PushResult::TooLarge => panic!("Should fit"),
         }
@@ -340,13 +340,13 @@ mod tests {
 
         // Force a pending batch
         loop {
-            if let PushResult::BatchReady(_) = batcher.push(&generate_1kb_data()).unwrap() {
+            if let PushResult::BatchReady(_) = batcher.push(generate_1kb_data().into()).unwrap() {
                 break;
             }
         }
 
         // Subsequent pushes should return BatchReady
-        match batcher.push(&generate_1kb_data()).unwrap() {
+        match batcher.push(generate_1kb_data().into()).unwrap() {
             PushResult::BatchReady(_) => {}
             _ => panic!("Should return BatchReady"),
         }
@@ -359,7 +359,7 @@ mod tests {
 
         for _ in 0..3 {
             loop {
-                match batcher.push(&generate_1kb_data()).unwrap() {
+                match batcher.push(generate_1kb_data().into()).unwrap() {
                     PushResult::Ok(_) => continue,
                     PushResult::BatchReady(id) => {
                         assert!(id > last_id);
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn test_flush_with_data() {
         let mut batcher = GzipBatcher::new(1);
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
 
         match batcher.finalize().unwrap() {
             FinalizeResult::Ok => {
@@ -404,12 +404,12 @@ mod tests {
         let mut batcher = GzipBatcher::new(1);
 
         // Batch 1
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         let _ = batcher.finalize().unwrap();
         let b1 = batcher.take_pending_batch().unwrap();
 
         // Batch 2
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         let _ = batcher.finalize().unwrap();
         let b2 = batcher.take_pending_batch().unwrap();
 
@@ -422,7 +422,7 @@ mod tests {
     fn test_output_is_valid_gzip_json_array() {
         let mut batcher = GzipBatcher::new(1);
         for _ in 0..10 {
-            let _ = batcher.push(&generate_1kb_data()).unwrap();
+            let _ = batcher.push(generate_1kb_data().into()).unwrap();
         }
         let _ = batcher.finalize().unwrap();
 
@@ -437,7 +437,7 @@ mod tests {
     fn test_row_count_accuracy() {
         let mut batcher = GzipBatcher::new(1);
         for _ in 0..42 {
-            let _ = batcher.push(&generate_1kb_data()).unwrap();
+            let _ = batcher.push(generate_1kb_data().into()).unwrap();
         }
         let _ = batcher.finalize().unwrap();
         assert_eq!(batcher.take_pending_batch().unwrap().row_count, 42);
@@ -447,11 +447,11 @@ mod tests {
     fn test_interleaved_push_and_take() {
         let mut batcher = GzipBatcher::new(1);
 
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         let _ = batcher.finalize().unwrap();
         let _ = batcher.take_pending_batch();
 
-        let _ = batcher.push(&generate_1kb_data()).unwrap();
+        let _ = batcher.push(generate_1kb_data().into()).unwrap();
         let _ = batcher.finalize().unwrap();
         let b2 = batcher.take_pending_batch().unwrap();
 
@@ -463,8 +463,8 @@ mod tests {
     #[test]
     fn test_no_leading_comma_after_bracket() {
         let mut batcher = GzipBatcher::new(1);
-        let _ = batcher.push(b"1").unwrap();
-        let _ = batcher.push(b"2").unwrap();
+        let _ = batcher.push(Bytes::from_static(b"1")).unwrap();
+        let _ = batcher.push(Bytes::from_static(b"2")).unwrap();
         let _ = batcher.finalize().unwrap();
 
         let json = decompress_and_validate(&batcher.take_pending_batch().unwrap().compressed_data);
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn test_no_trailing_comma_before_bracket() {
         let mut batcher = GzipBatcher::new(1);
-        let _ = batcher.push(b"1").unwrap();
+        let _ = batcher.push(Bytes::from_static(b"1")).unwrap();
         let _ = batcher.finalize().unwrap();
 
         let json = decompress_and_validate(&batcher.take_pending_batch().unwrap().compressed_data);
@@ -487,7 +487,7 @@ mod tests {
 
         // Fill until split
         loop {
-            if let PushResult::BatchReady(_) = batcher.push(&generate_1kb_data()).unwrap() {
+            if let PushResult::BatchReady(_) = batcher.push(generate_1kb_data().into()).unwrap() {
                 break;
             }
         }
@@ -506,7 +506,7 @@ mod tests {
 
         // Fill first batch and discard
         loop {
-            if let PushResult::BatchReady(_) = batcher.push(&generate_1kb_data()).unwrap() {
+            if let PushResult::BatchReady(_) = batcher.push(generate_1kb_data().into()).unwrap() {
                 break;
             }
         }
@@ -515,8 +515,8 @@ mod tests {
         // Second batch
         // Note: This batch will start with the "spillover" entry that triggered the previous BatchReady.
         // We append more data to it.
-        let _ = batcher.push(b"1").unwrap();
-        let _ = batcher.push(b"2").unwrap();
+        let _ = batcher.push(Bytes::from_static(b"1")).unwrap();
+        let _ = batcher.push(Bytes::from_static(b"2")).unwrap();
         let _ = batcher.finalize().unwrap();
 
         // decompress_and_validate checks for [, and ,] and [] wrapping
@@ -550,7 +550,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(compression_level);
         loop {
             let chunk = gen_chunk();
-            match batcher.push(&chunk).unwrap() {
+            match batcher.push(chunk.into()).unwrap() {
                 PushResult::Ok(_) => continue,
                 PushResult::BatchReady(_) => break,
                 PushResult::TooLarge => panic!("Should not happen with small chunks"),
@@ -670,7 +670,7 @@ mod tests {
                     .map(|_| hex[rng.random_range(0..16usize)] as char)
                     .collect();
                 let entry = format!(r#"{{"v":"{val}"}}"#).into_bytes();
-                match batcher.push(&entry).unwrap() {
+                match batcher.push(entry.into()).unwrap() {
                     PushResult::Ok(_) => continue,
                     PushResult::BatchReady(_) => break,
                     PushResult::TooLarge => panic!("Should not happen"),
@@ -693,7 +693,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(6);
         // Push data that's just under the limit minus structural overhead
         let data = vec![b'a'; TARGET_LIMIT - 3]; // -3 for '[', ']', and slack
-        match batcher.push(&data).unwrap() {
+        match batcher.push(data.into()).unwrap() {
             PushResult::Ok(_) => {}
             other => panic!("Expected Ok, got {:?}", std::mem::discriminant(&other)),
         }
@@ -712,7 +712,7 @@ mod tests {
         let mut batcher = GzipBatcher::new(1);
         // Exactly TARGET_LIMIT - 1: too large because +2 for structural bytes
         let data = vec![b'x'; TARGET_LIMIT - 1];
-        match batcher.push(&data).unwrap() {
+        match batcher.push(data.into()).unwrap() {
             PushResult::TooLarge => {} // Expected: data.len() + 2 > TARGET_LIMIT
             _ => panic!("Should be TooLarge"),
         }
@@ -728,7 +728,7 @@ mod tests {
 
         // Fill until we trigger at least one flush, then finalize.
         loop {
-            match batcher.push(&generate_1kb_data()).unwrap() {
+            match batcher.push(generate_1kb_data().into()).unwrap() {
                 PushResult::Ok(_) => continue,
                 PushResult::BatchReady(_) => break,
                 PushResult::TooLarge => panic!("Should not happen"),
@@ -752,7 +752,7 @@ mod tests {
         for level in [1u32, 6, 9] {
             let mut batcher = GzipBatcher::new(level);
             loop {
-                match batcher.push(&generate_1kb_data()).unwrap() {
+                match batcher.push(generate_1kb_data().into()).unwrap() {
                     PushResult::Ok(_) => continue,
                     PushResult::BatchReady(_) => break,
                     PushResult::TooLarge => panic!("Should not happen"),
@@ -775,7 +775,7 @@ mod tests {
 
         // Fill first batch
         loop {
-            if let PushResult::BatchReady(_) = batcher.push(&generate_1kb_data()).unwrap() {
+            if let PushResult::BatchReady(_) = batcher.push(generate_1kb_data().into()).unwrap() {
                 break;
             }
         }
@@ -790,7 +790,7 @@ mod tests {
         );
 
         // The spillover entry already started batch 2. Add more and finalize.
-        let _ = batcher.push(b"1").unwrap();
+        let _ = batcher.push(Bytes::from_static(b"1")).unwrap();
         let _ = batcher.finalize().unwrap();
 
         let b2 = batcher.take_pending_batch().unwrap();

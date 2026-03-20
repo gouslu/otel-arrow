@@ -251,7 +251,8 @@ impl AzureMonitorExporter {
         let log_entries = self.transformer.convert_to_log_analytics(logs_view);
 
         for log_entry in log_entries {
-            match self.gzip_batcher.push(&log_entry) {
+            let entry_len = log_entry.len();
+            match self.gzip_batcher.push(log_entry) {
                 Ok(gzip_batcher::PushResult::Ok(batch_id)) => {
                     // current batch id is being associated with the current message
                     self.state.add_batch_msg_relationship(batch_id, msg_id);
@@ -267,7 +268,7 @@ impl AzureMonitorExporter {
                     otel_warn!(
                         "azure_monitor_exporter.message.log_entry_too_large",
                         msg_id = msg_id,
-                        size_bytes = log_entry.len()
+                        size_bytes = entry_len
                     );
                     if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
                         effect_handler

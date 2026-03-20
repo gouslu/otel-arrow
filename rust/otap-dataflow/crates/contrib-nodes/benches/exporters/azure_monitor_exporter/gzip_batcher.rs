@@ -7,6 +7,7 @@
 #![allow(unused_results)]
 #![allow(clippy::print_stderr)]
 
+use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use otap_df_contrib_nodes::exporters::azure_monitor_exporter::{GzipBatcher, PushResult};
 use rand::RngExt;
@@ -73,13 +74,16 @@ fn bench_fill_batch(c: &mut Criterion) {
         for entry_size in [256, 512, 1024] {
             for level in [1u32, 6, 9] {
                 // Dry-run with a large pool to find how many rows fill a batch
-                let pool = generate_entries(kind, entry_size, 10000);
+                let pool: Vec<Bytes> = generate_entries(kind, entry_size, 10000)
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect();
                 let (rows_per_batch, compressed_size) = {
                     let mut batcher = GzipBatcher::new(level);
                     let mut count = 0usize;
                     for entry in &pool {
                         count += 1;
-                        match batcher.push(entry).expect("push failed") {
+                        match batcher.push(entry.clone()).expect("push failed") {
                             PushResult::Ok(_) => continue,
                             PushResult::BatchReady(_) => break,
                             PushResult::TooLarge => panic!("entry should fit"),
@@ -96,7 +100,10 @@ fn bench_fill_batch(c: &mut Criterion) {
                 };
 
                 // Pre-generate exactly the right amount of unique entries
-                let entries = generate_entries(kind, entry_size, rows_per_batch);
+                let entries: Vec<Bytes> = generate_entries(kind, entry_size, rows_per_batch)
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect();
                 let bytes_per_batch = rows_per_batch as u64 * entry_size as u64;
                 let ratio = compressed_size as f64 / bytes_per_batch as f64 * 100.0;
 
@@ -114,7 +121,7 @@ fn bench_fill_batch(c: &mut Criterion) {
                         b.iter(|| {
                             let mut batcher = GzipBatcher::new(level);
                             for entry in entries {
-                                match batcher.push(entry).expect("push failed") {
+                                match batcher.push(entry.clone()).expect("push failed") {
                                     PushResult::Ok(_) => continue,
                                     PushResult::BatchReady(_) => {
                                         let batch =
