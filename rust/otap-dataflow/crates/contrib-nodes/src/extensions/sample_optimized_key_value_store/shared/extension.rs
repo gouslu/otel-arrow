@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use otap_df_engine::shared::capability::KeyValueStore;
 use otap_df_engine::capability::registry::Error;
+use otap_df_telemetry::otel_info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,15 +32,19 @@ impl SampleOptimizedKeyValueStore {
 #[async_trait]
 impl KeyValueStore for SampleOptimizedKeyValueStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.data.read().await.get(key).cloned())
+        let result = self.data.read().await.get(key).cloned();
+        otel_info!("sample_optimized_kv.shared.get", key = key, found = result.is_some());
+        Ok(result)
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<(), Error> {
+        otel_info!("sample_optimized_kv.shared.set", key = key, value_len = value.len());
         let _ = self.data.write().await.insert(key.to_string(), value);
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), Error> {
+        otel_info!("sample_optimized_kv.shared.delete", key = key);
         let _ = self.data.write().await.remove(key);
         Ok(())
     }

@@ -234,6 +234,7 @@ crypto-openssl = ["otap-df-otap/crypto-openssl"]
 contrib-exporters = ["otap-df-contrib-nodes/contrib-exporters"]
 geneva-exporter = ["otap-df-contrib-nodes/geneva-exporter"]
 azure-monitor-exporter = ["otap-df-contrib-nodes/azure-monitor-exporter"]
+shared-kv-exporter = ["otap-df-contrib-nodes/shared-kv-exporter"]
 # Contrib extensions (opt-in) - now in contrib-nodes
 contrib-extensions = ["otap-df-contrib-nodes/contrib-extensions"]
 azure-identity-auth-extension = ["otap-df-contrib-nodes/azure-identity-auth-extension"]

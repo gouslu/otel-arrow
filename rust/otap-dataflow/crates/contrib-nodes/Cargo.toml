@@ -56,6 +56,7 @@ urlencoding = { version = "2", optional = true }
 contrib-exporters = [
     "geneva-exporter",
     "azure-monitor-exporter",
+    "shared-kv-exporter",
 ]
 contrib-extensions = [
     "azure-identity-auth-extension",
@@ -97,6 +98,7 @@ recordset-kql-processor = [
     "dep:chrono",
 ]
 resource-validator-processor = []
+shared-kv-exporter = []
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
