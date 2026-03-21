@@ -22,8 +22,10 @@
 //! # Example
 //!
 //! ```ignore
-//! // In a node factory, consumers ask for a handle:
-//! let auth = capabilities.require::<BearerTokenProvider>()?;
+//! // In a node factory, consumers ask for a capability:
+//! let auth = capabilities.require_local::<BearerTokenProvider>()?;
+//! // Or for shared (Send) consumers:
+//! let kv = capabilities.require_shared::<KeyValueStore>()?;
 //!
 //! // Lower-level trait lookup remains available inside engine internals:
 //! let provider: Box<dyn shared::BearerTokenProvider> = registry
@@ -746,8 +748,8 @@ pub trait CapabilityHandle: private::HandleSealed + Sized {
 pub struct Capabilities {
     local_resolved: HashMap<TypeId, local::RegistryEntry>,
     shared_resolved: HashMap<TypeId, shared::RegistryEntry>,
-    /// Tracks which capability names were accessed via `require()` or `optional()`.
-    /// Uses `RefCell` so that `require`/`optional` can take `&self`.
+    /// Tracks which capability names were accessed via `require_local()`, `require_shared()`, etc.
+    /// Uses `RefCell` so that these methods can take `&self`.
     accessed_capability_names: RefCell<HashSet<&'static str>>,
     /// Tracks whether any local variant was consumed.
     accessed_local: RefCell<bool>,
@@ -799,7 +801,7 @@ impl Capabilities {
     }
 
     /// Returns the capability names that were resolved from config bindings
-    /// but never consumed by the factory via `require()` or `optional()`.
+    /// but never consumed by the factory via `require_local()`, `require_shared()`, etc.
     ///
     /// Called by the engine after the factory `create()` returns to detect
     /// misconfigured or unnecessary capability bindings.
@@ -820,13 +822,13 @@ impl Capabilities {
             .collect()
     }
 
-    /// Returns `true` if any local variant was consumed by `require()` or `optional()`.
+    /// Returns `true` if any local variant was consumed by `require_local()` or `optional_local()`.
     #[must_use]
     pub fn consumed_local(&self) -> bool {
         *self.accessed_local.borrow()
     }
 
-    /// Returns `true` if any shared variant was consumed by `require()` or `optional()`.
+    /// Returns `true` if any shared variant was consumed by `require_shared()` or `optional_shared()`.
     #[must_use]
     pub fn consumed_shared(&self) -> bool {
         *self.accessed_shared.borrow()
@@ -1426,7 +1428,7 @@ mod tests {
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),
-            "after require(), should be empty: {unused:?}"
+            "after require_local(), should be empty: {unused:?}"
         );
     }
 

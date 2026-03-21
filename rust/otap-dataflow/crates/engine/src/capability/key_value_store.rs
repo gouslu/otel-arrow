@@ -3,7 +3,8 @@
 
 //! Key-value store capability.
 //!
-//! Types, local/shared traits, and the dispatch handle — all in one place.
+//! The `#[capability]` macro generates local/shared traits, the `SharedAsLocal`
+//! adapter, the handle enum, and registry glue from a single trait definition.
 //! Mirrors Go's `storage.Client` interface.
 
 use otap_df_engine_macros::capability;

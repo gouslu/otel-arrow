@@ -3,10 +3,14 @@
 
 //! Bearer token provider capability.
 //!
-//! Types, local/shared traits, and the dispatch handle — all in one place.
-//! Use `local::BearerTokenProvider` or `shared::BearerTokenProvider` for
-//! trait implementations. Use the top-level `BearerTokenProvider` handle
-//! in consumers.
+//! Shared data types (`BearerToken`, `Secret`) are defined here alongside the
+//! `#[capability]` macro invocation that generates local/shared traits, the
+//! `SharedAsLocal` adapter, the handle enum, and registry glue.
+//!
+//! Extension authors import via `local::capability::BearerTokenProvider` and
+//! `shared::capability::BearerTokenProvider`. Consumers use
+//! `capabilities.require_local::<BearerTokenProvider>()` or
+//! `capabilities.require_shared::<BearerTokenProvider>()`.
 
 use std::borrow::Cow;
 

@@ -3,11 +3,12 @@
 
 //! Capability handle definitions and registry.
 //!
-//! Each capability has a handle enum that dispatches between local and shared
-//! trait variants. The registry stores and resolves capability bindings.
+//! Each capability is defined via the `#[capability]` proc macro, which generates
+//! local/shared trait variants, a `SharedAsLocal` adapter, a handle enum, and
+//! registry glue. The registry stores and resolves capability bindings.
 //!
-//! Capability traits themselves live in [`crate::local::capability`] and
-//! [`crate::shared::capability`].
+//! Consumer code uses `capabilities.require_local::<H>()` or
+//! `capabilities.require_shared::<H>()` in node factories.
 
 /// Capability registry and sealed trait infrastructure.
 pub mod registry;

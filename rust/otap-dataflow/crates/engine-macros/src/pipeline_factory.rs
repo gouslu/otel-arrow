@@ -79,7 +79,7 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
 
         /// The factory registry instance.
         #registry_vis static #registry_name: std::sync::LazyLock<PipelineFactory<#pdata_type>> = std::sync::LazyLock::new(|| {
-            // Reference build_registry to avoid unused import warning, even though we don't call it
+            // Reference build_factory to avoid unused import warning, even though we don't call it
             let _ = build_factory::<#pdata_type>;
             PipelineFactory::with_extensions(
                 &#receiver_factories_name,

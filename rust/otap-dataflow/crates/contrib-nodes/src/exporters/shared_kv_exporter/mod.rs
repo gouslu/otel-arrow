@@ -31,9 +31,6 @@ use std::sync::Arc;
 pub const SHARED_KV_EXPORTER_URN: &str = "urn:otel:exporter:shared_kv";
 
 /// A minimal shared exporter that uses the key-value store capability.
-///
-/// Holds the `Box<dyn SharedKeyValueStoreTrait>` directly (which is `Send`)
-/// rather than the handle enum (which is `!Send` due to the `Local(Rc<…>)` variant).
 pub struct SharedKvExporter {
     kv: Box<dyn SharedKeyValueStoreTrait>,
 }
@@ -112,7 +109,7 @@ impl Exporter<OtapPdata> for SharedKvExporter {
                 }
                 Message::PData(data) => {
                     count += 1;
-                    otel_info!("shared_kv_exporter.received", total_count = count);
+                    otel_debug!("shared_kv_exporter.received", total_count = count);
 
                     // Persist count every 100 messages to exercise the KV store regularly.
                     if count.is_multiple_of(100) {
