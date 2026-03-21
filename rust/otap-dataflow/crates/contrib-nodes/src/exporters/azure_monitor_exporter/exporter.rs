@@ -39,14 +39,16 @@ use std::rc::Rc;
 
 /// Max concurrent HTTP requests in flight to the Logs Ingestion API.
 ///
-/// Approximation using Little's Law (L = λ × W):
-///   - λ (throughput): LA API allows ~500 req/min per DCR (~8 req/s, estimated)
-///   - W (latency): p99 response time ~0.5-1s (estimated, varies by region/load)
-///   - L ≈ 8 × 0.5 = 4 slots minimum, doubled for burst headroom ≈ 8
+/// Azure Monitor Logs Ingestion API service limits per DCR (as of Mar 2026):
+///   - up to 12,000 requests per minute
+///   - up to 2 GB per minute
+///   - max 1 MB per API call
 ///
-/// Set to 16 to absorb transient latency spikes without throttling.
-/// Worst-case memory for pending requests is roughly: 16 × 1MB = 16MB.
-/// These are rough estimates — tune based on observed metrics in production.
+/// This exporter keeps a conservative in-flight cap of 16 to absorb transient
+/// latency spikes while limiting concurrent request pressure.
+///
+/// In-flight request body memory upper bound is roughly: 16 × 1MB = 16MB.
+/// Total exporter memory can be higher due to batcher spillover and state maps.
 const MAX_IN_FLIGHT_EXPORTS: usize = 16;
 const PERIODIC_EXPORT_INTERVAL: u64 = 3;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
@@ -252,49 +254,52 @@ impl AzureMonitorExporter {
 
         for log_entry in log_entries {
             let entry_len = log_entry.len();
-            match self.gzip_batcher.push(log_entry) {
-                Ok(gzip_batcher::PushResult::Ok(batch_id)) => {
-                    // current batch id is being associated with the current message
-                    self.state.add_batch_msg_relationship(batch_id, msg_id);
-                }
-                Ok(gzip_batcher::PushResult::BatchReady(new_batch_id)) => {
-                    // new batch id is being associated with the current message
-                    self.state.add_batch_msg_relationship(new_batch_id, msg_id);
-                    self.queue_pending_batch(effect_handler).await?;
-                }
-                Ok(gzip_batcher::PushResult::TooLarge) => {
-                    let error = Error::LogEntryTooLarge;
-                    self.metrics.borrow_mut().add_log_entry_too_large();
-                    otel_warn!(
-                        "azure_monitor_exporter.message.log_entry_too_large",
-                        msg_id = msg_id,
-                        size_bytes = entry_len
-                    );
-                    if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
-                        effect_handler
-                            .notify_nack(NackMsg::new(
-                                error.to_string(),
-                                OtapPdata::new(context, payload),
-                            ))
-                            .await?;
+            let mut pending_entry = Some(log_entry);
+            while let Some(entry) = pending_entry.take() {
+                match self.gzip_batcher.push(entry.clone()) {
+                    Ok(gzip_batcher::PushResult::Ok(batch_id)) => {
+                        // Current batch id is associated with the current message.
+                        self.state.add_batch_msg_relationship(batch_id, msg_id);
                     }
-                    return Err(EngineError::InternalError {
-                        message: error.to_string(),
-                    });
-                }
-                Err(error) => {
-                    otel_error!("azure_monitor_exporter.message.batch_push_failed", msg_id = msg_id, error = %error);
-                    if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
-                        effect_handler
-                            .notify_nack(NackMsg::new(
-                                error.to_string(),
-                                OtapPdata::new(context, payload),
-                            ))
-                            .await?;
+                    Ok(gzip_batcher::PushResult::BatchReady(_)) => {
+                        // Pending batch is full and queued first, then retry the same entry.
+                        self.queue_pending_batch(effect_handler).await?;
+                        pending_entry = Some(entry);
                     }
-                    return Err(EngineError::InternalError {
-                        message: error.to_string(),
-                    });
+                    Ok(gzip_batcher::PushResult::TooLarge) => {
+                        let error = Error::LogEntryTooLarge;
+                        self.metrics.borrow_mut().add_log_entry_too_large();
+                        otel_warn!(
+                            "azure_monitor_exporter.message.log_entry_too_large",
+                            msg_id = msg_id,
+                            size_bytes = entry_len
+                        );
+                        if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
+                            effect_handler
+                                .notify_nack(NackMsg::new(
+                                    error.to_string(),
+                                    OtapPdata::new(context, payload),
+                                ))
+                                .await?;
+                        }
+                        return Err(EngineError::InternalError {
+                            message: error.to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        otel_error!("azure_monitor_exporter.message.batch_push_failed", msg_id = msg_id, error = %error);
+                        if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
+                            effect_handler
+                                .notify_nack(NackMsg::new(
+                                    error.to_string(),
+                                    OtapPdata::new(context, payload),
+                                ))
+                                .await?;
+                        }
+                        return Err(EngineError::InternalError {
+                            message: error.to_string(),
+                        });
+                    }
                 }
             }
         }

@@ -11,6 +11,7 @@ use super::error::Error;
 const ONE_MB: usize = 1024 * 1024; // 1 MiB (1,048,576 bytes) -- hard limit
 const TARGET_LIMIT: usize = 1015 * 1024; // 1015 KiB (1,039,360 bytes) -- soft target
 const MAX_GZIP_FLUSH_COUNT: usize = 100;
+const REPLAY_DROP_FACTOR: usize = 2;
 
 /// Accumulates JSON entries into gzip-compressed batches that stay under a size limit.
 pub struct GzipBatcher {
@@ -22,6 +23,8 @@ pub struct GzipBatcher {
     flush_count: usize,
     batch_id: u64,
     pending_batch: Option<GzipResult>,
+    current_rows: Vec<Bytes>,
+    spillover_rows: Vec<Bytes>,
 }
 
 /// Result of pushing an entry into the batcher.
@@ -68,6 +71,8 @@ impl GzipBatcher {
             flush_count: 0,
             batch_id: 0,
             pending_batch: None,
+            current_rows: Vec::new(),
+            spillover_rows: Vec::new(),
         }
     }
 
@@ -86,6 +91,23 @@ impl GzipBatcher {
     pub fn push(&mut self, data: Bytes) -> Result<PushResult, Error> {
         if self.pending_batch.is_some() {
             return Ok(PushResult::BatchReady(self.batch_id));
+        }
+
+        if !self.spillover_rows.is_empty() {
+            let mut spillover_iter = std::mem::take(&mut self.spillover_rows).into_iter();
+            while let Some(row) = spillover_iter.next() {
+                let result = self.push_internal(row)?;
+
+                if matches!(result, PushResult::TooLarge) {
+                    self.spillover_rows.extend(spillover_iter);
+                    return Ok(PushResult::TooLarge);
+                }
+
+                if self.pending_batch.is_some() {
+                    self.spillover_rows.extend(spillover_iter);
+                    return Ok(PushResult::BatchReady(self.batch_id));
+                }
+            }
         }
 
         self.push_internal(data)
@@ -132,19 +154,9 @@ impl GzipBatcher {
 
         if must_finalize {
             let finalize_result = self.finalize()?;
-            // We attempt to push the data to the next batch.
-            // If this fails, we propagate the error.
-            // Note: If finalize succeeded, we have a pending batch ready.
-            // The recursive push will start a new batch (id+1).
-            let _ = self.push_internal(data)?;
-
             match finalize_result {
                 FinalizeResult::Empty => Ok(PushResult::Ok(self.batch_id)),
-                FinalizeResult::Ok => {
-                    // this is the new batch id that we are currently building
-                    // the pending batch id is available in the pending_batch field
-                    Ok(PushResult::BatchReady(self.batch_id))
-                }
+                FinalizeResult::Ok => Ok(PushResult::BatchReady(self.batch_id)),
             }
         } else {
             if !is_first_entry {
@@ -154,6 +166,8 @@ impl GzipBatcher {
             self.buf.write_all(&data).map_err(Error::BatchPushFailed)?;
             self.uncompressed_size += data.len();
             self.row_count += 1;
+            // Track only rows that were actually written into the current gzip stream.
+            self.current_rows.push(data);
 
             Ok(PushResult::Ok(self.batch_id))
         }
@@ -171,19 +185,12 @@ impl GzipBatcher {
 
         let old_buf = std::mem::replace(&mut self.buf, Self::new_encoder(self.compression));
 
-        let compressed_data = old_buf.finish().map_err(Error::BatchFinalizeFailed)?;
+        let mut compressed_data = old_buf.finish().map_err(Error::BatchFinalizeFailed)?;
 
         // Hard limit: reject batches that exceed ONE_MB despite the TARGET_LIMIT.
         // Reset state before returning so the batcher can recover cleanly.
         if compressed_data.len() > ONE_MB {
-            self.remaining_size = TARGET_LIMIT;
-            self.uncompressed_size = 0;
-            self.row_count = 0;
-            self.flush_count = 0;
-            return Err(Error::BatchFinalizeFailed(std::io::Error::other(format!(
-                "batch exceeded hard limit: {} bytes (target was {TARGET_LIMIT})",
-                compressed_data.len()
-            ))));
+            compressed_data = self.recover_from_oversize_batch(compressed_data.len())?;
         }
 
         let row_count = self.row_count;
@@ -194,6 +201,7 @@ impl GzipBatcher {
         self.uncompressed_size = 0;
         self.row_count = 0;
         self.flush_count = 0;
+        self.current_rows.clear();
 
         self.pending_batch = Some(GzipResult {
             batch_id: self.batch_id,
@@ -203,6 +211,91 @@ impl GzipBatcher {
         });
 
         Ok(FinalizeResult::Ok)
+    }
+
+    fn recover_from_oversize_batch(&mut self, oversized_len: usize) -> Result<Vec<u8>, Error> {
+        self.clip_tail_for_spillover(oversized_len);
+        let mut compressed = self.replay_and_compress()?;
+
+        while compressed.len() > ONE_MB && self.current_rows.len() > 1 {
+            self.clip_tail_for_spillover(compressed.len());
+            compressed = self.replay_and_compress()?;
+        }
+
+        if compressed.len() > ONE_MB {
+            return Err(Error::BatchFinalizeFailed(std::io::Error::other(
+                "batch exceeds 1 MiB hard limit after oversize recovery",
+            )));
+        }
+
+        self.current_rows.clear();
+
+        // self.start_new_batch_after_recovery();
+        Ok(compressed)
+    }
+
+    fn replay_and_compress(&mut self) -> Result<Vec<u8>, Error> {
+        let mut encoder = GzEncoder::new(Vec::with_capacity(ONE_MB), self.compression);
+        encoder
+            .write_all(b"[")
+            .map_err(Error::BatchFinalizeFailed)?;
+
+        for (i, row) in self.current_rows.iter().enumerate() {
+            if i > 0 {
+                encoder
+                    .write_all(b",")
+                    .map_err(Error::BatchFinalizeFailed)?;
+            }
+            encoder
+                .write_all(row)
+                .map_err(Error::BatchFinalizeFailed)?;
+        }
+
+        encoder
+            .write_all(b"]")
+            .map_err(Error::BatchFinalizeFailed)?;
+        encoder
+            .finish()
+            .map_err(Error::BatchFinalizeFailed)
+    }
+
+    fn clip_tail_for_spillover(&mut self, oversized_len: usize) {
+        if self.current_rows.is_empty() {
+            self.spillover_rows.clear();
+            self.row_count = 0;
+            self.uncompressed_size = 0;
+            return;
+        }
+
+        let overshoot = oversized_len.saturating_sub(ONE_MB);
+        let drop_target = (overshoot * REPLAY_DROP_FACTOR).max(1);
+
+        let mut removed_bytes = 0usize;
+        let mut split_index = self.current_rows.len();
+        while split_index > 1 && removed_bytes < drop_target {
+            split_index -= 1;
+            // +1 for comma between rows in the JSON array.
+            removed_bytes += self.current_rows[split_index].len() + 1;
+        }
+
+        let mut newly_removed_tail = self.current_rows.split_off(split_index);
+        newly_removed_tail.extend(self.spillover_rows.drain(..));
+        self.spillover_rows = newly_removed_tail;
+
+        self.row_count = self.current_rows.len() as u64;
+        self.uncompressed_size = if self.current_rows.is_empty() {
+            0
+        } else {
+            self.current_rows
+                .iter()
+                .map(Bytes::len)
+                .sum::<usize>()
+                .saturating_add(self.current_rows.len() - 1)
+        };
+
+        // Old stream was consumed in finalize; keep counters coherent for next recovery step.
+        self.flush_count = 0;
+        self.remaining_size = TARGET_LIMIT;
     }
 
     /// Take the pending completed batch, if any.
@@ -590,7 +683,7 @@ mod tests {
         );
     }
 
-    /// JSON with random hex payload -- near-incompressible realistic worst case.
+    /// JSON with random hex payload for low-compressibility coverage.
     fn generate_hex_json(size: usize) -> Vec<u8> {
         let mut rng = rand::rng();
         let hex = b"0123456789abcdef";
@@ -613,7 +706,7 @@ mod tests {
         }
     }
 
-    /// Near-incompressible JSON: minimal object with random hex value.
+    /// Hex-payload JSON: minimal object with random hex value.
     #[test]
     fn test_batch_utilization_hex_json_data() {
         for level in [1u32, 6, 9] {
@@ -654,12 +747,9 @@ mod tests {
         }
     }
 
-    /// Worst-case realistic scenario: minimal JSON with a random hex value.
-    /// The JSON framing (`{"v":"..."}`) provides some redundancy, but the
-    /// random hex payload is near-incompressible. This is the hardest
-    /// realistic case for the size accounting.
+    /// Stress test with minimal JSON and random hex payload.
     #[test]
-    fn test_1mb_limit_with_near_incompressible_json() {
+    fn test_1mb_limit_with_hex_json_payload() {
         let hex = b"0123456789abcdef";
         let mut rng = rand::rng();
         for _ in 0..5 {
@@ -680,7 +770,7 @@ mod tests {
             let batch = batcher.take_pending_batch().unwrap();
             assert!(
                 batch.compressed_data.len() <= ONE_MB,
-                "Batch size {} exceeds 1MB limit with near-incompressible JSON",
+                "Batch size {} exceeds 1MB limit with hex-payload JSON",
                 batch.compressed_data.len()
             );
         }
