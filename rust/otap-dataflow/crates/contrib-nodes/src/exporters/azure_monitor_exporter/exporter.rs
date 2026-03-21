@@ -8,7 +8,7 @@ use otap_df_engine::ConsumerEffectHandlerExtension;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
-use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
+use otap_df_engine::local::capability::BearerTokenProvider as LocalBearerTokenProvider;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
 use otap_df_engine::message::{Message, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
@@ -57,7 +57,7 @@ const TOKEN_EXPIRY_BUFFER_SECS: u64 = 295;
 /// Azure Monitor exporter.
 pub struct AzureMonitorExporter {
     config: Config,
-    auth: BearerTokenProvider,
+    auth: Rc<dyn LocalBearerTokenProvider>,
     transformer: Transformer,
     gzip_batcher: GzipBatcher,
     state: AzureMonitorExporterState,
@@ -73,7 +73,7 @@ impl AzureMonitorExporter {
     pub fn new(
         pipeline_ctx: PipelineContext,
         config: Config,
-        auth: BearerTokenProvider,
+        auth: Rc<dyn LocalBearerTokenProvider>,
     ) -> Result<Self, Error> {
         // Validate configuration
         config
@@ -618,10 +618,8 @@ mod tests {
     use bytes::Bytes;
     use http::StatusCode;
     use otap_df_engine::context::{ControllerContext, PipelineContext};
-    use otap_df_engine::capability::bearer_token_provider::{
-        BearerToken, BearerTokenProvider as HandleBearerTokenProvider,
-    };
-    use otap_df_engine::local::capability::BearerTokenProvider as LocalBearerTokenProvider;
+    use otap_df_engine::capability::bearer_token_provider::BearerToken;
+    use otap_df_engine::local::capability::BearerTokenProvider as LocalBearerTokenProviderTrait;
     use otap_df_engine::local::exporter::EffectHandler;
     use otap_df_engine::node::NodeId;
     use otap_df_otap::pdata::Context;
@@ -642,7 +640,7 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl LocalBearerTokenProvider for MockTokenProvider {
+    impl LocalBearerTokenProviderTrait for MockTokenProvider {
         async fn get_token(
             &self,
         ) -> Result<BearerToken, otap_df_engine::capability::registry::Error> {
@@ -654,8 +652,8 @@ mod tests {
         }
     }
 
-    fn create_mock_auth() -> HandleBearerTokenProvider {
-        HandleBearerTokenProvider::Local(Rc::new(MockTokenProvider::new()))
+    fn create_mock_auth() -> Rc<dyn LocalBearerTokenProviderTrait> {
+        Rc::new(MockTokenProvider::new())
     }
 
     fn create_test_pipeline_ctx() -> PipelineContext {

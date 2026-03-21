@@ -8,18 +8,11 @@
 //! trait implementations. Use the top-level `BearerTokenProvider` handle
 //! in consumers.
 
-use async_trait::async_trait;
 use std::borrow::Cow;
-use std::rc::Rc;
 
-// Register the capability.
-crate::register_capability!(
-    BearerTokenProvider,
-    local::BearerTokenProvider,
-    shared::BearerTokenProvider,
-    "bearer_token_provider",
-    "Provides bearer tokens for authenticated HTTP/gRPC requests",
-);
+use otap_df_engine_macros::capability;
+
+type Error = super::registry::Error;
 
 // ── Shared data types ───────────────────────────────────────────────────────
 
@@ -91,89 +84,17 @@ impl BearerToken {
     }
 }
 
-// ── Local trait ─────────────────────────────────────────────────────────────
-
-// The local/shared trait variants are defined inline here so that types
-// (BearerToken, Secret, Error) and traits live together without cross-folder
-// dependencies. However, extension authors should import via the root-level
-// re-exports at `local::capability::BearerTokenProvider` and
-// `shared::capability::BearerTokenProvider` — not through these inline mods.
-// The #[doc(hidden)] attribute steers discovery toward the re-exports.
-
-/// Local (!Send) bearer token provider trait.
-#[doc(hidden)]
-pub mod local {
-    use super::*;
-
-    /// A bearer token provider for local (!Send) contexts.
-    #[async_trait(?Send)]
-    pub trait BearerTokenProvider {
-        /// Returns an authentication token.
-        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
-
-        /// Subscribes to token refresh events.
-        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
-    }
-}
-
-// ── Shared trait ────────────────────────────────────────────────────────────
-
-/// Shared (Send) bearer token provider trait.
-#[doc(hidden)]
-pub mod shared {
-    use super::*;
-
-    /// A bearer token provider for shared (Send) contexts.
-    #[async_trait]
-    pub trait BearerTokenProvider: Send {
-        /// Returns an authentication token.
-        async fn get_token(&self) -> Result<BearerToken, super::super::registry::Error>;
-
-        /// Subscribes to token refresh events.
-        fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
-    }
-}
-
-// ── Handle ──────────────────────────────────────────────────────────────────
+// ── Capability ──────────────────────────────────────────────────────────────
 
 /// Handle that dispatches to either the local or shared variant.
-pub enum BearerTokenProvider {
-    /// Rc-based variant for local consumers.
-    Local(Rc<dyn local::BearerTokenProvider>),
-    /// Box-based variant for shared consumers.
-    Shared(Box<dyn shared::BearerTokenProvider>),
-}
+#[capability(
+    name = "bearer_token_provider",
+    description = "Provides bearer tokens for authenticated HTTP/gRPC requests",
+)]
+pub trait BearerTokenProvider {
+    /// Returns an authentication token.
+    async fn get_token(&self) -> Result<BearerToken, Error>;
 
-impl BearerTokenProvider {
-    /// Returns an authentication token from the underlying provider.
-    pub async fn get_token(&self) -> Result<BearerToken, super::registry::Error> {
-        match self {
-            Self::Local(p) => p.get_token().await,
-            Self::Shared(p) => p.get_token().await,
-        }
-    }
-
-    /// Subscribes to token refresh events from the underlying provider.
-    pub fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>> {
-        match self {
-            Self::Local(p) => p.subscribe_token_refresh(),
-            Self::Shared(p) => p.subscribe_token_refresh(),
-        }
-    }
-}
-
-impl super::registry::CapabilityHandle for BearerTokenProvider {
-    const CAPABILITY_NAME: &'static str =
-        <Self as super::registry::ExtensionCapability>::NAME;
-
-    type Local = dyn local::BearerTokenProvider;
-    type Shared = dyn shared::BearerTokenProvider;
-
-    fn from_local(local: Rc<dyn local::BearerTokenProvider>) -> Self {
-        Self::Local(local)
-    }
-
-    fn from_shared(shared: Box<<Self as super::registry::CapabilityHandle>::Shared>) -> Self {
-        Self::Shared(shared)
-    }
+    /// Subscribes to token refresh events.
+    fn subscribe_token_refresh(&self) -> tokio::sync::watch::Receiver<Option<BearerToken>>;
 }

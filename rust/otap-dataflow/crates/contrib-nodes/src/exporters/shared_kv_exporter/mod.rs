@@ -10,8 +10,7 @@
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
-use otap_df_engine::capability::key_value_store;
-use otap_df_engine::capability::registry::ConsumerType;
+use otap_df_engine::capability::key_value_store::KeyValueStore;
 use otap_df_engine::config::ExporterConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NodeControlMsg};
@@ -50,19 +49,7 @@ pub static SHARED_KV_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              exporter_config: &ExporterConfig,
              capabilities: &otap_df_engine::capability::registry::Capabilities| {
 
-        let handle = capabilities
-            .require::<key_value_store::KeyValueStore>(ConsumerType::Shared)?;
-
-        // Extract the Send-compatible inner from the handle.
-        let kv = match handle {
-            key_value_store::KeyValueStore::Shared(boxed) => boxed,
-            key_value_store::KeyValueStore::Local(_) => {
-                return Err(otap_df_config::error::Error::InvalidUserConfig {
-                    error: "shared_kv_exporter requires a shared KeyValueStore capability"
-                        .to_string(),
-                });
-            }
-        };
+        let kv = capabilities.require_shared::<KeyValueStore>()?;
 
         Ok(ExporterWrapper::shared(
             SharedKvExporter { kv },

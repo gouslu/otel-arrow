@@ -25,6 +25,7 @@ otap-df-config = { path = "../config" }
 otap-df-state = { path = "../state" }
 otap-df-telemetry = { path = "../telemetry" }
 otap-df-telemetry-macros = { path = "../telemetry-macros" }
+otap-df-engine-macros = { path = "../engine-macros" }
 
 thiserror = { workspace = true }
 serde_json = { workspace = true }

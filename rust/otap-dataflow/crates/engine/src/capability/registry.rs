@@ -441,7 +441,7 @@ impl CapabilityRegistry {
 
             // 4. The specific extension must provide the requested capability.
             //    Populate both local and shared entries — the consumer picks
-            //    which variant to use via ConsumerType at require() time.
+            //    which variant to use via require_local() or require_shared().
             let mut found_any = false;
 
             let matched_local_entries: Vec<_> = self
@@ -721,15 +721,9 @@ pub trait CapabilityHandle: private::HandleSealed + Sized {
     fn from_local(local: Rc<Self::Local>) -> Self;
     /// Construct the handle wrapping a shared variant (`Box`-based).
     fn from_shared(shared: Box<Self::Shared>) -> Self;
-}
-
-/// Whether the consumer is a local or shared node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumerType {
-    /// Local node on a single-threaded LocalSet.
-    Local,
-    /// Shared node that may run on multi-threaded executors.
-    Shared,
+    /// Adapt a shared capability to a local one via an adapter.
+    /// This enables transparent fallback for local consumers.
+    fn adapt_shared_as_local(shared: Box<Self::Shared>) -> Rc<Self::Local>;
 }
 
 // ── Capabilities (per-node resolved bindings) ────────────────────────────────
@@ -737,20 +731,17 @@ pub enum ConsumerType {
 /// Per-node resolved capability bindings.
 ///
 /// Produced by [`CapabilityRegistry::resolve_bindings`] during pipeline build.
-/// Nodes use `require()`, `optional()`, or `get_handle()` in their factory to
-/// retrieve capabilities.
+/// Nodes use `require_local()`, `require_shared()`, `optional_local()`, or
+/// `optional_shared()` in their factory to retrieve capabilities.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Required capability — fails with a clear error if not bound
-/// let auth = capabilities.require::<BearerTokenProvider>(
-///     ConsumerType::Local,
-///     "bearer_token_provider",
-/// )?;
+/// // Required local capability — prefers local, falls back to shared via adapter
+/// let auth = capabilities.require_local::<BearerTokenProvider>()?;
 ///
-/// // Optional capability — returns None if not bound
-/// let enrichment = capabilities.optional::<DatasetLookupHandle>();
+/// // Required shared capability — Send-compatible, no enum wrapper
+/// let kv = capabilities.require_shared::<KeyValueStore>()?;
 /// ```
 pub struct Capabilities {
     local_resolved: HashMap<TypeId, local::RegistryEntry>,
@@ -837,23 +828,23 @@ impl Capabilities {
         *self.accessed_shared.borrow()
     }
 
-    /// Require a capability handle.
+    // ── Typed capability API ────────────────────────────────────────────
+
+    /// Require a local capability.
     ///
-    /// The `consumer_type` determines which variant is returned:
-    /// - `ConsumerType::Local` — tries local first, falls back to shared
-    /// - `ConsumerType::Shared` — shared only
+    /// Returns `Rc<dyn local::Trait>`. Tries the local variant first; if
+    /// unavailable, falls back to shared via the `SharedAsLocal` adapter.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let auth = capabilities.require::<BearerTokenProvider>(ConsumerType::Local)?;
-    /// auth.get_token().await?;
+    /// let auth: Rc<dyn local::BearerTokenProvider> =
+    ///     capabilities.require_local::<BearerTokenProvider>()?;
     /// ```
-    pub fn require<H: CapabilityHandle>(
+    pub fn require_local<H: CapabilityHandle>(
         &self,
-        consumer_type: ConsumerType,
-    ) -> Result<H, otap_df_config::error::Error> {
-        self.get::<H>(consumer_type).ok_or_else(|| {
+        ) -> Result<Rc<H::Local>, otap_df_config::error::Error> {
+        self.get_local::<H>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: format!(
                     "Missing required capability '{}'. Add to your node config:\n  capabilities:\n    {}: <extension_instance_name>",
@@ -864,78 +855,92 @@ impl Capabilities {
         })
     }
 
-    /// Get an optional capability handle.
+    /// Require a shared capability.
     ///
-    /// Returns `None` if the capability was not configured for this node.
+    /// Returns `Box<dyn shared::Trait>` (which is `Send`). Only the shared
+    /// variant is considered — local-only extensions will cause an error.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// if let Some(auth) = capabilities.optional::<BearerTokenProvider>(ConsumerType::Local) {
-    ///     auth.get_token().await?;
-    /// }
+    /// let kv: Box<dyn shared::KeyValueStore> =
+    ///     capabilities.require_shared::<KeyValueStore>()?;
     /// ```
-    pub fn optional<H: CapabilityHandle>(&self, consumer_type: ConsumerType) -> Option<H> {
-        self.get::<H>(consumer_type)
+    pub fn require_shared<H: CapabilityHandle>(
+        &self,
+    ) -> Result<Box<H::Shared>, otap_df_config::error::Error> {
+        self.get_shared::<H>().ok_or_else(|| {
+            otap_df_config::error::Error::InvalidUserConfig {
+                error: format!(
+                    "Missing required shared capability '{}'. The extension must provide a shared (Send) implementation.\n  capabilities:\n    {}: <extension_instance_name>",
+                    H::CAPABILITY_NAME,
+                    H::CAPABILITY_NAME,
+                ),
+            }
+        })
     }
 
-    /// Get a capability handle, selecting the local or shared variant
-    /// based on the consumer type.
+    /// Get an optional local capability.
     ///
-    /// For local consumers, tries the local variant first. If unavailable,
-    /// falls back to the shared variant (shared impls work on local nodes too).
-    /// For shared consumers, always uses the shared variant.
-    fn get<H: CapabilityHandle>(&self, consumer_type: ConsumerType) -> Option<H> {
-        let resolved = match consumer_type {
-            ConsumerType::Local => {
-                // Prefer local variant; fall back to shared
-                if let Some(local) = self.get_local_raw::<H::Local>() {
-                    *self.accessed_local.borrow_mut() = true;
-                    otel_debug!(
-                        "capabilities.get.local_resolved",
-                        capability = H::CAPABILITY_NAME,
-                        variant = "local",
-                    );
-                    Some(H::from_local(local))
-                } else {
-                    self.get_shared_raw::<H::Shared>().map(|shared| {
-                        *self.accessed_shared.borrow_mut() = true;
-                        otel_debug!(
-                            "capabilities.get.local_fallback_to_shared",
-                            capability = H::CAPABILITY_NAME,
-                            variant = "shared (fallback)",
-                        );
-                        H::from_shared(shared)
-                    })
-                }
-            }
-            ConsumerType::Shared => self.get_shared_raw::<H::Shared>().map(|shared| {
-                *self.accessed_shared.borrow_mut() = true;
-                otel_debug!(
-                    "capabilities.get.shared_resolved",
-                    capability = H::CAPABILITY_NAME,
-                    variant = "shared",
-                );
-                H::from_shared(shared)
-            }),
-        };
+    /// Returns `None` if the capability was not configured for this node.
+    pub fn optional_local<H: CapabilityHandle>(&self) -> Option<Rc<H::Local>> {
+        self.get_local::<H>()
+    }
 
-        if resolved.is_none() {
-            otel_debug!(
-                "capabilities.get.not_found",
-                capability = H::CAPABILITY_NAME,
-                consumer_type = ?consumer_type,
-            );
-        }
+    /// Get an optional shared capability.
+    ///
+    /// Returns `None` if the capability was not configured or no shared
+    /// variant is available.
+    pub fn optional_shared<H: CapabilityHandle>(&self) -> Option<Box<H::Shared>> {
+        self.get_shared::<H>()
+    }
 
-        if resolved.is_some() {
+    /// Internal: get local capability with fallback to shared via adapter.
+    fn get_local<H: CapabilityHandle>(&self) -> Option<Rc<H::Local>> {
+        // Prefer local variant
+        if let Some(local) = self.get_local_raw::<H::Local>() {
+            *self.accessed_local.borrow_mut() = true;
             let _ = self
                 .accessed_capability_names
                 .borrow_mut()
                 .insert(H::CAPABILITY_NAME);
+            otel_debug!(
+                "capabilities.get_local.local_resolved",
+                capability = H::CAPABILITY_NAME,
+            );
+            return Some(local);
         }
+        // Fall back: wrap shared as local via adapter
+        if let Some(shared) = self.get_shared_raw::<H::Shared>() {
+            *self.accessed_shared.borrow_mut() = true;
+            let _ = self
+                .accessed_capability_names
+                .borrow_mut()
+                .insert(H::CAPABILITY_NAME);
+            otel_debug!(
+                "capabilities.get_local.shared_fallback",
+                capability = H::CAPABILITY_NAME,
+            );
+            return Some(H::adapt_shared_as_local(shared));
+        }
+        None
+    }
 
-        resolved
+    /// Internal: get shared capability (no fallback).
+    fn get_shared<H: CapabilityHandle>(&self) -> Option<Box<H::Shared>> {
+        if let Some(shared) = self.get_shared_raw::<H::Shared>() {
+            *self.accessed_shared.borrow_mut() = true;
+            let _ = self
+                .accessed_capability_names
+                .borrow_mut()
+                .insert(H::CAPABILITY_NAME);
+            otel_debug!(
+                "capabilities.get_shared.resolved",
+                capability = H::CAPABILITY_NAME,
+            );
+            return Some(shared);
+        }
+        None
     }
 
     /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
@@ -1149,7 +1154,7 @@ mod tests {
         let caps = registry
             .resolve_bindings(&bindings)
             .unwrap();
-        let handle = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
+        let handle = caps.require_local::<BearerTokenProviderHandle>().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1400,7 +1405,7 @@ mod tests {
     #[test]
     fn test_require_missing_capability() {
         let caps = Capabilities::new();
-        let result = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local);
+        let result = caps.require_local::<BearerTokenProviderHandle>();
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("Missing required capability"), "{msg}");
@@ -1424,7 +1429,7 @@ mod tests {
         assert_eq!(unused, vec!["bearer_token_provider"]);
 
         // After accessing, none are unused.
-        let _ = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
+        let _ = caps.require_local::<BearerTokenProviderHandle>().unwrap();
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),
@@ -1442,7 +1447,7 @@ mod tests {
             .resolve_bindings(&bindings)
             .unwrap();
 
-        let auth = caps.require::<BearerTokenProviderHandle>(ConsumerType::Local).unwrap();
+        let auth = caps.require_local::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "local_token");
     }
@@ -1457,7 +1462,7 @@ mod tests {
             .resolve_bindings(&bindings)
             .unwrap();
 
-        let auth = caps.require::<BearerTokenProviderHandle>(ConsumerType::Shared).unwrap();
+        let auth = caps.require_shared::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "shared_token");
     }
@@ -1473,7 +1478,7 @@ mod tests {
             .unwrap();
 
         // Shared consumer should not get local-only capability
-        let result = caps.require::<BearerTokenProviderHandle>(ConsumerType::Shared);
+        let result = caps.require_shared::<BearerTokenProviderHandle>();
         assert!(result.is_err());
     }
 }
