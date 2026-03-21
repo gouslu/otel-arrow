@@ -4,6 +4,7 @@
 //! Async Pipeline Engine
 
 use crate::{
+    capability::registry::{Capabilities, CapabilityRegistry},
     channel_metrics::{
         CHANNEL_IMPL_FLUME, CHANNEL_IMPL_INTERNAL, CHANNEL_IMPL_TOKIO, CHANNEL_KIND_PDATA,
         CHANNEL_MODE_LOCAL, CHANNEL_MODE_SHARED, CHANNEL_TYPE_MPMC, CHANNEL_TYPE_MPSC,
@@ -16,7 +17,6 @@ use crate::{
     error::{Error, TypedError},
     exporter::ExporterWrapper,
     extension::ExtensionWrapper,
-    capability::registry::{Capabilities, CapabilityRegistry},
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -49,10 +49,10 @@ use std::{
     sync::OnceLock,
 };
 
+pub mod capability;
 pub mod error;
 pub mod exporter;
 pub mod extension;
-pub mod capability;
 pub mod message;
 pub mod processor;
 pub mod receiver;
@@ -1540,9 +1540,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let create = factory.create;
 
         let capabilities = capability_registry
-            .resolve_bindings(
-                &node_config.capabilities,
-            )
+            .resolve_bindings(&node_config.capabilities)
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let receiver = create(
             (*pipeline_ctx).clone(),
@@ -1626,9 +1624,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let create = factory.create;
 
         let capabilities = capability_registry
-            .resolve_bindings(
-                &node_config.capabilities,
-            )
+            .resolve_bindings(&node_config.capabilities)
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let processor = create(
             (*pipeline_ctx).clone(),
@@ -1712,9 +1708,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let create = factory.create;
 
         let capabilities = capability_registry
-            .resolve_bindings(
-                &node_config.capabilities,
-            )
+            .resolve_bindings(&node_config.capabilities)
             .map_err(|e| Error::ConfigError(Box::new(e)))?;
         let exporter = create(
             (*pipeline_ctx).clone(),

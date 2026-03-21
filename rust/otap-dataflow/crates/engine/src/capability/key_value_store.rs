@@ -13,7 +13,7 @@ type Error = super::registry::Error;
 /// Handle that dispatches to either the local or shared variant.
 #[capability(
     name = "key_value_store",
-    description = "Provides key-value storage (get/set/delete) for pipeline components",
+    description = "Provides key-value storage (get/set/delete) for pipeline components"
 )]
 pub trait KeyValueStore {
     /// Retrieves the value associated with the given key.

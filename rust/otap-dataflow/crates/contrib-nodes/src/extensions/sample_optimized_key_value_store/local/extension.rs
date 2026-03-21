@@ -7,8 +7,8 @@
 //! sharing on a single-threaded LocalSet.
 
 use async_trait::async_trait;
-use otap_df_engine::local::capability::KeyValueStore;
 use otap_df_engine::capability::registry::Error;
+use otap_df_engine::local::capability::KeyValueStore;
 use std::cell::RefCell;
 use std::collections::HashMap;
 

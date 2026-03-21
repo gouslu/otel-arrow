@@ -551,7 +551,9 @@ macro_rules! register_capability {
         // ── Coercion glue: shared_capabilities / local_capabilities ─────
         impl $handle {
             /// Build shared capability registrations for this handle.
-            pub fn shared_capabilities<T>(instance: &T) -> Vec<$crate::capability::registry::shared::CapabilityRegistration>
+            pub fn shared_capabilities<T>(
+                instance: &T,
+            ) -> Vec<$crate::capability::registry::shared::CapabilityRegistration>
             where
                 T: Clone + Send + 'static + $shared_trait,
             {
@@ -572,7 +574,8 @@ macro_rules! register_capability {
                         trait_id: std::any::TypeId::of::<Box<dyn $shared_trait>>(),
                         value: Box::new(val.clone()),
                         coerce: coerce::<TInner>,
-                        capability_name: <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
+                        capability_name:
+                            <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
                     }
                 }
 
@@ -580,7 +583,9 @@ macro_rules! register_capability {
             }
 
             /// Build local capability registrations (Rc-based) for this handle.
-            pub fn local_capabilities<T>(instance: &std::rc::Rc<T>) -> Vec<$crate::capability::registry::local::CapabilityRegistration>
+            pub fn local_capabilities<T>(
+                instance: &std::rc::Rc<T>,
+            ) -> Vec<$crate::capability::registry::local::CapabilityRegistration>
             where
                 T: 'static + $local_trait,
             {
@@ -601,7 +606,8 @@ macro_rules! register_capability {
                         trait_id: std::any::TypeId::of::<std::rc::Rc<dyn $local_trait>>(),
                         value: std::rc::Rc::clone(rc) as std::rc::Rc<dyn std::any::Any>,
                         coerce: coerce::<TInner>,
-                        capability_name: <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
+                        capability_name:
+                            <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
                     }
                 }
 
@@ -693,12 +699,6 @@ macro_rules! extension_capabilities {
 
 // ── Capabilities ─────────────────────────────────────────────────────────
 
-/// Per-node capability instances resolved from config bindings.
-///
-/// Built by the engine from the node's `capabilities` config section and
-/// the global [`CapabilityRegistry`]. Nodes receive this at factory time
-/// and look up capabilities by type only — no extension names needed.
-///
 // ── CapabilityHandle ─────────────────────────────────────────────────────────
 
 /// Trait for handle types that dispatch between local and shared capability variants.
@@ -809,7 +809,11 @@ impl Capabilities {
         self.local_resolved
             .values()
             .map(|entry| entry.capability_name)
-            .chain(self.shared_resolved.values().map(|entry| entry.capability_name))
+            .chain(
+                self.shared_resolved
+                    .values()
+                    .map(|entry| entry.capability_name),
+            )
             .filter(|name| !accessed.contains(name))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -843,7 +847,7 @@ impl Capabilities {
     /// ```
     pub fn require_local<H: CapabilityHandle>(
         &self,
-        ) -> Result<Rc<H::Local>, otap_df_config::error::Error> {
+    ) -> Result<Rc<H::Local>, otap_df_config::error::Error> {
         self.get_local::<H>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: format!(
@@ -1129,8 +1133,9 @@ mod tests {
         let caps = crate::extension_capabilities!(TestTokenProvider => BearerTokenProviderHandle);
         registry.register_all_shared("ext", (caps.register_shared)(&instance));
 
-        let provider: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
+        let provider: Box<dyn SharedBearerTokenProvider> = registry
+            .get::<dyn SharedBearerTokenProvider>("ext")
+            .unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let token = rt.block_on(provider.get_token()).unwrap();
@@ -1144,16 +1149,12 @@ mod tests {
         let rc: Rc<dyn Any> = Rc::new(LocalOnlyTokenProvider {
             token: "local_token".to_string(),
         });
-        let caps = crate::extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
+        let caps =
+            crate::extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
         registry.register_all_local("ext", (caps.register_local)(Rc::clone(&rc)));
 
-        let bindings = HashMap::from([(
-            "bearer_token_provider".to_string(),
-            "ext".to_string(),
-        )]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let bindings = HashMap::from([("bearer_token_provider".to_string(), "ext".to_string())]);
+        let caps = registry.resolve_bindings(&bindings).unwrap();
         let handle = caps.require_local::<BearerTokenProviderHandle>().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1179,10 +1180,12 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "ext", "shared_test");
 
-        let a: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
-        let b: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
+        let a: Box<dyn SharedBearerTokenProvider> = registry
+            .get::<dyn SharedBearerTokenProvider>("ext")
+            .unwrap();
+        let b: Box<dyn SharedBearerTokenProvider> = registry
+            .get::<dyn SharedBearerTokenProvider>("ext")
+            .unwrap();
 
         // Both are independent clones (different pointers)
         assert!(!std::ptr::eq(
@@ -1198,8 +1201,9 @@ mod tests {
 
         let cloned = registry.clone();
 
-        let from_original: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
+        let from_original: Box<dyn SharedBearerTokenProvider> = registry
+            .get::<dyn SharedBearerTokenProvider>("ext")
+            .unwrap();
         let from_clone: Box<dyn SharedBearerTokenProvider> =
             cloned.get::<dyn SharedBearerTokenProvider>("ext").unwrap();
 
@@ -1262,8 +1266,9 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "auth", "real_token");
 
-        let provider: Box<dyn SharedBearerTokenProvider> =
-            registry.get::<dyn SharedBearerTokenProvider>("auth").unwrap();
+        let provider: Box<dyn SharedBearerTokenProvider> = registry
+            .get::<dyn SharedBearerTokenProvider>("auth")
+            .unwrap();
         let token = provider.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "real_token");
     }
@@ -1291,9 +1296,7 @@ mod tests {
             "bearer_token_provider".to_string(),
             "nonexistent".to_string(),
         )]);
-        let err = registry
-            .resolve_bindings(&bindings)
-            .unwrap_err();
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("nonexistent"),
@@ -1307,9 +1310,7 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
         let bindings = HashMap::from([("totally_made_up".to_string(), "azure_auth".to_string())]);
-        let err = registry
-            .resolve_bindings(&bindings)
-            .unwrap_err();
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Unknown capability"),
@@ -1330,9 +1331,7 @@ mod tests {
             "bearer_token_provider".to_string(),
             "azure_auth".to_string(),
         )]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let caps = registry.resolve_bindings(&bindings).unwrap();
         assert!(!caps.is_empty());
     }
 
@@ -1366,9 +1365,7 @@ mod tests {
         register_fake_capability(&mut registry, "other_ext", "other_cap");
         let bindings =
             HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
-        let err = registry
-            .resolve_bindings(&bindings)
-            .unwrap_err();
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no loaded extension provides it"),
@@ -1387,9 +1384,7 @@ mod tests {
         register_fake_capability(&mut registry, "other_ext", "other_cap");
         let bindings =
             HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
-        let err = registry
-            .resolve_bindings(&bindings)
-            .unwrap_err();
+        let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("does not provide capability"),
@@ -1420,9 +1415,7 @@ mod tests {
             "bearer_token_provider".to_string(),
             "azure_auth".to_string(),
         )]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Before any access, all bindings are unused.
         let unused = caps.unused_bindings();
@@ -1443,9 +1436,7 @@ mod tests {
         register_dual_provider(&mut registry, "auth", "local_token", "shared_token");
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let caps = registry.resolve_bindings(&bindings).unwrap();
 
         let auth = caps.require_local::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
@@ -1458,9 +1449,7 @@ mod tests {
         register_dual_provider(&mut registry, "auth", "local_token", "shared_token");
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let caps = registry.resolve_bindings(&bindings).unwrap();
 
         let auth = caps.require_shared::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
@@ -1473,9 +1462,7 @@ mod tests {
         register_local_only_provider(&mut registry, "auth", "local_only_token");
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
-        let caps = registry
-            .resolve_bindings(&bindings)
-            .unwrap();
+        let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Shared consumer should not get local-only capability
         let result = caps.require_shared::<BearerTokenProviderHandle>();

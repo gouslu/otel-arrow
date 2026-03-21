@@ -10,10 +10,10 @@
 
 use async_trait::async_trait;
 use azure_core::credentials::TokenCredential;
-use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::capability::bearer_token_provider::BearerToken;
-use otap_df_engine::local::capability::BearerTokenProvider;
+use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::extension::{ControlChannel, EffectHandler};
+use otap_df_engine::local::capability::BearerTokenProvider;
 use otap_df_engine::local::extension::Extension;
 use otap_df_engine::terminal_state::TerminalState;
 use std::sync::Arc;

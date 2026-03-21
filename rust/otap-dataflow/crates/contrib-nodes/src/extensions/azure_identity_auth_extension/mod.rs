@@ -40,10 +40,10 @@
 use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ExtensionFactory;
+use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::{Active, ExtensionWrapper};
-use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
 use otap_df_engine::node::NodeId;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -95,24 +95,22 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
             })?;
 
         // Create both variants from the same config
-        let local_ext = local::AzureIdentityAuthExtension::new(
-            node.name.to_string(),
-            cfg.clone(),
-        ).map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
-            error: e.to_string(),
-        })?;
+        let local_ext = local::AzureIdentityAuthExtension::new(node.name.to_string(), cfg.clone())
+            .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+                error: e.to_string(),
+            })?;
 
-        let shared_ext = shared::AzureIdentityAuthExtension::new(
-            node.name.to_string(),
-            cfg,
-        ).map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
-            error: e.to_string(),
-        })?;
+        let shared_ext = shared::AzureIdentityAuthExtension::new(node.name.to_string(), cfg)
+            .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+                error: e.to_string(),
+            })?;
 
-        Ok(ExtensionWrapper::builder(node, node_config, extension_config)
-            .with_local(Active(Rc::new(local_ext)))
-            .with_shared(Active(shared_ext))
-            .build())
+        Ok(
+            ExtensionWrapper::builder(node, node_config, extension_config)
+                .with_local(Active(Rc::new(local_ext)))
+                .with_shared(Active(shared_ext))
+                .build(),
+        )
     },
     validate_config: otap_df_config::validation::validate_typed_config::<Config>,
 };

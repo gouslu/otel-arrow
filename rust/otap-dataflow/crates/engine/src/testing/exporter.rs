@@ -8,6 +8,7 @@
 
 use crate::ExporterFactory;
 use crate::Interests;
+use crate::capability::registry::Capabilities;
 use crate::config::ExporterConfig;
 use crate::context::{ControllerContext, PipelineContext};
 use crate::control::{
@@ -15,7 +16,6 @@ use crate::control::{
 };
 use crate::error::Error;
 use crate::exporter::ExporterWrapper;
-use crate::capability::registry::Capabilities;
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::message::{Receiver, Sender};
 use crate::node::NodeWithPDataReceiver;

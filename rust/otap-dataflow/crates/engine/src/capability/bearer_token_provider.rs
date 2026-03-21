@@ -89,7 +89,7 @@ impl BearerToken {
 /// Handle that dispatches to either the local or shared variant.
 #[capability(
     name = "bearer_token_provider",
-    description = "Provides bearer tokens for authenticated HTTP/gRPC requests",
+    description = "Provides bearer tokens for authenticated HTTP/gRPC requests"
 )]
 pub trait BearerTokenProvider {
     /// Returns an authentication token.

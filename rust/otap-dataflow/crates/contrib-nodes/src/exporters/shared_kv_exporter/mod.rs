@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
+use otap_df_engine::ExporterFactory;
 use otap_df_engine::capability::key_value_store::KeyValueStore;
 use otap_df_engine::config::ExporterConfig;
 use otap_df_engine::context::PipelineContext;
@@ -21,10 +22,9 @@ use otap_df_engine::node::NodeId;
 use otap_df_engine::shared::capability::KeyValueStore as SharedKeyValueStoreTrait;
 use otap_df_engine::shared::exporter::{EffectHandler, Exporter, MessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
-use otap_df_engine::ExporterFactory;
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
-use otap_df_telemetry::{otel_info, otel_debug, otel_warn};
+use otap_df_telemetry::{otel_debug, otel_info, otel_warn};
 use std::sync::Arc;
 
 /// The URN for the shared KV exporter.
@@ -48,7 +48,6 @@ pub static SHARED_KV_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
              capabilities: &otap_df_engine::capability::registry::Capabilities| {
-
         let kv = capabilities.require_shared::<KeyValueStore>()?;
 
         Ok(ExporterWrapper::shared(
@@ -76,11 +75,8 @@ impl Exporter<OtapPdata> for SharedKvExporter {
         // Read any previously persisted count from the KV store.
         match self.kv.get("exported_count").await {
             Ok(Some(bytes)) if bytes.len() == 8 => {
-                count = u64::from_le_bytes(bytes.try_into().unwrap());
-                otel_info!(
-                    "shared_kv_exporter.restored_count",
-                    restored_count = count
-                );
+                count = u64::from_le_bytes(bytes.try_into().expect("length checked above"));
+                otel_info!("shared_kv_exporter.restored_count", restored_count = count);
             }
             Ok(Some(_)) => {
                 otel_warn!("shared_kv_exporter.invalid_stored_count");
@@ -116,13 +112,10 @@ impl Exporter<OtapPdata> for SharedKvExporter {
                 }
                 Message::PData(data) => {
                     count += 1;
-                    otel_info!(
-                        "shared_kv_exporter.received",
-                        total_count = count
-                    );
+                    otel_info!("shared_kv_exporter.received", total_count = count);
 
                     // Persist count every 100 messages to exercise the KV store regularly.
-                    if count % 100 == 0 {
+                    if count.is_multiple_of(100) {
                         match self
                             .kv
                             .set("exported_count", count.to_le_bytes().to_vec())

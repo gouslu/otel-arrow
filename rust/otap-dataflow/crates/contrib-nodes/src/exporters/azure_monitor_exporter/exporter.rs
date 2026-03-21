@@ -617,8 +617,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::StatusCode;
-    use otap_df_engine::context::{ControllerContext, PipelineContext};
     use otap_df_engine::capability::bearer_token_provider::BearerToken;
+    use otap_df_engine::context::{ControllerContext, PipelineContext};
     use otap_df_engine::local::capability::BearerTokenProvider as LocalBearerTokenProviderTrait;
     use otap_df_engine::local::exporter::EffectHandler;
     use otap_df_engine::node::NodeId;

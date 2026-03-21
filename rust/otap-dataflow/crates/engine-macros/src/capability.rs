@@ -35,7 +35,7 @@ impl Parse for CapabilityArgs {
                     return Err(syn::Error::new(
                         key.span(),
                         format!("unknown attribute `{key}`"),
-                    ))
+                    ));
                 }
             }
             if input.peek(Token![,]) {
@@ -117,7 +117,11 @@ fn generate(
             let is_async = sig.asyncness.is_some();
             let param_names = extract_param_names(sig);
             // Preserve doc attributes from the original trait method.
-            let doc_attrs: Vec<_> = m.attrs.iter().filter(|a| a.path().is_ident("doc")).collect();
+            let doc_attrs: Vec<_> = m
+                .attrs
+                .iter()
+                .filter(|a| a.path().is_ident("doc"))
+                .collect();
             let (local_call, shared_call) = if is_async {
                 (
                     quote! { inner.#method_name(#(#param_names),*).await },

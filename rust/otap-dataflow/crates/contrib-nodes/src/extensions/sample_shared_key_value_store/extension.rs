@@ -6,9 +6,9 @@
 //! All state behind `Arc<RwLock<>>` — clone-safe and `Send`.
 
 use async_trait::async_trait;
+use otap_df_engine::capability::registry::Error;
 use otap_df_engine::local::capability::KeyValueStore as LocalKeyValueStore;
 use otap_df_engine::shared::capability::KeyValueStore;
-use otap_df_engine::capability::registry::Error;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
