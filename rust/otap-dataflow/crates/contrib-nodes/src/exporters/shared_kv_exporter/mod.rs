@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ExporterFactory;
-use otap_df_engine::capability::key_value_store::KeyValueStore;
 use otap_df_engine::config::ExporterConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NodeControlMsg};
@@ -45,7 +44,8 @@ pub static SHARED_KV_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
              capabilities: &otap_df_engine::capability::registry::Capabilities| {
-        let kv = capabilities.require_shared::<KeyValueStore>()?;
+        let kv = capabilities
+            .require_shared::<dyn otap_df_engine::shared::capability::KeyValueStore>()?;
 
         Ok(ExporterWrapper::shared(
             SharedKvExporter { kv },

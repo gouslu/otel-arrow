@@ -39,7 +39,6 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use linkme::distributed_slice;
-use otap_df_telemetry::otel_debug;
 
 // ── Static capability name registry ─────────────────────────────────────────
 
@@ -81,17 +80,6 @@ pub(crate) mod private {
         /// Must be set to [`MACRO_SEAL`]. Only the macro can do this.
         #[doc(hidden)]
         const MACRO_TOKEN: MacroToken;
-    }
-
-    /// Sealing trait for capability handle types.
-    ///
-    /// This prevents external crates from implementing
-    /// [`CapabilityHandle`](super::CapabilityHandle) and bypassing
-    /// engine-controlled handle dispatch semantics.
-    pub trait HandleSealed {
-        /// Must be set to [`MACRO_SEAL`]. Only registration macros can do this.
-        #[doc(hidden)]
-        const HANDLE_MACRO_TOKEN: MacroToken;
     }
 }
 
@@ -191,6 +179,10 @@ pub mod shared {
         pub(crate) value: Box<dyn CloneAnySend>,
         pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
         pub(crate) capability_name: &'static str,
+        /// TypeId of the corresponding local `Rc<dyn local::Trait>` for fallback.
+        pub(crate) local_trait_id: Option<TypeId>,
+        /// Produces a local entry from this shared entry (for shared→local fallback).
+        pub(crate) adapt_to_local: Option<fn(&Self) -> super::local::RegistryEntry>,
     }
 
     impl Clone for RegistryEntry {
@@ -199,6 +191,8 @@ pub mod shared {
                 value: self.value.clone(),
                 coerce: self.coerce,
                 capability_name: self.capability_name,
+                local_trait_id: self.local_trait_id,
+                adapt_to_local: self.adapt_to_local,
             }
         }
     }
@@ -209,6 +203,10 @@ pub mod shared {
         pub(crate) value: Box<dyn CloneAnySend>,
         pub(crate) coerce: fn(&dyn Any) -> Box<dyn Any + Send>,
         pub(crate) capability_name: &'static str,
+        /// TypeId of the corresponding local Rc<dyn Trait> for fallback lookup.
+        pub(crate) local_trait_id: Option<TypeId>,
+        /// Produces a local entry from this shared entry.
+        pub(crate) adapt_to_local: Option<fn(&RegistryEntry) -> super::local::RegistryEntry>,
     }
 }
 
@@ -296,6 +294,8 @@ impl CapabilityRegistry {
                 value: reg.value,
                 coerce: reg.coerce,
                 capability_name: reg.capability_name,
+                local_trait_id: reg.local_trait_id,
+                adapt_to_local: reg.adapt_to_local,
             };
             let _ = self
                 .shared_handles
@@ -470,6 +470,14 @@ impl CapabilityRegistry {
             for ((_, type_id), entry) in &matched_shared_entries {
                 capabilities.insert_shared_entry(*type_id, (*entry).clone());
                 found_any = true;
+
+                // Pre-populate local fallback from shared via adapter.
+                if let (Some(local_tid), Some(adapt)) = (entry.local_trait_id, entry.adapt_to_local)
+                {
+                    if !capabilities.has_local_entry(local_tid) {
+                        capabilities.insert_local_entry(local_tid, adapt(entry));
+                    }
+                }
             }
 
             if !found_any {
@@ -534,10 +542,6 @@ macro_rules! register_capability {
             const MACRO_TOKEN: $crate::capability::registry::private::MacroToken =
                 $crate::capability::registry::private::MACRO_SEAL;
         }
-        impl $crate::capability::registry::private::HandleSealed for $handle {
-            const HANDLE_MACRO_TOKEN: $crate::capability::registry::private::MacroToken =
-                $crate::capability::registry::private::MACRO_SEAL;
-        }
         impl $crate::capability::registry::ExtensionCapability for $handle {
             const NAME: &'static str = $name;
             const DESCRIPTION: &'static str = $description;
@@ -578,6 +582,10 @@ macro_rules! register_capability {
                         coerce: coerce::<TInner>,
                         capability_name:
                             <$handle as $crate::capability::registry::ExtensionCapability>::NAME,
+                        local_trait_id: Some(
+                            std::any::TypeId::of::<std::rc::Rc<dyn $local_trait>>(),
+                        ),
+                        adapt_to_local: Some($handle::_adapt_shared_entry_to_local),
                     }
                 }
 
@@ -701,33 +709,6 @@ macro_rules! extension_capabilities {
 
 // ── Capabilities ─────────────────────────────────────────────────────────
 
-// ── CapabilityHandle ─────────────────────────────────────────────────────────
-
-/// Trait for handle types that dispatch between local and shared capability variants.
-///
-/// Implement this on handle enums (e.g., `BearerTokenProvider`) so the
-/// registry can construct the right variant based on consumer context.
-///
-/// Local variants use `Rc<dyn Trait>` for true single-instance sharing.
-/// Shared variants use `Box<dyn Trait>` with clone-based distribution.
-pub trait CapabilityHandle: private::HandleSealed + Sized {
-    /// Stable capability name used in node config bindings.
-    const CAPABILITY_NAME: &'static str;
-
-    /// The !Send trait type for local consumers.
-    type Local: ?Sized + 'static;
-    /// The Send trait type for shared consumers.
-    type Shared: ?Sized + 'static;
-
-    /// Construct the handle wrapping a local variant (`Rc`-based).
-    fn from_local(local: Rc<Self::Local>) -> Self;
-    /// Construct the handle wrapping a shared variant (`Box`-based).
-    fn from_shared(shared: Box<Self::Shared>) -> Self;
-    /// Adapt a shared capability to a local one via an adapter.
-    /// This enables transparent fallback for local consumers.
-    fn adapt_shared_as_local(shared: Box<Self::Shared>) -> Rc<Self::Local>;
-}
-
 // ── Capabilities (per-node resolved bindings) ────────────────────────────────
 
 /// Per-node resolved capability bindings.
@@ -789,6 +770,11 @@ impl Capabilities {
         let _ = self.local_resolved.insert(type_id, entry);
     }
 
+    /// Check if a local entry exists for the given TypeId.
+    fn has_local_entry(&self, type_id: TypeId) -> bool {
+        self.local_resolved.contains_key(&type_id)
+    }
+
     /// Insert a resolved shared capability. Called by the engine during build.
     fn insert_shared_entry(&mut self, type_id: TypeId, entry: shared::RegistryEntry) {
         let _ = self.shared_resolved.insert(type_id, entry);
@@ -838,26 +824,24 @@ impl Capabilities {
 
     /// Require a local capability.
     ///
-    /// Returns `Rc<dyn local::Trait>`. Tries the local variant first; if
-    /// unavailable, falls back to shared via the `SharedAsLocal` adapter.
+    /// Returns `Rc<dyn local::Trait>`. Pre-populated fallback from shared
+    /// extensions means this is a flat lookup — no adapter logic at call time.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let auth: Rc<dyn local::BearerTokenProvider> =
-    ///     capabilities.require_local::<BearerTokenProvider>()?;
+    ///     capabilities.require_local::<dyn local::BearerTokenProvider>()?;
     /// ```
-    pub fn require_local<H: CapabilityHandle>(
+    pub fn require_local<T: crate::local::capability::Sealed + ?Sized + 'static>(
         &self,
-    ) -> Result<Rc<H::Local>, otap_df_config::error::Error> {
-        self.get_local::<H>().ok_or_else(|| {
+    ) -> Result<Rc<T>, otap_df_config::error::Error> {
+        self.get_local_raw::<T>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
-                error: format!(
-                    "Missing required capability '{}'. Add to your node config:\n  capabilities:\n    {}: <extension_instance_name>",
-                    H::CAPABILITY_NAME,
-                    H::CAPABILITY_NAME,
-                ),
+                error: "Missing required capability. Add to your node config:\n  capabilities:\n    <capability_name>: <extension_instance_name>".to_string(),
             }
+        }).inspect(|_| {
+            *self.accessed_local.borrow_mut() = true;
         })
     }
 
@@ -870,89 +854,55 @@ impl Capabilities {
     ///
     /// ```ignore
     /// let kv: Box<dyn shared::KeyValueStore> =
-    ///     capabilities.require_shared::<KeyValueStore>()?;
+    ///     capabilities.require_shared::<dyn shared::KeyValueStore>()?;
     /// ```
-    pub fn require_shared<H: CapabilityHandle>(
+    pub fn require_shared<T: crate::shared::capability::Sealed + ?Sized + 'static>(
         &self,
-    ) -> Result<Box<H::Shared>, otap_df_config::error::Error> {
-        self.get_shared::<H>().ok_or_else(|| {
+    ) -> Result<Box<T>, otap_df_config::error::Error> {
+        self.get_shared_raw::<T>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
-                error: format!(
-                    "Missing required shared capability '{}'. The extension must provide a shared (Send) implementation.\n  capabilities:\n    {}: <extension_instance_name>",
-                    H::CAPABILITY_NAME,
-                    H::CAPABILITY_NAME,
-                ),
+                error: "Missing required shared capability. The extension must provide a shared (Send) implementation.\n  capabilities:\n    <capability_name>: <extension_instance_name>".to_string(),
             }
+        }).inspect(|_| {
+            *self.accessed_shared.borrow_mut() = true;
         })
     }
 
     /// Get an optional local capability.
     ///
     /// Returns `None` if the capability was not configured for this node.
-    pub fn optional_local<H: CapabilityHandle>(&self) -> Option<Rc<H::Local>> {
-        self.get_local::<H>()
+    pub fn optional_local<T: crate::local::capability::Sealed + ?Sized + 'static>(
+        &self,
+    ) -> Option<Rc<T>> {
+        let result = self.get_local_raw::<T>();
+        if result.is_some() {
+            *self.accessed_local.borrow_mut() = true;
+        }
+        result
     }
 
     /// Get an optional shared capability.
     ///
     /// Returns `None` if the capability was not configured or no shared
     /// variant is available.
-    pub fn optional_shared<H: CapabilityHandle>(&self) -> Option<Box<H::Shared>> {
-        self.get_shared::<H>()
-    }
-
-    /// Internal: get local capability with fallback to shared via adapter.
-    fn get_local<H: CapabilityHandle>(&self) -> Option<Rc<H::Local>> {
-        // Prefer local variant
-        if let Some(local) = self.get_local_raw::<H::Local>() {
-            *self.accessed_local.borrow_mut() = true;
-            let _ = self
-                .accessed_capability_names
-                .borrow_mut()
-                .insert(H::CAPABILITY_NAME);
-            otel_debug!(
-                "capabilities.get_local.local_resolved",
-                capability = H::CAPABILITY_NAME,
-            );
-            return Some(local);
-        }
-        // Fall back: wrap shared as local via adapter
-        if let Some(shared) = self.get_shared_raw::<H::Shared>() {
+    pub fn optional_shared<T: crate::shared::capability::Sealed + ?Sized + 'static>(
+        &self,
+    ) -> Option<Box<T>> {
+        let result = self.get_shared_raw::<T>();
+        if result.is_some() {
             *self.accessed_shared.borrow_mut() = true;
-            let _ = self
-                .accessed_capability_names
-                .borrow_mut()
-                .insert(H::CAPABILITY_NAME);
-            otel_debug!(
-                "capabilities.get_local.shared_fallback",
-                capability = H::CAPABILITY_NAME,
-            );
-            return Some(H::adapt_shared_as_local(shared));
         }
-        None
-    }
-
-    /// Internal: get shared capability (no fallback).
-    fn get_shared<H: CapabilityHandle>(&self) -> Option<Box<H::Shared>> {
-        if let Some(shared) = self.get_shared_raw::<H::Shared>() {
-            *self.accessed_shared.borrow_mut() = true;
-            let _ = self
-                .accessed_capability_names
-                .borrow_mut()
-                .insert(H::CAPABILITY_NAME);
-            otel_debug!(
-                "capabilities.get_shared.resolved",
-                capability = H::CAPABILITY_NAME,
-            );
-            return Some(shared);
-        }
-        None
+        result
     }
 
     /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
     fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Rc<T>> {
         let key = TypeId::of::<Rc<T>>();
         let entry = self.local_resolved.get(&key)?;
+        let _ = self
+            .accessed_capability_names
+            .borrow_mut()
+            .insert(entry.capability_name);
         let erased = (entry.coerce)(Rc::clone(&entry.value));
         let inner = erased
             .downcast::<Rc<T>>()
@@ -964,6 +914,10 @@ impl Capabilities {
     fn get_shared_raw<T: ?Sized + 'static>(&self) -> Option<Box<T>> {
         let key = TypeId::of::<Box<T>>();
         let entry = self.shared_resolved.get(&key)?;
+        let _ = self
+            .accessed_capability_names
+            .borrow_mut()
+            .insert(entry.capability_name);
         let erased = (entry.coerce)(entry.value.as_ref().as_any_ref());
         let double_boxed = erased
             .downcast::<Box<T>>()
@@ -1157,7 +1111,9 @@ mod tests {
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "ext".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
-        let handle = caps.require_local::<BearerTokenProviderHandle>().unwrap();
+        let handle = caps
+            .require_local::<dyn LocalBearerTokenProvider>()
+            .unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1356,6 +1312,8 @@ mod tests {
                 Box::new(Box::new(concrete.clone()) as Box<dyn SharedBearerTokenProvider>)
             },
             capability_name: cap_name,
+            local_trait_id: None,
+            adapt_to_local: None,
         };
         registry.register_all_shared(ext_name, vec![reg]);
     }
@@ -1402,11 +1360,10 @@ mod tests {
     #[test]
     fn test_require_missing_capability() {
         let caps = Capabilities::new();
-        let result = caps.require_local::<BearerTokenProviderHandle>();
+        let result = caps.require_local::<dyn LocalBearerTokenProvider>();
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("Missing required capability"), "{msg}");
-        assert!(msg.contains("bearer_token_provider"), "{msg}");
     }
 
     #[test]
@@ -1424,7 +1381,9 @@ mod tests {
         assert_eq!(unused, vec!["bearer_token_provider"]);
 
         // After accessing, none are unused.
-        let _ = caps.require_local::<BearerTokenProviderHandle>().unwrap();
+        let _ = caps
+            .require_local::<dyn LocalBearerTokenProvider>()
+            .unwrap();
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),
@@ -1440,7 +1399,9 @@ mod tests {
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
-        let auth = caps.require_local::<BearerTokenProviderHandle>().unwrap();
+        let auth = caps
+            .require_local::<dyn LocalBearerTokenProvider>()
+            .unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "local_token");
     }
@@ -1453,7 +1414,9 @@ mod tests {
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
-        let auth = caps.require_shared::<BearerTokenProviderHandle>().unwrap();
+        let auth = caps
+            .require_shared::<dyn SharedBearerTokenProvider>()
+            .unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "shared_token");
     }
@@ -1467,7 +1430,7 @@ mod tests {
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Shared consumer should not get local-only capability
-        let result = caps.require_shared::<BearerTokenProviderHandle>();
+        let result = caps.require_shared::<dyn SharedBearerTokenProvider>();
         assert!(result.is_err());
     }
 }

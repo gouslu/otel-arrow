@@ -41,12 +41,13 @@ themselves, and they never touch pipeline data directly.
 |       v                 v                                |
 |  +-----------+  +-----------+                            |
 |  | Receiver  |  | Exporter  |                            |
-|  | require() |  | require() |                            |
-|  | -> Handle |  | -> Handle |                            |
+|  | require   |  | require   |                            |
+|  | _local()  |  | _shared() |                            |
+|  | -> Rc<T>  |  | -> Box<T> |                            |
 |  +-----------+  +-----------+                            |
 |                                                          |
-|  Handles dispatch to Local(Rc<dyn Trait>) or             |
-|  Shared(Box<dyn Trait>) based on ConsumerType            |
+|  Local consumers get Rc<dyn local::Trait>                |
+|  Shared consumers get Box<dyn shared::Trait> (Send)      |
 +----------------------------------------------------------+
 ```
 
@@ -85,20 +86,27 @@ themselves, and they never touch pipeline data directly.
    - **Passive:** `with_shared(Passive(ext))` — no lifecycle,
      capabilities only.
 
-5. **Handle-based capability dispatch.** Capabilities use
-   a handle enum (e.g., `BearerTokenProvider`) that wraps
-   either `Local(Rc<dyn Trait>)` or `Shared(Box<dyn Trait>)`.
-   Consumers call `capabilities.require::<Handle>(ConsumerType)`
-   — the registry selects the right variant. Local consumers
-   prefer local, fall back to shared.
+5. **Type-safe capability resolution.** Consumers call
+   `capabilities.require_local::<dyn local::Trait>()`
+   (returns `Rc<dyn local::Trait>`) or
+   `capabilities.require_shared::<dyn shared::Trait>()`
+   (returns `Box<dyn shared::Trait>`, which is `Send`).
+   The trait object type itself is the lookup key.
+   Sealed traits (`local::capability::Sealed`
+   and `shared::capability::Sealed`) ensure only
+   engine-defined capabilities are accepted at compile
+   time. Local fallback from shared extensions is
+   pre-populated at build time via `SharedAsLocal` adapters.
 
-6. **Capability co-location.** Each capability file
-   (e.g., `capability/bearer_token_provider.rs`) contains
-   the shared data types, inline `local::`/`shared::` trait
-   mods, and the dispatch handle — all in one place. This
-   eliminates cross-folder dependencies. Root-level
-   `local::capability::` and `shared::capability::` modules
-   re-export the traits for ergonomic imports.
+6. **`#[capability]` proc macro.** Each capability is
+   defined via a single `#[capability]` attribute on a
+   trait definition. The macro generates: `local::` and
+   `shared::` trait variants, a `SharedAsLocal` adapter
+   for transparent fallback, sealed trait impls, a
+   zero-sized registration struct, and all registration
+   glue. Consumers use trait objects directly. Shared
+   data types (e.g., `BearerToken`, `Secret`) are
+   hand-written alongside the macro invocation.
 
 ## Module Layout
 
@@ -110,19 +118,19 @@ engine/src/
   capability/
     mod.rs                  → module root
     registry.rs             → CapabilityRegistry, Capabilities, macros,
-                              CapabilityHandle trait, Error type
-    bearer_token_provider.rs → BearerToken, Secret, local::trait,
-                              shared::trait, handle enum
-    key_value_store.rs      → local::trait, shared::trait, handle enum
+                              Error type
+    bearer_token_provider.rs → BearerToken, Secret,
+                              #[capability] macro invocation
+    key_value_store.rs      → #[capability] macro invocation
 
   local/
     extension.rs            → Extension trait (!Send, Rc<Self>)
-    capability.rs           → re-exports: local::capability::BearerTokenProvider etc.
+    capability.rs           → re-exports + Sealed trait
     exporter.rs, receiver.rs, processor.rs  (unchanged)
 
   shared/
     extension.rs            → Extension trait (Send, Box<Self>)
-    capability.rs           → re-exports: shared::capability::BearerTokenProvider etc.
+    capability.rs           → re-exports + Sealed trait
     exporter.rs, receiver.rs, processor.rs  (unchanged)
 ```
 
@@ -142,20 +150,28 @@ use otap_df_engine::shared::capability::BearerTokenProvider;
 use otap_df_engine::shared::extension::Extension;
 ```
 
-Consumers (handle — mode-agnostic):
+Consumers (in factories):
 
 ```rust
-use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
+// Local consumer
+use otap_df_engine::local::capability::BearerTokenProvider;
+let auth = capabilities
+    .require_local::<dyn BearerTokenProvider>()?;
+
+// Shared consumer
+use otap_df_engine::shared::capability::KeyValueStore;
+let kv = capabilities
+    .require_shared::<dyn KeyValueStore>()?;
 ```
 
 ### Dependency Flow
 
 ```text
 capability/registry.rs        → Error type, macros (no deps on local/shared)
-capability/bearer_token_provider.rs → types + inline local/shared traits + handle
-    ↑                                    (self-contained, no cross-folder deps)
-local::capability   → re-exports from capability/bearer_token_provider::local
-shared::capability  → re-exports from capability/bearer_token_provider::shared
+capability/bearer_token_provider.rs → types + #[capability] macro
+    ↑                                    (generates local/shared traits + adapter)
+local::capability   → re-exports + Sealed trait
+shared::capability  → re-exports + Sealed trait
 ```
 
 All arrows point one way. No circular dependencies.
@@ -248,10 +264,20 @@ ExtensionWrapper::builder(node, config, ext_config)
 
 When both `with_local` and `with_shared` are called, the
 builder asserts at `build()` that the inner types have
-different `TypeId`s. Same-type means the developer should
-use `with_shared()` alone (piggyback pattern). This
-prevents accidentally creating two independent instances
-of the same type with disconnected state.
+different `TypeId`s. This catches a pointless pattern:
+registering the same type as both local (`Rc<T>`) and
+shared (`T`) creates two lifecycles for the same object —
+one just unnecessarily wrapped in `Rc`. Since the registry
+already wraps any shared impl in `SharedAsLocal` for local
+consumers automatically, a same-type dual registration is
+always redundant. Use `with_shared()` alone (piggyback).
+
+When both types are registered, they must be genuinely
+different — e.g., a local type using `Rc<RefCell<HashMap>>`
+(lock-free) and a shared type using `Arc<RwLock<HashMap>>`
+(thread-safe). Different `TypeId`s guarantee the two
+variants are intentionally distinct implementations, not
+accidental duplicates.
 
 #### Dual Control Channels
 
@@ -266,12 +292,12 @@ independent shutdown messages.
 
 #### register_capability! Macro
 
-A single macro registers a capability — sealing, metadata,
-link-time registration, and coercion glue:
+A declarative macro that registers a capability — sealing,
+metadata, link-time registration, and coercion glue:
 
 ```rust
 crate::register_capability!(
-    BearerTokenProvider,                 // handle type
+    BearerTokenProvider,                 // registration struct
     local::BearerTokenProvider,          // local trait
     shared::BearerTokenProvider,         // shared trait
     "bearer_token_provider",             // config name
@@ -281,84 +307,72 @@ crate::register_capability!(
 
 The macro generates:
 
-- `Sealed` / `HandleSealed` / `ExtensionCapability` impls
+- `Sealed` / `ExtensionCapability` impls
 - A `KNOWN_CAPABILITIES` static entry (via `paste!` and
   `distributed_slice`)
 - `shared_capabilities()` / `local_capabilities()` methods
   for type-erased coercion
+- `adapt_to_local` function for shared→local fallback
 
-#### CapabilityHandle Trait
+#### Consuming Capabilities
 
-Each capability defines a handle enum that dispatches to
-the right variant:
-
-```rust
-pub trait CapabilityHandle: HandleSealed + Sized {
-    const CAPABILITY_NAME: &'static str;
-    type Local: ?Sized + 'static;
-    type Shared: ?Sized + 'static;
-
-    fn from_local(local: Rc<Self::Local>) -> Self;
-    fn from_shared(shared: Box<Self::Shared>) -> Self;
-}
-```
-
-Consumers resolve capabilities via the `Capabilities`
-struct:
+Consumers use the trait object type directly as the
+generic parameter:
 
 ```rust
-let auth = capabilities.require::<BearerTokenProvider>(
-    ConsumerType::Local,
-)?;
+// Local consumer — returns Rc<dyn local::Trait>
+let auth = capabilities
+    .require_local::<dyn local::BearerTokenProvider>()?;
 auth.get_token().await?;
+
+// Shared consumer — returns Box<dyn shared::Trait> (Send)
+let kv = capabilities
+    .require_shared::<dyn shared::KeyValueStore>()?;
+kv.get("key").await?;
 ```
 
-`ConsumerType::Local` tries the local variant first, falls
-back to shared. `ConsumerType::Shared` uses shared only.
+Sealed traits (`local::capability::Sealed` and
+`shared::capability::Sealed`) enforce at compile time
+that only engine-defined capabilities can be passed.
+Local fallback from shared extensions is pre-populated
+at `resolve_bindings()` time — `require_local()` does
+a flat HashMap lookup with no runtime adapter logic.
 
-#### Consuming Capabilities: require() and optional()
+#### require_local/shared and optional_local/shared
 
 The `Capabilities` struct (produced by `resolve_bindings()`)
-is passed to every node factory. It provides two methods
-for resolving capability handles:
+is passed to every node factory. It provides four methods
+for resolving capabilities:
 
-**`require()`** — The capability must be configured. If not
-bound, returns a clear error with instructions:
+**`require_local()`** — Returns `Rc<dyn local::Trait>`.
+Fallback from shared is pre-populated at build time.
+If not bound, returns an error:
 
 ```rust
-let auth = capabilities.require::<BearerTokenProvider>(
-    ConsumerType::Local,
-)?;
-// Error if not bound:
-// "Missing required capability 'bearer_token_provider'.
-//  Add to your node config:
-//    capabilities:
-//      bearer_token_provider: <extension_instance_name>"
+let auth = capabilities
+    .require_local::<dyn local::BearerTokenProvider>()?;
 ```
 
-**`optional()`** — The capability may or may not be
-configured. Returns `None` if not bound:
+**`require_shared()`** — Returns `Box<dyn shared::Trait>`
+(which is `Send`). Only the shared variant is considered:
 
 ```rust
-if let Some(store) = capabilities.optional::<KeyValueStore>(
-    ConsumerType::Local,
-) {
+let kv = capabilities
+    .require_shared::<dyn shared::KeyValueStore>()?;
+```
+
+**`optional_local()`** / **`optional_shared()`** — Same
+semantics but return `Option` instead of `Result`:
+
+```rust
+if let Some(store) = capabilities
+    .optional_local::<dyn local::KeyValueStore>()
+{
     store.set("offset", offset_bytes).await?;
 }
 ```
 
-Both methods take a `ConsumerType` that determines variant
-selection:
-
-- **`ConsumerType::Local`** — Prefers the local (`Rc`-based)
-  variant for zero-overhead on single-threaded runtimes.
-  Falls back to the shared variant if no local variant is
-  registered (piggyback mode).
-- **`ConsumerType::Shared`** — Uses the shared (`Box`-based)
-  variant only. Local-only extensions are not visible to
-  shared consumers.
-
-Both methods also track which variants were consumed
+All methods track which variants were consumed
 (`consumed_local()` / `consumed_shared()`). After all
 nodes are built, the engine uses this to drop unused
 extension variants — if no consumer asked for the local
@@ -422,33 +436,6 @@ The `capabilities` field carries the registration functions
 produced by `extension_capabilities!`. The engine calls
 these during build to populate the `CapabilityRegistry`.
 
-### Built-in Capabilities
-
-#### BearerTokenProvider
-
-```rust
-pub enum BearerTokenProvider {
-    Local(Rc<dyn local::BearerTokenProvider>),
-    Shared(Box<dyn shared::BearerTokenProvider>),
-}
-```
-
-Provides `get_token()` and `subscribe_token_refresh()`.
-Data types `BearerToken` and `Secret` are co-located in
-the same file.
-
-#### KeyValueStore
-
-```rust
-pub enum KeyValueStore {
-    Local(Rc<dyn local::KeyValueStore>),
-    Shared(Box<dyn shared::KeyValueStore>),
-}
-```
-
-Provides `get()`, `set()`, `delete()`. Mirrors Go's
-`storage.Client` interface.
-
 ## Implementing Extensions
 
 ### Active Extension (Azure Identity Auth)
@@ -465,7 +452,7 @@ Both variants implement `Extension` with their own event
 loop. The builder detects different `TypeId`s, creates
 dual control channels, and `start()` spawns both.
 
-### Passive Extension (In-Memory KV Store)
+### Passive Extension (Sample Shared KV Store)
 
 ```rust
 // Factory — no Extension trait impl needed
@@ -477,7 +464,7 @@ ExtensionWrapper::builder(node, node_config, ext_config)
 No task spawned, no control channel. The extension only
 registers capabilities.
 
-### Dual-Type Passive Extension (Optimized KV Store)
+### Dual-Type Passive Extension (Sample Shared/Local KV Store)
 
 ```rust
 // Factory — local uses Rc<RefCell<HashMap>> (no locks),
@@ -494,29 +481,28 @@ shared consumers get the thread-safe variant.
 
 ### Adding a New Capability
 
-**1.** Create `capability/<name>.rs` with inline
-`local::`/`shared::` trait mods and handle enum:
+**1.** Create `capability/<name>.rs` with the `#[capability]`
+macro and any shared data types:
 
 ```rust
-crate::register_capability!(
-    MyCapability,
-    local::MyCapability,
-    shared::MyCapability,
-    "my_capability",
-    "Does something useful",
-);
+use otap_df_engine_macros::capability;
 
-#[doc(hidden)]
-pub mod local { /* trait */ }
-#[doc(hidden)]
-pub mod shared { /* trait */ }
+type Error = super::registry::Error;
 
-pub enum MyCapability {
-    Local(Rc<dyn local::MyCapability>),
-    Shared(Box<dyn shared::MyCapability>),
+#[capability(
+    name = "my_capability",
+    description = "Does something useful",
+)]
+pub trait MyCapability {
+    async fn do_thing(&self, input: &str) -> Result<String, Error>;
 }
-// + impl CapabilityHandle
 ```
+
+The macro generates: `local::MyCapability` trait
+(`#[async_trait(?Send)]`), `shared::MyCapability` trait
+(`#[async_trait]` + `Send`), `SharedAsLocal` adapter,
+sealed trait impls, a zero-sized registration struct,
+and `register_capability!` glue.
 
 **2.** Add re-exports in `local/capability.rs` and
 `shared/capability.rs`:
@@ -625,9 +611,10 @@ capability binding with four checks:
 
 After all nodes are built, the engine also detects
 **unused bindings** — capabilities that were configured
-but never consumed by any `require()` or `optional()`
-call. These are reported as warnings for configuration
-hygiene.
+but never consumed by any `require_local()`,
+`require_shared()`, `optional_local()`, or
+`optional_shared()` call. These are reported as warnings
+for configuration hygiene.
 
 ## Pipeline Lifecycle
 

@@ -108,45 +108,8 @@ fn generate(
         })
         .collect();
 
-    // Dispatch methods on the handle enum.
-    let dispatch_methods: Vec<_> = methods
-        .iter()
-        .map(|m| {
-            let sig = &m.sig;
-            let method_name = &sig.ident;
-            let is_async = sig.asyncness.is_some();
-            let param_names = extract_param_names(sig);
-            // Preserve doc attributes from the original trait method.
-            let doc_attrs: Vec<_> = m
-                .attrs
-                .iter()
-                .filter(|a| a.path().is_ident("doc"))
-                .collect();
-            let (local_call, shared_call) = if is_async {
-                (
-                    quote! { inner.#method_name(#(#param_names),*).await },
-                    quote! { inner.#method_name(#(#param_names),*).await },
-                )
-            } else {
-                (
-                    quote! { inner.#method_name(#(#param_names),*) },
-                    quote! { inner.#method_name(#(#param_names),*) },
-                )
-            };
-            quote! {
-                #(#doc_attrs)*
-                pub #sig {
-                    match self {
-                        Self::Local(inner) => #local_call,
-                        Self::Shared(inner) => #shared_call,
-                    }
-                }
-            }
-        })
-        .collect();
-
-    // Preserve doc attributes from the original trait for the handle enum.
-    let doc_attrs: Vec<_> = trait_def
+    // Preserve doc attributes from the original trait for the generated struct.
+    let _doc_attrs: Vec<_> = trait_def
         .attrs
         .iter()
         .filter(|a| a.path().is_ident("doc"))
@@ -195,43 +158,45 @@ fn generate(
             #(#adapter_methods)*
         }
 
-        // ── Handle enum ─────────────────────────────────────────────────
-        #(#doc_attrs)*
-        #vis enum #trait_name {
-            /// Rc-based variant for local consumers.
-            Local(std::rc::Rc<dyn local::#trait_name>),
-            /// Box-based variant for shared consumers.
-            Shared(Box<dyn shared::#trait_name>),
-        }
+        // ── Registry helper (adapter + registration glue) ────────────────
+        /// Zero-sized type used as a namespace for capability registration helpers.
+        #vis struct #trait_name;
 
         impl #trait_name {
-            #(#dispatch_methods)*
+            /// Adapts a shared registry entry to a local one via SharedAsLocal.
+            /// Called at resolve_bindings() time to pre-populate local fallbacks.
+            #[doc(hidden)]
+            pub fn _adapt_shared_entry_to_local(
+                shared_entry: &crate::capability::registry::shared::RegistryEntry,
+            ) -> crate::capability::registry::local::RegistryEntry {
+                let erased = (shared_entry.coerce)(shared_entry.value.as_ref().as_any_ref());
+                let shared_box = erased
+                    .downcast::<Box<dyn shared::#trait_name>>()
+                    .expect("TypeId matched but downcast failed — this is a bug");
+                let adapted: std::rc::Rc<SharedAsLocal> =
+                    std::rc::Rc::new(SharedAsLocal(*shared_box));
+
+                fn coerce_local(
+                    rc_any: std::rc::Rc<dyn std::any::Any>,
+                ) -> Box<dyn std::any::Any> {
+                    let rc = rc_any
+                        .downcast::<SharedAsLocal>()
+                        .expect("TypeId matched but downcast failed — this is a bug");
+                    let trait_obj: std::rc::Rc<dyn local::#trait_name> = rc;
+                    Box::new(trait_obj) as Box<dyn std::any::Any>
+                }
+
+                crate::capability::registry::local::RegistryEntry {
+                    value: adapted as std::rc::Rc<dyn std::any::Any>,
+                    coerce: coerce_local,
+                    capability_name: shared_entry.capability_name,
+                }
+            }
         }
 
-        // ── CapabilityHandle impl ───────────────────────────────────────
-        impl crate::capability::registry::CapabilityHandle for #trait_name {
-            const CAPABILITY_NAME: &'static str =
-                <Self as crate::capability::registry::ExtensionCapability>::NAME;
-
-            type Local = dyn local::#trait_name;
-            type Shared = dyn shared::#trait_name;
-
-            fn from_local(local: std::rc::Rc<dyn local::#trait_name>) -> Self {
-                Self::Local(local)
-            }
-
-            fn from_shared(
-                shared: Box<<Self as crate::capability::registry::CapabilityHandle>::Shared>,
-            ) -> Self {
-                Self::Shared(shared)
-            }
-
-            fn adapt_shared_as_local(
-                shared: Box<<Self as crate::capability::registry::CapabilityHandle>::Shared>,
-            ) -> std::rc::Rc<<Self as crate::capability::registry::CapabilityHandle>::Local> {
-                std::rc::Rc::new(SharedAsLocal(shared))
-            }
-        }
+        // ── Sealed marker impls ─────────────────────────────────────────
+        impl crate::local::capability::Sealed for dyn local::#trait_name {}
+        impl crate::shared::capability::Sealed for dyn shared::#trait_name {}
 
         // ── Capability registration (sealed traits, link-time, glue) ────
         crate::register_capability!(
