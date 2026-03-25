@@ -787,8 +787,10 @@ the caller before export.
 
 ## Open Questions
 
-1. **Phase timing budget** — How to split the global deadline across phases?
-   Fixed percentages, or adaptive based on pipeline depth?
+1. **Phase timing budget** — Currently a single global deadline (default 60s,
+   set via admin HTTP endpoint). Should phased shutdown keep the single global
+   deadline wrapping all phases, or introduce per-phase budgets? Single global
+   is simplest and matches current behavior.
 2. **Processor-owned loops** — Should processors also be able to own their
    event loop (like exporters), or always be engine-managed?
 3. **Connector nodes** — Not yet implemented. How do they fit into the
