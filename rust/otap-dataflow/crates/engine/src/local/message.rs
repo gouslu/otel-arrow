@@ -3,6 +3,7 @@
 
 //! Abstraction to represent generic local senders and receivers.
 
+use crate::control::NodeControlMsg;
 use crate::channel_metrics::{
     ChannelMetricsHandle, ChannelMetricsRegistry, ChannelReceiverMetrics,
     ChannelReceiverMetricsState, ChannelSenderMetrics, ChannelSenderMetricsState,
@@ -256,3 +257,10 @@ impl<T> LocalReceiver<T> {
         }
     }
 }
+
+/// `!Send` [`MessageChannel`](crate::message::MessageChannel) using local receivers.
+pub type MessageChannel<PData> = crate::message::MessageChannel<
+    PData,
+    crate::message::Receiver<NodeControlMsg<PData>>,
+    crate::message::Receiver<PData>,
+>;

@@ -326,7 +326,7 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_pipeline_ctrl_msg_sender(pipeline_ctrl_msg_tx);
                 effect_handler.core.set_node_interests(node_interests);
-                let message_channel = shared::MessageChannel::new(
+                let message_channel = crate::shared::message::MessageChannel::new(
                     control_receiver,
                     pdata_rx,
                     node_id.index,
@@ -449,7 +449,7 @@ mod tests {
     impl local::Exporter<TestMsg> for TestExporter {
         async fn start(
             self: Box<Self>,
-            mut msg_chan: message::MessageChannel<TestMsg>,
+            mut msg_chan: crate::local::message::MessageChannel<TestMsg>,
             effect_handler: local::EffectHandler<TestMsg>,
         ) -> Result<TerminalState, Error> {
             // Loop until a Shutdown event is received.
@@ -486,7 +486,7 @@ mod tests {
     impl shared::Exporter<TestMsg> for TestExporter {
         async fn start(
             self: Box<Self>,
-            mut msg_chan: shared::MessageChannel<TestMsg>,
+            mut msg_chan: crate::shared::message::MessageChannel<TestMsg>,
             effect_handler: shared::EffectHandler<TestMsg>,
         ) -> Result<TerminalState, Error> {
             // Loop until a Shutdown event is received.
@@ -608,7 +608,7 @@ mod tests {
     fn make_chan() -> (
         mpsc::Sender<NodeControlMsg<String>>,
         mpsc::Sender<String>,
-        message::MessageChannel<String>,
+        crate::local::message::MessageChannel<String>,
     ) {
         let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<String>>::new(10);
         let (pdata_tx, pdata_rx) = mpsc::Channel::<String>::new(10);
@@ -1054,16 +1054,16 @@ mod tests {
     fn make_shared_chan() -> (
         tokio::sync::mpsc::Sender<NodeControlMsg<String>>,
         tokio::sync::mpsc::Sender<String>,
-        message::MessageChannel<String>,
+        crate::shared::message::MessageChannel<String>,
     ) {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<NodeControlMsg<String>>(10);
         let (pdata_tx, pdata_rx) = tokio::sync::mpsc::channel::<String>(10);
         (
             control_tx,
             pdata_tx,
-            message::MessageChannel::new(
-                message::Receiver::Shared(SharedReceiver::mpsc(control_rx)),
-                message::Receiver::Shared(SharedReceiver::mpsc(pdata_rx)),
+            crate::shared::message::MessageChannel::new(
+                SharedReceiver::mpsc(control_rx),
+                SharedReceiver::mpsc(pdata_rx),
                 0,
                 Interests::empty(),
             ),

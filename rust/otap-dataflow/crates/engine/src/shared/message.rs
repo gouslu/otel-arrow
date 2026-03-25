@@ -3,6 +3,7 @@
 
 //! Abstraction to represent generic shared senders and receivers.
 
+use crate::control::NodeControlMsg;
 use crate::channel_metrics::{
     ChannelMetricsHandle, ChannelMetricsRegistry, ChannelReceiverMetrics,
     ChannelReceiverMetricsState, ChannelSenderMetrics, ChannelSenderMetricsState,
@@ -268,6 +269,10 @@ impl<T> SharedReceiver<T> {
         }
     }
 }
+
+/// `Send` [`MessageChannel`](crate::message::MessageChannel) using shared receivers.
+pub type MessageChannel<PData> =
+    crate::message::MessageChannel<PData, SharedReceiver<NodeControlMsg<PData>>, SharedReceiver<PData>>;
 
 #[cfg(test)]
 mod tests {

@@ -9,6 +9,7 @@ use crate::shared::message::{SharedReceiver, SharedSender};
 use crate::{Interests, ReceivedAtNode};
 use otap_df_channel::error::{RecvError, SendError};
 use otap_df_channel::mpsc;
+use std::future::Future;
 use std::ops::Add;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -179,7 +180,54 @@ impl<T> Receiver<T> {
     }
 }
 
+/// Abstraction over channel receiver types used by [`MessageChannel`].
+///
+/// Both [`Receiver`] (`!Send`) and [`SharedReceiver`] (`Send`) implement this
+/// trait, allowing `MessageChannel` to be generic over the underlying channel
+/// while keeping all message-priority and shutdown-draining logic in one place.
+pub trait MsgReceiver<T> {
+    /// Receives a message asynchronously.
+    fn recv(&mut self) -> impl Future<Output = Result<T, RecvError>>;
+    /// Attempts to receive a message without blocking.
+    fn try_recv(&mut self) -> Result<T, RecvError>;
+    /// Returns `true` if the channel buffer is empty.
+    fn is_empty(&self) -> bool;
+}
+
+impl<T> MsgReceiver<T> for Receiver<T> {
+    async fn recv(&mut self) -> Result<T, RecvError> {
+        Receiver::recv(self).await
+    }
+    fn try_recv(&mut self) -> Result<T, RecvError> {
+        Receiver::try_recv(self)
+    }
+    fn is_empty(&self) -> bool {
+        Receiver::is_empty(self)
+    }
+}
+
+impl<T> MsgReceiver<T> for SharedReceiver<T> {
+    async fn recv(&mut self) -> Result<T, RecvError> {
+        SharedReceiver::recv(self).await
+    }
+    fn try_recv(&mut self) -> Result<T, RecvError> {
+        SharedReceiver::try_recv(self)
+    }
+    fn is_empty(&self) -> bool {
+        SharedReceiver::is_empty(self)
+    }
+}
+
 /// A channel for receiving control and pdata messages.
+///
+/// This type is generic over the receiver implementation (`CtrlRx`, `DataRx`)
+/// so the same logic serves both `!Send` (local) and `Send` (shared) contexts.
+/// Prefer the concrete type aliases [`local::message::MessageChannel`] and
+/// [`shared::message::MessageChannel`] instead of naming the generic parameters
+/// directly.
+///
+/// [`local::message::MessageChannel`]: crate::local::message::MessageChannel
+/// [`shared::message::MessageChannel`]: crate::shared::message::MessageChannel
 ///
 /// Control messages are prioritized until the first `Shutdown` is received.
 /// After that, both control messages and pdata are considered up to the deadline,
@@ -188,9 +236,13 @@ impl<T> Receiver<T> {
 /// Note: This approach is used to implement a graceful shutdown. The engine will first close all
 /// data sources in the pipeline, and then send a shutdown message with a deadline to all nodes in
 /// the pipeline.
-pub struct MessageChannel<PData> {
-    control_rx: Option<Receiver<NodeControlMsg<PData>>>,
-    pdata_rx: Option<Receiver<PData>>,
+pub struct MessageChannel<PData, CtrlRx, DataRx>
+where
+    CtrlRx: MsgReceiver<NodeControlMsg<PData>>,
+    DataRx: MsgReceiver<PData>,
+{
+    control_rx: Option<CtrlRx>,
+    pdata_rx: Option<DataRx>,
     /// Once a Shutdown is seen, this is set to `Some(instant)` representing the drain deadline.
     shutting_down_deadline: Option<Instant>,
     /// Holds the ControlMsg::Shutdown until after we’ve drained pdata.
@@ -201,12 +253,16 @@ pub struct MessageChannel<PData> {
     interests: Interests,
 }
 
-impl<PData> MessageChannel<PData> {
+impl<PData, CtrlRx, DataRx> MessageChannel<PData, CtrlRx, DataRx>
+where
+    CtrlRx: MsgReceiver<NodeControlMsg<PData>>,
+    DataRx: MsgReceiver<PData>,
+{
     /// Creates a new `MessageChannel` with the given control and data receivers.
     #[must_use]
     pub fn new(
-        control_rx: Receiver<NodeControlMsg<PData>>,
-        pdata_rx: Receiver<PData>,
+        control_rx: CtrlRx,
+        pdata_rx: DataRx,
         node_id: usize,
         interests: Interests,
     ) -> Self {
@@ -221,7 +277,11 @@ impl<PData> MessageChannel<PData> {
     }
 }
 
-impl<PData: ReceivedAtNode> MessageChannel<PData> {
+impl<PData: ReceivedAtNode, CtrlRx, DataRx> MessageChannel<PData, CtrlRx, DataRx>
+where
+    CtrlRx: MsgReceiver<NodeControlMsg<PData>>,
+    DataRx: MsgReceiver<PData>,
+{
     /// Asynchronously receives the next message to process.
     ///
     /// Order of precedence:
