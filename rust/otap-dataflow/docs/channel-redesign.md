@@ -269,21 +269,21 @@ Stays on receive side via `PdataReceiver` wrapper. Stamps automatically on
 
 1. **Phase timing budget** — Single global deadline vs per-phase budgets.
 2. **Connector nodes** — How do they fit in the topological shutdown order?
-3. **Node-specific shutdown messages** — Exporters do all their work in
-   `BeginShutdown` and just exit on `EndShutdown`, which is a different
-   contract from receivers/processors and makes migration non-trivial (existing
-   `Shutdown` logic moves to `BeginShutdown`, not a 1:1 rename to
-   `EndShutdown`). This raises a spectrum of options:
-   - **Fully generic** (current proposal): one `BeginShutdown`/`EndShutdown`
-     pair for all node types; per-type behavior is convention only.
-   - **Fully node-specific**: distinct variants per node type (e.g.,
-     `ReceiverBeginShutdown`, `ExporterBeginShutdown`) encoding exact
-     expectations in the type system.
-   - **Partially node-specific**: generic `BeginShutdown`/`EndShutdown`
-     messages with a node-type-specific payload or enum field that describes
-     the expected work (e.g., `phase_work: ShutdownWork::DrainAndFlush` vs
-     `ShutdownWork::ProcessAckNack`). This keeps the message count small while
-     making the per-node contract explicit.
+3. **Node-specific shutdown messages** — The current proposal uses one
+   `BeginShutdown`/`EndShutdown` pair for all node types, but each node type
+   has a different contract (e.g., exporters do all work in `BeginShutdown`
+   and just exit on `EndShutdown`). This makes migration error-prone since
+   the compiler can't enforce what each node type should do in each phase.
+   Options to address this:
+   - **Fully node-specific**: distinct `NodeControlMsg` types per node type
+     (e.g., `ReceiverControlMsg`, `ExporterControlMsg`) each with their own
+     shutdown variants encoding exact expectations in the type system.
+   - **Partially node-specific via generics**: `NodeControlMsg<ShutdownPayload>`
+     where `ShutdownPayload` is a generic type parameter that varies by node
+     type (e.g., `ReceiverShutdown`, `ExporterShutdown`). The enum stays small,
+     but `BeginShutdown { done, payload: ShutdownPayload }` carries
+     node-type-specific instructions. The engine constructs the right payload
+     per node; the node destructures its own type.
    Trade-off: type safety and migration clarity vs. enum size and complexity.
 4. **`into_channels()` escape hatch** — Should `MessageChannel` expose an
    `into_channels()` method that decomposes it into raw control, ack/nack,
