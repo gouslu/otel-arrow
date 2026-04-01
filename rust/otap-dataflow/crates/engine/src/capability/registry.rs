@@ -8,7 +8,8 @@
 //! deep-copies each stored extension (which is cheap when the extension itself
 //! wraps shared state in `Arc`).
 //!
-//! Extensions that publish traits use the [`extension_capabilities!`] macro,
+//! Extensions that publish traits use the [`extension_capabilities!`] macro
+//! to declare which capabilities they provide.
 //!
 //! # Extension writer contract
 //!
@@ -161,6 +162,10 @@ pub mod local {
         pub(crate) value: Rc<dyn Any>,
         pub(crate) coerce: fn(Rc<dyn Any>) -> Box<dyn Any>,
         pub(crate) capability_name: &'static str,
+        /// True if this entry is a local view of a shared extension via `SharedAsLocal` adapter.
+        /// When consumed, the shared variant is also marked as used so the engine
+        /// doesn't drop the shared lifecycle that backs it.
+        pub(crate) shared_as_local: bool,
     }
 
     /// A registration for one local capability trait implementation.
@@ -321,6 +326,7 @@ impl CapabilityRegistry {
                 value: reg.value,
                 coerce: reg.coerce,
                 capability_name: reg.capability_name,
+                shared_as_local: false,
             };
             let _ = self
                 .local_handles
@@ -825,6 +831,8 @@ impl Capabilities {
     }
 
     /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
+    /// Also marks `accessed_shared` if the entry was populated via `SharedAsLocal` adapter,
+    /// so the engine doesn't drop the shared lifecycle that backs it.
     fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Rc<T>> {
         let key = TypeId::of::<Rc<T>>();
         let entry = self.local_resolved.get(&key)?;
@@ -832,6 +840,9 @@ impl Capabilities {
             .accessed_capability_names
             .borrow_mut()
             .insert(entry.capability_name);
+        if entry.shared_as_local {
+            *self.accessed_shared.borrow_mut() = true;
+        }
         let erased = (entry.coerce)(Rc::clone(&entry.value));
         let inner = erased
             .downcast::<Rc<T>>()

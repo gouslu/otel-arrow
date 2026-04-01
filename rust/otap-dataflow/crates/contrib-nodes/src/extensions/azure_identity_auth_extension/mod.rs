@@ -31,9 +31,7 @@
 //! resolved capabilities at factory time:
 //!
 //! ```ignore
-//! let auth = capabilities.require::<
-//!     BearerTokenProvider
-//! >()?;
+//! let auth = capabilities.require_local::<BearerTokenProvider>()?;
 //! let mut token_rx = auth.subscribe_token_refresh();
 //! ```
 

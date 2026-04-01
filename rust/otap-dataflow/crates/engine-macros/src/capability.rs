@@ -196,6 +196,7 @@ fn generate(
                     value: adapted as std::rc::Rc<dyn std::any::Any>,
                     coerce: coerce_local,
                     capability_name: shared_entry.capability_name,
+                    shared_as_local: true,
                 }
             }
         }
