@@ -29,7 +29,7 @@ themselves, and they never touch pipeline data directly.
 |  | local + shared    |  | shared only       |            |
 |  | lifecycle         |  | no task spawned   |            |
 |  +---------+---------+  +---------+---------+            |
-|            | register_capability!() macro                |
+|            | #[capability] proc macro                   |
 |            | + extension_capabilities!() macro           |
 |            v                                             |
 |  +----------------------------+                          |
@@ -87,15 +87,15 @@ themselves, and they never touch pipeline data directly.
      capabilities only.
 
 5. **Type-safe capability resolution.** Consumers call
-   `capabilities.require_local::<dyn local::Trait>()`
-   (returns `Rc<dyn local::Trait>`) or
-   `capabilities.require_shared::<dyn shared::Trait>()`
-   (returns `Box<dyn shared::Trait>`, which is `Send`).
-   The trait object type itself is the lookup key.
-   Sealed traits (`local::capability::Sealed`
-   and `shared::capability::Sealed`) ensure only
-   engine-defined capabilities are accepted at compile
-   time. Local fallback from shared extensions is
+   `capabilities.require_local::<BearerTokenProvider>()`
+   (returns `Rc<dyn local::BearerTokenProvider>`) or
+   `capabilities.require_shared::<KeyValueStore>()`
+   (returns `Box<dyn shared::KeyValueStore>`, which is `Send`).
+   The zero-sized registration struct carries associated
+   types (`Local` and `Shared`) that map to the correct
+   trait object variants. Sealing via `ExtensionCapability`
+   ensures only engine-defined capabilities are accepted
+   at compile time. Local fallback from shared extensions is
    pre-populated at build time via `SharedAsLocal` adapters.
 
 6. **`#[capability]` proc macro.** Each capability is
@@ -103,8 +103,9 @@ themselves, and they never touch pipeline data directly.
    trait definition. The macro generates: `local::` and
    `shared::` trait variants, a `SharedAsLocal` adapter
    for transparent fallback, sealed trait impls, a
-   zero-sized registration struct, and all registration
-   glue. Consumers use trait objects directly. Shared
+   zero-sized registration struct, a `KNOWN_CAPABILITIES`
+   link-time entry, and type-erased coercion functions.
+   Consumers use trait objects directly. Shared
    data types (e.g., `BearerToken`, `Secret`) are
    hand-written alongside the macro invocation.
 
@@ -117,8 +118,8 @@ engine/src/
                               ControlChannel, EffectHandler, provider traits
   capability/
     mod.rs                  → module root
-    registry.rs             → CapabilityRegistry, Capabilities, macros,
-                              Error type
+    registry.rs             → CapabilityRegistry, Capabilities,
+                              extension_capabilities! macro, Error type
     bearer_token_provider.rs → BearerToken, Secret,
                               #[capability] macro invocation
     key_value_store.rs      → #[capability] macro invocation
@@ -153,23 +154,24 @@ use otap_df_engine::shared::extension::Extension;
 Consumers (in factories):
 
 ```rust
-// Local consumer
-use otap_df_engine::local::capability::BearerTokenProvider;
+// Local consumer — returns Rc<dyn local::BearerTokenProvider>
+use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
 let auth = capabilities
-    .require_local::<dyn BearerTokenProvider>()?;
+    .require_local::<BearerTokenProvider>()?;
 
-// Shared consumer
-use otap_df_engine::shared::capability::KeyValueStore;
+// Shared consumer — returns Box<dyn shared::KeyValueStore>
+use otap_df_engine::capability::key_value_store::KeyValueStore;
 let kv = capabilities
-    .require_shared::<dyn KeyValueStore>()?;
+    .require_shared::<KeyValueStore>()?;
 ```
 
 ### Dependency Flow
 
 ```text
-capability/registry.rs        → Error type, macros (no deps on local/shared)
+capability/registry.rs        → CapabilityRegistry, Capabilities, Error type
 capability/bearer_token_provider.rs → types + #[capability] macro
-    ↑                                    (generates local/shared traits + adapter)
+    ↑                                    (generates local/shared traits, adapter,
+                                          sealed impls, registration, coercion)
 local::capability   → re-exports + Sealed trait
 shared::capability  → re-exports + Sealed trait
 ```
@@ -290,50 +292,60 @@ independent shutdown messages.
 
 ### Capability System
 
-#### register_capability! Macro
+#### `#[capability]` Proc Macro
 
-A declarative macro that registers a capability — sealing,
-metadata, link-time registration, and coercion glue:
+Each capability is defined via a single `#[capability]`
+attribute on a trait definition in `capability/<name>.rs`.
+The proc macro (in `engine-macros`) generates all
+infrastructure from that one annotation:
 
 ```rust
-crate::register_capability!(
-    BearerTokenProvider,                 // registration struct
-    local::BearerTokenProvider,          // local trait
-    shared::BearerTokenProvider,         // shared trait
-    "bearer_token_provider",             // config name
-    "Provides bearer tokens for HTTP",   // description
-);
+#[capability(
+    name = "bearer_token_provider",
+    description = "Provides bearer tokens for HTTP",
+)]
+pub trait BearerTokenProvider {
+    async fn get_token(&self) -> Result<BearerToken, Error>;
+    fn subscribe_token_refresh(&self)
+        -> tokio::sync::watch::Receiver<Option<BearerToken>>;
+}
 ```
 
 The macro generates:
 
-- `Sealed` / `ExtensionCapability` impls
-- A `KNOWN_CAPABILITIES` static entry (via `paste!` and
-  `distributed_slice`)
+- `local::BearerTokenProvider` trait (`#[async_trait(?Send)]`)
+- `shared::BearerTokenProvider` trait (`#[async_trait]` + `Send`)
+- `SharedAsLocal` adapter for transparent shared→local fallback
+- A zero-sized `BearerTokenProvider` registration struct
+- `Sealed` / `ExtensionCapability` impls (sealing)
+- A `KNOWN_CAPABILITIES` static entry (via `distributed_slice`)
+  for config validation
 - `shared_capabilities()` / `local_capabilities()` methods
   for type-erased coercion
-- `adapt_to_local` function for shared→local fallback
+- `_adapt_shared_entry_to_local` function for shared→local
+  fallback at `resolve_bindings()` time
 
 #### Consuming Capabilities
 
-Consumers use the trait object type directly as the
-generic parameter:
+Consumers use the zero-sized registration struct as the
+generic parameter. The `Local` and `Shared` associated
+types on `ExtensionCapability` determine the return type:
 
 ```rust
-// Local consumer — returns Rc<dyn local::Trait>
+// Local consumer — returns Rc<dyn local::BearerTokenProvider>
 let auth = capabilities
-    .require_local::<dyn local::BearerTokenProvider>()?;
+    .require_local::<BearerTokenProvider>()?;
 auth.get_token().await?;
 
-// Shared consumer — returns Box<dyn shared::Trait> (Send)
+// Shared consumer — returns Box<dyn shared::KeyValueStore> (Send)
 let kv = capabilities
-    .require_shared::<dyn shared::KeyValueStore>()?;
+    .require_shared::<KeyValueStore>()?;
 kv.get("key").await?;
 ```
 
-Sealed traits (`local::capability::Sealed` and
-`shared::capability::Sealed`) enforce at compile time
-that only engine-defined capabilities can be passed.
+Sealing via `ExtensionCapability` (which requires
+`private::Sealed`) ensures at compile time that only
+engine-defined capabilities can be passed.
 Local fallback from shared extensions is pre-populated
 at `resolve_bindings()` time — `require_local()` does
 a flat HashMap lookup with no runtime adapter logic.
@@ -350,7 +362,7 @@ If not bound, returns an error:
 
 ```rust
 let auth = capabilities
-    .require_local::<dyn local::BearerTokenProvider>()?;
+    .require_local::<BearerTokenProvider>()?;
 ```
 
 **`require_shared()`** — Returns `Box<dyn shared::Trait>`
@@ -358,7 +370,7 @@ let auth = capabilities
 
 ```rust
 let kv = capabilities
-    .require_shared::<dyn shared::KeyValueStore>()?;
+    .require_shared::<KeyValueStore>()?;
 ```
 
 **`optional_local()`** / **`optional_shared()`** — Same
@@ -366,7 +378,7 @@ semantics but return `Option` instead of `Result`:
 
 ```rust
 if let Some(store) = capabilities
-    .optional_local::<dyn local::KeyValueStore>()
+    .optional_local::<KeyValueStore>()
 {
     store.set("offset", offset_bytes).await?;
 }
@@ -502,7 +514,7 @@ The macro generates: `local::MyCapability` trait
 (`#[async_trait(?Send)]`), `shared::MyCapability` trait
 (`#[async_trait]` + `Send`), `SharedAsLocal` adapter,
 sealed trait impls, a zero-sized registration struct,
-and `register_capability!` glue.
+`KNOWN_CAPABILITIES` entry, and coercion functions.
 
 **2.** Add re-exports in `local/capability.rs` and
 `shared/capability.rs`:
@@ -597,7 +609,7 @@ capability binding with four checks:
 
 2. **Known capability type** — The capability name must be
    in `KNOWN_CAPABILITIES` (registered at link time via
-   `register_capability!`). Error: "Unknown capability"
+   the `#[capability]` proc macro). Error: "Unknown capability"
    with a list of known types.
 
 3. **Capability provided** — Some loaded extension must
