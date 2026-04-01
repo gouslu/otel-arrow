@@ -831,7 +831,7 @@ impl Capabilities {
     }
 
     /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
-    /// Also marks `accessed_shared` if the entry was populated via `SharedAsLocal` adapter,
+    /// When the entry is `shared_as_local` (piggyback), also marks `accessed_shared = true`
     /// so the engine doesn't drop the shared lifecycle that backs it.
     fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Rc<T>> {
         let key = TypeId::of::<Rc<T>>();
