@@ -1,0 +1,77 @@
+# OTLP Receiver -> Azure Monitor Exporter (Local Mock Server)
+#
+# Accepts OTLP logs via gRPC and exports to a local mock-la-server.
+# Use this to test with real OTLP senders (e.g., OTel SDK, another collector).
+#
+# Usage:
+#   1. Start the mock server:
+#      cargo run --example mock_la_server -p otap-df-contrib-nodes --features azure-monitor-exporter -- --port 9999
+#
+#   2. Run the pipeline:
+#      cargo run --release --features azure-monitor-exporter -- --config crates/contrib-nodes/src/exporters/azure_monitor_exporter/otlp-ame-local.yaml --num-cores 1
+#
+#   3. Send OTLP logs to localhost:4317 (gRPC)
+
+version: otel_dataflow/v1
+
+policies:
+  channel_capacity:
+    control:
+      node: 100
+      pipeline: 100
+    pdata: 128
+
+engine:
+  telemetry:
+    logs:
+      level: "info,typespec_client_core=warn,otap-df-contrib-nodes=info"
+
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          otlp-receiver:
+            type: "urn:otel:receiver:otlp"
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "0.0.0.0:4317"
+
+          azure-monitor-exporter:
+            type: "urn:microsoft:exporter:azure_monitor"
+            config:
+              api:
+                dcr_endpoint: "http://localhost:9999"
+                stream_name: "Custom-MyTable_CL"
+                dcr: "dcr-local-test"
+                schema:
+                  resource_mapping:
+                    "service.name": "ServiceName"
+                    "service.version": "ServiceVersion"
+                    "k8s.pod.name": "PodName"
+                    "k8s.namespace.name": "Namespace"
+                  scope_mapping:
+                    "otel.library.name": "InstrumentationLibrary"
+                  log_record_mapping:
+                    "body": "Message"
+                    "severity_text": "SeverityText"
+                    "severity_number": "SeverityNumber"
+                    "time_unix_nano": "TimeGenerated"
+                    "trace_id": "TraceId"
+                    "span_id": "SpanId"
+                    "attributes":
+                      "http.method": "HttpMethod"
+                      "http.status_code": "HttpStatusCode"
+                      "http.url": "HttpUrl"
+
+              auth:
+                method: "dev"
+
+              heartbeat:
+                enabled: true
+                frequency: 1m
+
+        connections:
+          - from: otlp-receiver
+            to: azure-monitor-exporter
