@@ -51,7 +51,7 @@ impl KeyValueStore for SampleSharedKeyValueStore {
 }
 
 // Also implement local trait — this Send type works fine on a single-threaded
-// LocalSet. This is the piggyback pattern: one type serves both variants.
+// LocalSet. This is the shared-only with local fallback pattern: one type serves both variants.
 #[async_trait(?Send)]
 impl LocalKeyValueStore for SampleSharedKeyValueStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {

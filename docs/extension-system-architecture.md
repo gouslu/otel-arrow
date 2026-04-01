@@ -1,4 +1,4 @@
-# Extension System Architecture (v2 — Local/Shared)
+# Extension System Architecture
 
 ## Overview
 
@@ -11,8 +11,8 @@ extensions and capabilities.
 ## What Are Extensions?
 
 Extensions are standalone pipeline components that provide
-**shared, cross-cutting capabilities** — such as
-authentication, storage, or service discovery — to
+**shared, cross-cutting capabilities** -- such as
+authentication, storage etc. -- to
 data-path nodes (receivers, processors, exporters). They
 are configured as siblings to `nodes`, not as nodes
 themselves, and they never touch pipeline data directly.
@@ -29,7 +29,7 @@ themselves, and they never touch pipeline data directly.
 |  | local + shared    |  | shared only       |            |
 |  | lifecycle         |  | no task spawned   |            |
 |  +---------+---------+  +---------+---------+            |
-|            | #[capability] proc macro                   |
+|            | #[capability] proc macro                    |
 |            | + extension_capabilities!() macro           |
 |            v                                             |
 |  +----------------------------+                          |
@@ -66,7 +66,7 @@ themselves, and they never touch pipeline data directly.
 3. **Active vs Passive.** Extensions signal their lifecycle
    intent at build time via `Active(ext)` or `Passive(ext)`
    newtype wrappers. Active extensions get a task and control
-   channel. Passive extensions only provide capabilities —
+   channel. Passive extensions only provide capabilities --
    no task is spawned, no control channel is allocated, no
    messages are sent. This is enforced at the type level:
    `Active<E>` requires `E: Extension`, `Passive<E>` does
@@ -76,14 +76,19 @@ themselves, and they never touch pipeline data directly.
    (`!Send`, `Rc`-based) and shared (`Send`, `Clone`-based)
    variants. A single extension can provide one or both:
 
-   - **Shared-only (piggyback):** `with_shared(Active(ext))`
-     — the shared type serves both local and shared consumers
-     via registry fallback.
+   - **Shared-only (with local fallback):**
+     `with_shared(Active(ext))`
+     -- the shared type serves both local and shared consumers
+     via registry fallback. This is the most common pattern.
+   - **Local-only:** `with_local(Active(Rc::new(ext)))` --
+     only local consumers can use this extension. Shared
+     consumers (`require_shared()`) will get a config error.
+     Use this when the extension is inherently `!Send`.
    - **Dual-type:** `with_local(Active(Rc::new(l)))` +
-     `with_shared(Active(s))` — separate types with
+     `with_shared(Active(s))` -- separate types with
      independent lifecycles. The builder enforces different
      `TypeId`s via a runtime assertion.
-   - **Passive:** `with_shared(Passive(ext))` — no lifecycle,
+   - **Passive:** `with_shared(Passive(ext))` -- no lifecycle,
      capabilities only.
 
 5. **Type-safe capability resolution.** Consumers call
@@ -113,25 +118,25 @@ themselves, and they never touch pipeline data directly.
 
 ```text
 engine/src/
-  lib.rs                    → ExtensionFactory, engine build logic
-  extension.rs              → ExtensionWrapper, builder, Active, Passive,
+  lib.rs                    -> ExtensionFactory, engine build logic
+  extension.rs              -> ExtensionWrapper, builder, Active, Passive,
                               ControlChannel, EffectHandler, provider traits
   capability/
-    mod.rs                  → module root
-    registry.rs             → CapabilityRegistry, Capabilities,
+    mod.rs                  -> module root
+    registry.rs             -> CapabilityRegistry, Capabilities,
                               extension_capabilities! macro, Error type
-    bearer_token_provider.rs → BearerToken, Secret,
+    bearer_token_provider.rs -> BearerToken, Secret,
                               #[capability] macro invocation
-    key_value_store.rs      → #[capability] macro invocation
+    key_value_store.rs      -> #[capability] macro invocation
 
   local/
-    extension.rs            → Extension trait (!Send, Rc<Self>)
-    capability.rs           → re-exports + Sealed trait
+    extension.rs            -> Extension trait (!Send, Rc<Self>)
+    capability.rs           -> re-exports + Sealed trait
     exporter.rs, receiver.rs, processor.rs  (unchanged)
 
   shared/
-    extension.rs            → Extension trait (Send, Box<Self>)
-    capability.rs           → re-exports + Sealed trait
+    extension.rs            -> Extension trait (Send, Box<Self>)
+    capability.rs           -> re-exports + Sealed trait
     exporter.rs, receiver.rs, processor.rs  (unchanged)
 ```
 
@@ -154,12 +159,12 @@ use otap_df_engine::shared::extension::Extension;
 Consumers (in factories):
 
 ```rust
-// Local consumer — returns Rc<dyn local::BearerTokenProvider>
+// Local consumer -- returns Rc<dyn local::BearerTokenProvider>
 use otap_df_engine::capability::bearer_token_provider::BearerTokenProvider;
 let auth = capabilities
     .require_local::<BearerTokenProvider>()?;
 
-// Shared consumer — returns Box<dyn shared::KeyValueStore>
+// Shared consumer -- returns Box<dyn shared::KeyValueStore>
 use otap_df_engine::capability::key_value_store::KeyValueStore;
 let kv = capabilities
     .require_shared::<KeyValueStore>()?;
@@ -168,12 +173,12 @@ let kv = capabilities
 ### Dependency Flow
 
 ```text
-capability/registry.rs        → CapabilityRegistry, Capabilities, Error type
-capability/bearer_token_provider.rs → types + #[capability] macro
-    ↑                                    (generates local/shared traits, adapter,
+capability/registry.rs        -> CapabilityRegistry, Capabilities, Error type
+capability/bearer_token_provider.rs -> types + #[capability] macro
+    ^                                    (generates local/shared traits, adapter,
                                           sealed impls, registration, coercion)
-local::capability   → re-exports + Sealed trait
-shared::capability  → re-exports + Sealed trait
+local::capability   -> re-exports + Sealed trait
+shared::capability  -> re-exports + Sealed trait
 ```
 
 All arrows point one way. No circular dependencies.
@@ -186,10 +191,10 @@ Extensions signal their lifecycle intent at the builder call
 site using newtype wrappers:
 
 ```rust
-/// Active — has an event loop, gets a task + control channel.
+/// Active -- has an event loop, gets a task + control channel.
 pub struct Active<E>(pub E);
 
-/// Passive — capabilities only, no task, no control channel.
+/// Passive -- capabilities only, no task, no control channel.
 pub struct Passive<E>(pub E);
 ```
 
@@ -197,19 +202,19 @@ These implement sealed `SharedProvider` / `LocalProvider`
 traits that decompose the wrapped value into type-erased
 components:
 
-- `Active<E>` where `E: shared::Extension + Clone + Send` →
+- `Active<E>` where `E: shared::Extension + Clone + Send` ->
   stores both `shared_any` (capabilities) and
   `shared_extension` (lifecycle)
-- `Passive<E>` where `E: Clone + Send` → stores only
+- `Passive<E>` where `E: Clone + Send` -> stores only
   `shared_any` (capabilities), no `Extension` bound needed
 
 This means:
 
 - A passive extension **cannot** have a `start()` method
-  silently ignored — it doesn't implement `Extension` at all.
-- An active extension **must** implement `Extension` — the
+  silently ignored -- it doesn't implement `Extension` at all.
+- An active extension **must** implement `Extension` -- the
   compiler enforces this.
-- The engine skips task spawning for passive extensions —
+- The engine skips task spawning for passive extensions --
   no control channel, no messages, zero overhead.
 
 ### ExtensionWrapper
@@ -223,16 +228,16 @@ pub struct ExtensionWrapper {
     user_config: Arc<NodeUserConfig>,
     runtime_config: ExtensionConfig,
 
-    // Lifecycle — None for passive
+    // Lifecycle -- None for passive
     shared_extension: Option<Box<dyn shared::Extension>>,
     local_extension: Option<Rc<dyn local::Extension>>,
 
-    // Capabilities — always present
+    // Capabilities -- always present
     shared_any: Option<Box<dyn CloneAnySend>>,
     local_any: Option<Rc<dyn Any>>,
     capabilities: ExtensionCapabilities,
 
-    // Control channels — None for passive
+    // Control channels -- None for passive
     control_sender: Option<SharedSender<ExtensionControlMsg>>,
     control_receiver: Option<SharedReceiver<ExtensionControlMsg>>,
     shared_control_sender: Option<SharedSender<ExtensionControlMsg>>,
@@ -245,7 +250,7 @@ pub struct ExtensionWrapper {
 #### Builder Pattern
 
 ```rust
-// Active shared-only (piggyback)
+// Active shared-only (with local fallback)
 ExtensionWrapper::builder(node, config, ext_config)
     .with_shared(Active(ext))
     .build()
@@ -268,14 +273,15 @@ When both `with_local` and `with_shared` are called, the
 builder asserts at `build()` that the inner types have
 different `TypeId`s. This catches a pointless pattern:
 registering the same type as both local (`Rc<T>`) and
-shared (`T`) creates two lifecycles for the same object —
+shared (`T`) creates two lifecycles for the same object --
 one just unnecessarily wrapped in `Rc`. Since the registry
 already wraps any shared impl in `SharedAsLocal` for local
 consumers automatically, a same-type dual registration is
-always redundant. Use `with_shared()` alone (piggyback).
+always redundant. Use `with_shared()` alone (shared-only
+with local fallback).
 
 When both types are registered, they must be genuinely
-different — e.g., a local type using `Rc<RefCell<HashMap>>`
+different -- e.g., a local type using `Rc<RefCell<HashMap>>`
 (lock-free) and a shared type using `Arc<RwLock<HashMap>>`
 (thread-safe). Different `TypeId`s guarantee the two
 variants are intentionally distinct implementations, not
@@ -315,14 +321,14 @@ The macro generates:
 
 - `local::BearerTokenProvider` trait (`#[async_trait(?Send)]`)
 - `shared::BearerTokenProvider` trait (`#[async_trait]` + `Send`)
-- `SharedAsLocal` adapter for transparent shared→local fallback
+- `SharedAsLocal` adapter for transparent shared->local fallback
 - A zero-sized `BearerTokenProvider` registration struct
 - `Sealed` / `ExtensionCapability` impls (sealing)
 - A `KNOWN_CAPABILITIES` static entry (via `distributed_slice`)
   for config validation
 - `shared_capabilities()` / `local_capabilities()` methods
   for type-erased coercion
-- `_adapt_shared_entry_to_local` function for shared→local
+- `_adapt_shared_entry_to_local` function for shared->local
   fallback at `resolve_bindings()` time
 
 #### Consuming Capabilities
@@ -332,12 +338,12 @@ generic parameter. The `Local` and `Shared` associated
 types on `ExtensionCapability` determine the return type:
 
 ```rust
-// Local consumer — returns Rc<dyn local::BearerTokenProvider>
+// Local consumer -- returns Rc<dyn local::BearerTokenProvider>
 let auth = capabilities
     .require_local::<BearerTokenProvider>()?;
 auth.get_token().await?;
 
-// Shared consumer — returns Box<dyn shared::KeyValueStore> (Send)
+// Shared consumer -- returns Box<dyn shared::KeyValueStore> (Send)
 let kv = capabilities
     .require_shared::<KeyValueStore>()?;
 kv.get("key").await?;
@@ -347,7 +353,7 @@ Sealing via `ExtensionCapability` (which requires
 `private::Sealed`) ensures at compile time that only
 engine-defined capabilities can be passed.
 Local fallback from shared extensions is pre-populated
-at `resolve_bindings()` time — `require_local()` does
+at `resolve_bindings()` time -- `require_local()` does
 a flat HashMap lookup with no runtime adapter logic.
 
 #### require_local/shared and optional_local/shared
@@ -356,7 +362,7 @@ The `Capabilities` struct (produced by `resolve_bindings()`)
 is passed to every node factory. It provides four methods
 for resolving capabilities:
 
-**`require_local()`** — Returns `Rc<dyn local::Trait>`.
+**`require_local()`** -- Returns `Rc<dyn local::Trait>`.
 Fallback from shared is pre-populated at build time.
 If not bound, returns an error:
 
@@ -365,7 +371,7 @@ let auth = capabilities
     .require_local::<BearerTokenProvider>()?;
 ```
 
-**`require_shared()`** — Returns `Box<dyn shared::Trait>`
+**`require_shared()`** -- Returns `Box<dyn shared::Trait>`
 (which is `Send`). Only the shared variant is considered:
 
 ```rust
@@ -373,7 +379,7 @@ let kv = capabilities
     .require_shared::<KeyValueStore>()?;
 ```
 
-**`optional_local()`** / **`optional_shared()`** — Same
+**`optional_local()`** / **`optional_shared()`** -- Same
 semantics but return `Option` instead of `Result`:
 
 ```rust
@@ -387,19 +393,19 @@ if let Some(store) = capabilities
 All methods track which variants were consumed
 (`consumed_local()` / `consumed_shared()`). After all
 nodes are built, the engine uses this to drop unused
-extension variants — if no consumer asked for the local
+extension variants -- if no consumer asked for the local
 variant, `drop_local()` is called, freeing the `Rc`
 and preventing an orphaned lifecycle from starting.
 
 When a local entry is a `SharedAsLocal` adapter
-(piggyback pattern), consuming it via `require_local()`
-also marks `consumed_shared() = true`. This ensures the
+(shared-only with local fallback), consuming it via
+`require_local()` also marks `consumed_shared() = true`. This ensures the
 shared lifecycle is never dropped when local consumers
 depend on it through the adapter.
 
 ### Extension Traits
 
-Two lifecycle traits — local and shared:
+Two lifecycle traits -- local and shared:
 
 **Local** (`local/extension.rs`):
 
@@ -459,7 +465,7 @@ these during build to populate the `CapabilityRegistry`.
 ### Active Extension (Azure Identity Auth)
 
 ```rust
-// Factory — shared-only (piggyback)
+// Factory -- shared-only (with local fallback)
 ExtensionWrapper::builder(node, node_config, ext_config)
     .with_shared(Active(ext))
     .build()
@@ -467,7 +473,7 @@ ExtensionWrapper::builder(node, node_config, ext_config)
 
 The shared variant implements `Extension` with its own event
 loop. Local consumers are served automatically via the
-`SharedAsLocal` adapter — no separate local type needed.
+`SharedAsLocal` adapter -- no separate local type needed.
 
 ### Dual-Type Active Extension
 
@@ -476,7 +482,7 @@ implementations (e.g., lock-free `Rc<RefCell>` locally vs
 thread-safe `Arc<RwLock>` shared):
 
 ```rust
-// Factory — separate types with independent lifecycles
+// Factory -- separate types with independent lifecycles
 ExtensionWrapper::builder(node, node_config, ext_config)
     .with_local(Active(Rc::new(local_ext)))
     .with_shared(Active(shared_ext))
@@ -490,7 +496,7 @@ dual control channels, and `start()` spawns both.
 ### Passive Extension (Sample Shared KV Store)
 
 ```rust
-// Factory — no Extension trait impl needed
+// Factory -- no Extension trait impl needed
 ExtensionWrapper::builder(node, node_config, ext_config)
     .with_shared(Passive(ext))
     .build()
@@ -502,7 +508,7 @@ registers capabilities.
 ### Dual-Type Passive Extension (Sample Shared/Local KV Store)
 
 ```rust
-// Factory — local uses Rc<RefCell<HashMap>> (no locks),
+// Factory -- local uses Rc<RefCell<HashMap>> (no locks),
 //           shared uses Arc<RwLock<HashMap>> (thread-safe)
 ExtensionWrapper::builder(node, node_config, ext_config)
     .with_local(Passive(Rc::new(local_ext)))
@@ -510,7 +516,7 @@ ExtensionWrapper::builder(node, node_config, ext_config)
     .build()
 ```
 
-Different types → different `TypeId`s → accepted by
+Different types -> different `TypeId`s -> accepted by
 builder. Local consumers get the lock-free variant,
 shared consumers get the thread-safe variant.
 
@@ -572,7 +578,7 @@ groups:
 
           kv-store:
             type: "urn:otap:extension:sample_shared_key_value_store"
-            # no config needed — uses no_config validator
+            # no config needed -- uses no_config validator
 
         nodes:
           azure-monitor-exporter:
@@ -585,14 +591,14 @@ groups:
 
 The `capabilities` section maps capability names to
 extension instance names. This is how consumers declare
-their dependencies — the engine resolves them at build
+their dependencies -- the engine resolves them at build
 time via `resolve_bindings()`.
 
 ### Config Validation
 
 Each `ExtensionFactory` carries a `validate_config`
 function pointer that performs static validation during
-config parsing — before any extension is created:
+config parsing -- before any extension is created:
 
 ```rust
 pub struct ExtensionFactory {
@@ -605,7 +611,7 @@ pub struct ExtensionFactory {
 
 Two built-in validators:
 
-- **`validate_typed_config::<T>`** — Deserializes the JSON
+- **`validate_typed_config::<T>`** -- Deserializes the JSON
   config into type `T`. If deserialization fails, the error
   surfaces immediately at config parse time with a clear
   message. This is the most common validator:
@@ -614,7 +620,7 @@ Two built-in validators:
   validate_config: validate_typed_config::<Config>,
   ```
 
-- **`no_config`** — Accepts `null` or `{}` only. Rejects
+- **`no_config`** -- Accepts `null` or `{}` only. Rejects
   any other value, catching typos or misplaced config
   blocks early:
 
@@ -627,25 +633,25 @@ Two built-in validators:
 During `resolve_bindings()`, the engine validates each
 capability binding with four checks:
 
-1. **Extension exists** — The named extension instance must
+1. **Extension exists** -- The named extension instance must
    be registered. Error: "no extension with that name exists."
 
-2. **Known capability type** — The capability name must be
+2. **Known capability type** -- The capability name must be
    in `KNOWN_CAPABILITIES` (registered at link time via
    the `#[capability]` proc macro). Error: "Unknown capability"
    with a list of known types.
 
-3. **Capability provided** — Some loaded extension must
+3. **Capability provided** -- Some loaded extension must
    actually provide the requested capability. Error:
    "no loaded extension provides it."
 
-4. **Specific extension provides it** — The specific named
+4. **Specific extension provides it** -- The specific named
    extension must expose the requested capability. Error:
    "does not provide capability" with a list of what it
    does provide.
 
 After all nodes are built, the engine also detects
-**unused bindings** — capabilities that were configured
+**unused bindings** -- capabilities that were configured
 but never consumed by any `require_local()`,
 `require_shared()`, `optional_local()`, or
 `optional_shared()` call. These are reported as warnings
@@ -655,30 +661,137 @@ for configuration hygiene.
 
 ```text
 1. Config parsing
-   ├─ Extensions parsed from `extensions` section
-   └─ ExtensionInNodesSection error if misplaced
+   |- Extensions parsed from `extensions` section
+   \- ExtensionInNodesSection error if misplaced
 
 2. Pipeline build
-   ├─ Create extensions (factories return ExtensionWrapper)
-   ├─ register_traits() → populate CapabilityRegistry
-   ├─ resolve_bindings() → per-node Capabilities
-   ├─ Create data-path nodes (receive &Capabilities)
-   ├─ Track consumption (consumed_local/consumed_shared)
-   └─ Drop unused variants (drop_local/drop_shared)
+   |- Create extensions (factories return ExtensionWrapper)
+   |- register_traits() -> populate CapabilityRegistry
+   |- resolve_bindings() -> per-node Capabilities
+   |- Create data-path nodes (receive &Capabilities)
+   |- Track consumption (consumed_local/consumed_shared)
+   \- Drop unused variants (drop_local/drop_shared)
 
 3. Pipeline start (RuntimePipeline::run)
-   ├─ Passive extensions: skip (is_passive() == true)
-   ├─ Active extensions: spawn tasks, track control senders
-   ├─ Spawn exporters, processors, receivers
-   └─ Extension control senders stored separately
+   |- Passive extensions: skip (is_passive() == true)
+   |- Active extensions: spawn tasks, track control senders
+   |- Spawn exporters, processors, receivers
+   \- Extension control senders stored separately
 
 4. Steady state
-   ├─ Active extensions run event loops
-   ├─ Passive extensions exist only as registered capabilities
-   └─ ExtensionControlMsg flows to active extensions only
+   |- Active extensions run event loops
+   |- Passive extensions exist only as registered capabilities
+   \- ExtensionControlMsg flows to active extensions only
 
 5. Shutdown
-   ├─ Data-path nodes drain
-   ├─ shutdown_extensions() sends Shutdown to active only
-   └─ Extensions terminate after data-path is fully drained
+   |- Data-path nodes drain
+   |- shutdown_extensions() sends Shutdown to active only
+   \- Extensions terminate after data-path is fully drained
 ```
+
+## Migration Plan
+
+The extension system is developed on a feature branch and
+will be merged to `main` incrementally. Each PR is
+self-contained and leaves `main` in a working state.
+
+### PR 1 -- Config: `extensions` section + `capabilities` bindings
+
+Add config parsing for the `extensions:` section and
+`capabilities:` bindings on nodes. Includes:
+
+- `ExtensionConfig` struct in `otap-df-config`
+- Pipeline config parsing: `extensions` as siblings to `nodes`
+- `ExtensionInNodesSection` error if extensions are
+  misplaced inside `nodes`
+- `capabilities` field on `NodeUserConfig`
+- Config validation: `validate_typed_config`, `no_config`
+- No runtime behavior -- config is parsed and validated
+  but extensions are not created or started
+
+### PR 2 -- Engine: `ExtensionFactory` + `ExtensionWrapper` + builder
+
+Add the core engine types for extension lifecycle:
+
+- `ExtensionFactory` struct + `OTAP_EXTENSION_FACTORIES`
+  distributed slice
+- `ExtensionWrapper` with builder pattern
+- `Active<E>` / `Passive<E>` newtype wrappers
+- `ExtensionControlMsg`, control channel types
+- Extension `start()` traits (local + shared)
+- TypeId guard, dual control channels
+- No capability system yet -- extensions can start/stop
+  but don't provide capabilities
+
+### PR 3 -- Capability system: `#[capability]` proc macro + registry
+
+Add type-safe capability resolution:
+
+- `#[capability]` proc macro in `engine-macros`
+- `CapabilityRegistry`, `Capabilities` struct
+- `resolve_bindings()` with 4-step validation
+- `require_local()` / `require_shared()` /
+  `optional_local()` / `optional_shared()`
+- `extension_capabilities!` macro (3 arms:
+  `shared:`, `local:`, dual)
+- `SharedAsLocal` adapter + `shared_as_local` tracking
+- `consumed_local()` / `consumed_shared()` +
+  `drop_local()` / `drop_shared()`
+- `KNOWN_CAPABILITIES` link-time registration
+- Sealed traits + `ExtensionCapability` with
+  `Local`/`Shared` associated types
+- Compile-time assertions in `extension_capabilities!`
+
+### PR 4 -- First capabilities: `BearerTokenProvider` + `KeyValueStore`
+
+Define the initial capability traits:
+
+- `capability/bearer_token_provider.rs` -- `BearerToken`,
+  `Secret`, `#[capability]` invocation
+- `capability/key_value_store.rs` -- `#[capability]`
+  invocation
+- Re-exports in `local/capability.rs` and
+  `shared/capability.rs`
+
+### PR 5 -- Runtime pipeline: extension spawning + shutdown
+
+Wire extensions into the pipeline lifecycle:
+
+- `RuntimePipeline::run` -- spawn extensions before
+  data-path nodes, skip passive ones
+- `shutdown_extensions()` -- send `Shutdown` to active
+  extensions after data-path nodes drain
+- Extension control sender tracking in `pipeline_ctrl.rs`
+- `is_passive()` check
+
+### PR 6 -- Node factories: `&Capabilities` parameter
+
+Update `ExporterFactory`, `ProcessorFactory`,
+`ReceiverFactory` to accept `&Capabilities`:
+
+- Add `capabilities` parameter to factory `create` fn
+- Update all existing node factories to accept (and
+  ignore) the parameter
+- No consumer changes yet -- factories receive
+  `Capabilities` but don't call `require_*`
+
+### PR 7 -- Azure Identity Auth Extension
+
+First real extension implementation:
+
+- `azure_identity_auth_extension` -- shared-only (with local fallback)
+  active extension providing `BearerTokenProvider`
+- Token acquisition with retry + exponential backoff
+- Token refresh event loop with `watch::Sender` broadcast
+- Config: `method` (managed_identity / development),
+  `scope`, `client_id`
+
+### PR 8 -- Azure Monitor Exporter: consume `BearerTokenProvider`
+
+Migrate the exporter from built-in auth to extension-based:
+
+- Remove `auth` module from azure_monitor_exporter
+- Use `require_local::<BearerTokenProvider>()` in factory
+- Subscribe to `token_rx.changed()` in event loop
+- Config: remove `auth` section, add `capabilities`
+  binding in YAML

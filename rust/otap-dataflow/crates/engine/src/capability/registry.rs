@@ -552,7 +552,7 @@ pub struct ExtensionCapabilities {
 ///
 /// Always use an explicit prefix to declare which variant(s) the extension provides.
 ///
-/// # Shared-only (piggyback — local consumers get `SharedAsLocal` adapter):
+/// # Shared-only (with local fallback — local consumers get `SharedAsLocal` adapter):
 ///
 /// ```ignore
 /// extension_capabilities!(shared: MyExtension => BearerTokenProvider)
@@ -831,7 +831,7 @@ impl Capabilities {
     }
 
     /// Internal local typed lookup — returns `Rc<dyn Trait>` for true single-instance sharing.
-    /// When the entry is `shared_as_local` (piggyback), also marks `accessed_shared = true`
+    /// When the entry is `shared_as_local`, also marks `accessed_shared = true`
     /// so the engine doesn't drop the shared lifecycle that backs it.
     fn get_local_raw<T: ?Sized + 'static>(&self) -> Option<Rc<T>> {
         let key = TypeId::of::<Rc<T>>();
