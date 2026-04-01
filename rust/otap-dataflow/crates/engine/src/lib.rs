@@ -229,7 +229,7 @@ pub struct ExtensionFactory {
     /// registration functions used at pipeline build time.
     ///
     /// Use [`extension_capabilities!`](crate::extension_capabilities) to produce
-    /// this from the concrete extension type(s) and capability handle types.
+    /// this from the concrete extension type(s) and capability registration types.
     pub capabilities: capability::registry::ExtensionCapabilities,
     /// A function that creates a new extension instance.
     ///

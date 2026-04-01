@@ -127,6 +127,12 @@ fn generate(
         quote! {}
     };
 
+    // Build an uppercase static name for the KNOWN_CAPABILITIES entry.
+    let known_cap_static = Ident::new(
+        &format!("_KNOWN_CAP_{}", trait_name.to_string().to_uppercase()),
+        trait_name.span(),
+    );
+
     Ok(quote! {
         // ── Local trait (!Send) ─────────────────────────────────────────
         #[doc(hidden)]
@@ -158,7 +164,7 @@ fn generate(
             #(#adapter_methods)*
         }
 
-        // ── Registry helper (adapter + registration glue) ────────────────
+        // ── Zero-sized registration struct ──────────────────────────────
         /// Zero-sized type used as a namespace for capability registration helpers.
         #vis struct #trait_name;
 
@@ -198,14 +204,101 @@ fn generate(
         impl crate::local::capability::Sealed for dyn local::#trait_name {}
         impl crate::shared::capability::Sealed for dyn shared::#trait_name {}
 
-        // ── Capability registration (sealed traits, link-time, glue) ────
-        crate::register_capability!(
-            #trait_name,
-            local::#trait_name,
-            shared::#trait_name,
-            #cap_name,
-            #cap_desc,
-        );
+        // ── Capability sealing ──────────────────────────────────────────
+        impl crate::capability::registry::private::Sealed for #trait_name {
+            const MACRO_TOKEN: crate::capability::registry::private::MacroToken =
+                crate::capability::registry::private::MACRO_SEAL;
+        }
+        impl crate::capability::registry::ExtensionCapability for #trait_name {
+            const NAME: &'static str = #cap_name;
+            const DESCRIPTION: &'static str = #cap_desc;
+        }
+
+        // ── Link-time capability name registration ──────────────────────
+        #[allow(unsafe_code)]
+        #[crate::distributed_slice(crate::capability::registry::KNOWN_CAPABILITIES)]
+        static #known_cap_static: &str = #cap_name;
+
+        // ── Coercion glue: shared_capabilities / local_capabilities ─────
+        impl #trait_name {
+            /// Build shared capability registrations for this type.
+            pub fn shared_capabilities<T>(
+                instance: &T,
+            ) -> Vec<crate::capability::registry::shared::CapabilityRegistration>
+            where
+                T: Clone + Send + 'static + shared::#trait_name,
+            {
+                fn make_registration<TInner: Clone + Send + 'static + shared::#trait_name>(
+                    val: &TInner,
+                ) -> crate::capability::registry::shared::CapabilityRegistration {
+                    fn coerce<TInner: Clone + Send + 'static + shared::#trait_name>(
+                        any: &dyn std::any::Any,
+                    ) -> Box<dyn std::any::Any + Send> {
+                        let concrete = any
+                            .downcast_ref::<TInner>()
+                            .expect("registry entry type mismatch — this is a bug");
+                        let boxed: Box<dyn shared::#trait_name> = Box::new(concrete.clone());
+                        Box::new(boxed) as Box<dyn std::any::Any + Send>
+                    }
+
+                    crate::capability::registry::shared::CapabilityRegistration {
+                        trait_id: std::any::TypeId::of::<Box<dyn shared::#trait_name>>(),
+                        value: Box::new(val.clone()),
+                        coerce: coerce::<TInner>,
+                        capability_name:
+                            <#trait_name as crate::capability::registry::ExtensionCapability>::NAME,
+                        local_trait_id: Some(
+                            std::any::TypeId::of::<std::rc::Rc<dyn local::#trait_name>>(),
+                        ),
+                        adapt_to_local: Some(#trait_name::_adapt_shared_entry_to_local),
+                    }
+                }
+
+                vec![make_registration(instance)]
+            }
+
+            /// Build local capability registrations (Rc-based) for this type.
+            pub fn local_capabilities<T>(
+                instance: &std::rc::Rc<T>,
+            ) -> Vec<crate::capability::registry::local::CapabilityRegistration>
+            where
+                T: 'static + local::#trait_name,
+            {
+                fn make_registration<TInner: 'static + local::#trait_name>(
+                    rc: &std::rc::Rc<TInner>,
+                ) -> crate::capability::registry::local::CapabilityRegistration {
+                    fn coerce<TInner: 'static + local::#trait_name>(
+                        rc_any: std::rc::Rc<dyn std::any::Any>,
+                    ) -> Box<dyn std::any::Any> {
+                        let concrete: std::rc::Rc<TInner> = rc_any
+                            .downcast::<TInner>()
+                            .expect("registry entry type mismatch — this is a bug");
+                        let trait_obj: std::rc::Rc<dyn local::#trait_name> = concrete;
+                        Box::new(trait_obj) as Box<dyn std::any::Any>
+                    }
+
+                    crate::capability::registry::local::CapabilityRegistration {
+                        trait_id: std::any::TypeId::of::<std::rc::Rc<dyn local::#trait_name>>(),
+                        value: std::rc::Rc::clone(rc) as std::rc::Rc<dyn std::any::Any>,
+                        coerce: coerce::<TInner>,
+                        capability_name:
+                            <#trait_name as crate::capability::registry::ExtensionCapability>::NAME,
+                    }
+                }
+
+                vec![make_registration(instance)]
+            }
+
+            /// Compile-time assertion that `T` implements `shared::Trait`.
+            /// Called by `extension_capabilities!` to surface errors at the
+            /// extension's call site rather than deep inside generated code.
+            #[doc(hidden)]
+            pub fn assert_shared_impl<T: shared::#trait_name>() {}
+
+            /// Compile-time assertion that `T` implements `local::Trait`.
+            #[doc(hidden)]
+            pub fn assert_local_impl<T: local::#trait_name>() {}
+        }
     })
 }
 

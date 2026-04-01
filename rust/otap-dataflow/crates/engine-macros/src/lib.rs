@@ -40,9 +40,10 @@ pub fn pipeline_factory(args: TokenStream, input: TokenStream) -> TokenStream {
 /// 1. `pub mod local` — `#[async_trait(?Send)]` variant of the trait (only if async methods exist)
 /// 2. `pub mod shared` — `#[async_trait]` + `Send` variant of the trait (only if async methods exist)
 /// 3. `SharedAsLocal` adapter — wraps shared impl for local consumers
-/// 4. Handle enum — dispatches to either local or shared variant
-/// 5. `CapabilityHandle` impl — wires into the registry
-/// 6. `register_capability!` invocation — sealed traits + link-time registration
+/// 4. Zero-sized registration struct — namespace for registry helper methods
+/// 5. Sealed trait impls — compile-time enforcement that only engine-defined capabilities are accepted
+/// 6. Registration plumbing — sealing, `KNOWN_CAPABILITIES` link-time entry,
+///    and type-erased coercion functions for the capability registry
 ///
 /// `#[async_trait]` is only emitted when the trait contains async methods.
 ///

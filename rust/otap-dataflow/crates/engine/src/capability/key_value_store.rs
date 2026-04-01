@@ -3,15 +3,16 @@
 
 //! Key-value store capability.
 //!
-//! The `#[capability]` macro generates local/shared traits, the `SharedAsLocal`
-//! adapter, the handle enum, and registry glue from a single trait definition.
+//! The `#[capability]` macro generates local/shared trait variants, a
+//! `SharedAsLocal` adapter, sealed impls, a `KNOWN_CAPABILITIES` entry,
+//! and coercion functions from a single trait definition.
 //! Mirrors Go's `storage.Client` interface.
 
 use otap_df_engine_macros::capability;
 
 type Error = super::registry::Error;
 
-/// Handle that dispatches to either the local or shared variant.
+/// The `#[capability]` macro generates everything from this trait definition.
 #[capability(
     name = "key_value_store",
     description = "Provides key-value storage (get/set/delete) for pipeline components"

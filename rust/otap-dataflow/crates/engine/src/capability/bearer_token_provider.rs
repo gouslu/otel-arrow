@@ -4,13 +4,14 @@
 //! Bearer token provider capability.
 //!
 //! Shared data types (`BearerToken`, `Secret`) are defined here alongside the
-//! `#[capability]` macro invocation that generates local/shared traits, the
-//! `SharedAsLocal` adapter, the handle enum, and registry glue.
+//! `#[capability]` macro invocation. The macro generates local/shared trait
+//! variants, a `SharedAsLocal` adapter, sealed trait impls, a
+//! `KNOWN_CAPABILITIES` entry, and type-erased coercion functions.
 //!
 //! Extension authors import via `local::capability::BearerTokenProvider` and
 //! `shared::capability::BearerTokenProvider`. Consumers use
-//! `capabilities.require_local::<BearerTokenProvider>()` or
-//! `capabilities.require_shared::<BearerTokenProvider>()`.
+//! `capabilities.require_local::<dyn BearerTokenProvider>()` or
+//! `capabilities.require_shared::<dyn BearerTokenProvider>()`.
 
 use std::borrow::Cow;
 
@@ -90,7 +91,10 @@ impl BearerToken {
 
 // ── Capability ──────────────────────────────────────────────────────────────
 
-/// Handle that dispatches to either the local or shared variant.
+/// The `#[capability]` macro generates everything from this trait definition:
+/// local/shared trait variants, `SharedAsLocal` adapter, sealed impls,
+/// a zero-sized registration struct, `KNOWN_CAPABILITIES` entry, and
+/// coercion functions.
 #[capability(
     name = "bearer_token_provider",
     description = "Provides bearer tokens for authenticated HTTP/gRPC requests"
