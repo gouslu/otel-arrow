@@ -45,7 +45,7 @@ pub static SHARED_KV_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
              exporter_config: &ExporterConfig,
              capabilities: &otap_df_engine::capability::registry::Capabilities| {
         let kv = capabilities
-            .require_shared::<dyn otap_df_engine::shared::capability::KeyValueStore>()?;
+            .require_shared::<otap_df_engine::capability::key_value_store::KeyValueStore>()?;
 
         Ok(ExporterWrapper::shared(
             SharedKvExporter { kv },

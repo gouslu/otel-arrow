@@ -212,6 +212,8 @@ fn generate(
         impl crate::capability::registry::ExtensionCapability for #trait_name {
             const NAME: &'static str = #cap_name;
             const DESCRIPTION: &'static str = #cap_desc;
+            type Local = dyn local::#trait_name;
+            type Shared = dyn shared::#trait_name;
         }
 
         // ── Link-time capability name registration ──────────────────────

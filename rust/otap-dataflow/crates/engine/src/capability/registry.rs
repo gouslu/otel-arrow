@@ -102,6 +102,14 @@ pub trait ExtensionCapability: private::Sealed {
     ///
     /// Surfaced in error messages, generated documentation, and CLI inspection.
     const DESCRIPTION: &'static str;
+
+    /// The local (!Send) trait object type for this capability.
+    /// Used by `require_local()` to resolve `Rc<Self::Local>`.
+    type Local: ?Sized + 'static;
+
+    /// The shared (Send) trait object type for this capability.
+    /// Used by `require_shared()` to resolve `Box<Self::Shared>`.
+    type Shared: ?Sized + 'static;
 }
 
 /// Error type for extension trait operations.
@@ -734,13 +742,12 @@ impl Capabilities {
     /// # Example
     ///
     /// ```ignore
-    /// let auth: Rc<dyn local::BearerTokenProvider> =
-    ///     capabilities.require_local::<dyn local::BearerTokenProvider>()?;
+    /// let auth = capabilities.require_local::<BearerTokenProvider>()?;
     /// ```
-    pub fn require_local<T: crate::local::capability::Sealed + ?Sized + 'static>(
+    pub fn require_local<T: ExtensionCapability>(
         &self,
-    ) -> Result<Rc<T>, otap_df_config::error::Error> {
-        self.get_local_raw::<T>().ok_or_else(|| {
+    ) -> Result<Rc<T::Local>, otap_df_config::error::Error> {
+        self.get_local_raw::<T::Local>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: "Missing required capability. Add to your node config:\n  capabilities:\n    <capability_name>: <extension_instance_name>".to_string(),
             }
@@ -757,13 +764,12 @@ impl Capabilities {
     /// # Example
     ///
     /// ```ignore
-    /// let kv: Box<dyn shared::KeyValueStore> =
-    ///     capabilities.require_shared::<dyn shared::KeyValueStore>()?;
+    /// let kv = capabilities.require_shared::<KeyValueStore>()?;
     /// ```
-    pub fn require_shared<T: crate::shared::capability::Sealed + ?Sized + 'static>(
+    pub fn require_shared<T: ExtensionCapability>(
         &self,
-    ) -> Result<Box<T>, otap_df_config::error::Error> {
-        self.get_shared_raw::<T>().ok_or_else(|| {
+    ) -> Result<Box<T::Shared>, otap_df_config::error::Error> {
+        self.get_shared_raw::<T::Shared>().ok_or_else(|| {
             otap_df_config::error::Error::InvalidUserConfig {
                 error: "Missing required shared capability. The extension must provide a shared (Send) implementation.\n  capabilities:\n    <capability_name>: <extension_instance_name>".to_string(),
             }
@@ -775,10 +781,8 @@ impl Capabilities {
     /// Get an optional local capability.
     ///
     /// Returns `None` if the capability was not configured for this node.
-    pub fn optional_local<T: crate::local::capability::Sealed + ?Sized + 'static>(
-        &self,
-    ) -> Option<Rc<T>> {
-        let result = self.get_local_raw::<T>();
+    pub fn optional_local<T: ExtensionCapability>(&self) -> Option<Rc<T::Local>> {
+        let result = self.get_local_raw::<T::Local>();
         if result.is_some() {
             *self.accessed_local.borrow_mut() = true;
         }
@@ -789,10 +793,8 @@ impl Capabilities {
     ///
     /// Returns `None` if the capability was not configured or no shared
     /// variant is available.
-    pub fn optional_shared<T: crate::shared::capability::Sealed + ?Sized + 'static>(
-        &self,
-    ) -> Option<Box<T>> {
-        let result = self.get_shared_raw::<T>();
+    pub fn optional_shared<T: ExtensionCapability>(&self) -> Option<Box<T::Shared>> {
+        let result = self.get_shared_raw::<T::Shared>();
         if result.is_some() {
             *self.accessed_shared.borrow_mut() = true;
         }
@@ -1015,9 +1017,7 @@ mod tests {
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "ext".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
-        let handle = caps
-            .require_local::<dyn LocalBearerTokenProvider>()
-            .unwrap();
+        let handle = caps.require_local::<BearerTokenProviderHandle>().unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1264,7 +1264,7 @@ mod tests {
     #[test]
     fn test_require_missing_capability() {
         let caps = Capabilities::new();
-        let result = caps.require_local::<dyn LocalBearerTokenProvider>();
+        let result = caps.require_local::<BearerTokenProviderHandle>();
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("Missing required capability"), "{msg}");
@@ -1285,9 +1285,7 @@ mod tests {
         assert_eq!(unused, vec!["bearer_token_provider"]);
 
         // After accessing, none are unused.
-        let _ = caps
-            .require_local::<dyn LocalBearerTokenProvider>()
-            .unwrap();
+        let _ = caps.require_local::<BearerTokenProviderHandle>().unwrap();
         let unused = caps.unused_bindings();
         assert!(
             unused.is_empty(),
@@ -1303,9 +1301,7 @@ mod tests {
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
-        let auth = caps
-            .require_local::<dyn LocalBearerTokenProvider>()
-            .unwrap();
+        let auth = caps.require_local::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "local_token");
     }
@@ -1318,9 +1314,7 @@ mod tests {
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
-        let auth = caps
-            .require_shared::<dyn SharedBearerTokenProvider>()
-            .unwrap();
+        let auth = caps.require_shared::<BearerTokenProviderHandle>().unwrap();
         let token = auth.get_token().await.unwrap();
         assert_eq!(token.token.secret(), "shared_token");
     }
@@ -1334,7 +1328,7 @@ mod tests {
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Shared consumer should not get local-only capability
-        let result = caps.require_shared::<dyn SharedBearerTokenProvider>();
+        let result = caps.require_shared::<BearerTokenProviderHandle>();
         assert!(result.is_err());
     }
 }
