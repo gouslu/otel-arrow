@@ -391,6 +391,12 @@ extension variants — if no consumer asked for the local
 variant, `drop_local()` is called, freeing the `Rc`
 and preventing an orphaned lifecycle from starting.
 
+When a local entry is a `SharedAsLocal` adapter
+(piggyback pattern), consuming it via `require_local()`
+also marks `consumed_shared() = true`. This ensures the
+shared lifecycle is never dropped when local consumers
+depend on it through the adapter.
+
 ### Extension Traits
 
 Two lifecycle traits — local and shared:
