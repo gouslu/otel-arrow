@@ -542,34 +542,39 @@ pub struct ExtensionCapabilities {
     pub register_local: fn(Rc<dyn Any>) -> Vec<local::CapabilityRegistration>,
 }
 
-/// Produces an extension capabilities descriptor with both shared and local
-/// registration functions.
+/// Produces an extension capabilities descriptor.
 ///
-/// # Single-type usage (one type implements both local and shared traits):
+/// Always use an explicit prefix to declare which variant(s) the extension provides.
+///
+/// # Shared-only (piggyback — local consumers get `SharedAsLocal` adapter):
 ///
 /// ```ignore
-/// extension_capabilities!(MyExtension => BearerTokenProvider, HealthCheck)
+/// extension_capabilities!(shared: MyExtension => BearerTokenProvider)
 /// ```
 ///
-/// # Dual-type usage (separate local and shared implementations):
+/// # Local-only (shared consumers will get a config error):
+///
+/// ```ignore
+/// extension_capabilities!(local: MyLocalExtension => KeyValueStore)
+/// ```
+///
+/// # Dual-type (separate local and shared implementations):
 ///
 /// ```ignore
 /// extension_capabilities!(
-///     shared: shared::MyExtension,
-///     local: local::MyExtension
-///     => BearerTokenProvider, HealthCheck
+///     shared: SharedExt,
+///     local: LocalExt
+///     => BearerTokenProvider, KeyValueStore
 /// )
 /// ```
 #[macro_export]
 macro_rules! extension_capabilities {
-    // Single type — implements both local and shared traits
-    ($type:ty => $($handle:path),+ $(,)?) => {{
-        // Compile-time check: $type must implement all listed capability traits.
-        // Surfaces errors at this call site, not deep inside generated code.
+    // Shared-only — local consumers get served via SharedAsLocal adapter.
+    (shared: $type:ty => $($handle:path),+ $(,)?) => {{
+        // Compile-time check: $type must implement the shared capability traits.
         $(const _: () = {
             fn _check() {
                 <$handle>::assert_shared_impl::<$type>();
-                <$handle>::assert_local_impl::<$type>();
             }
         };)+
         $crate::capability::registry::ExtensionCapabilities {
@@ -581,6 +586,24 @@ macro_rules! extension_capabilities {
                 $(caps.extend(<$handle>::shared_capabilities(ext));)+
                 caps
             },
+            register_local: |_: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::capability::registry::local::CapabilityRegistration> {
+                Vec::new()
+            },
+        }
+    }};
+    // Local-only — shared consumers will get a config error at resolve_bindings() time.
+    (local: $type:ty => $($handle:path),+ $(,)?) => {{
+        // Compile-time check: $type must implement the local capability traits.
+        $(const _: () = {
+            fn _check() {
+                <$handle>::assert_local_impl::<$type>();
+            }
+        };)+
+        $crate::capability::registry::ExtensionCapabilities {
+            names: &[$(<$handle as $crate::capability::registry::ExtensionCapability>::NAME),+],
+            register_shared: |_: &dyn std::any::Any| -> Vec<$crate::capability::registry::shared::CapabilityRegistration> {
+                Vec::new()
+            },
             register_local: |rc_any: std::rc::Rc<dyn std::any::Any>| -> Vec<$crate::capability::registry::local::CapabilityRegistration> {
                 let rc = rc_any.downcast::<$type>()
                     .expect("extension type mismatch — this is a bug");
@@ -590,7 +613,7 @@ macro_rules! extension_capabilities {
             },
         }
     }};
-    // Dual types — separate local and shared implementations
+    // Dual types — separate local and shared implementations.
     (shared: $shared_type:ty, local: $local_type:ty => $($handle:path),+ $(,)?) => {{
         // Compile-time check: types must implement all listed capability traits.
         $(const _: () = {
@@ -946,7 +969,7 @@ mod tests {
         let instance = TestTokenProvider {
             token: token.to_string(),
         };
-        let caps = crate::extension_capabilities!(
+        let caps = crate::extension_capabilities!(shared:
             TestTokenProvider => BearerTokenProviderHandle
         );
         registry.register_all_shared(name, (caps.register_shared)(&instance));
@@ -963,7 +986,7 @@ mod tests {
             shared_token: shared_token.to_string(),
         };
 
-        let caps = crate::extension_capabilities!(
+        let caps = crate::extension_capabilities!(shared:
             DualTokenProvider => BearerTokenProviderHandle
         );
         registry.register_all_shared(name, (caps.register_shared)(&instance));
@@ -979,7 +1002,7 @@ mod tests {
         let rc: Rc<dyn Any> = Rc::new(LocalOnlyTokenProvider {
             token: token.to_string(),
         });
-        let caps = crate::extension_capabilities!(
+        let caps = crate::extension_capabilities!(shared:
             LocalOnlyTokenProvider => BearerTokenProviderHandle
         );
         registry.register_all_local(name, (caps.register_local)(rc));
@@ -992,7 +1015,8 @@ mod tests {
         let instance = TestTokenProvider {
             token: "shared_token".to_string(),
         };
-        let caps = crate::extension_capabilities!(TestTokenProvider => BearerTokenProviderHandle);
+        let caps =
+            crate::extension_capabilities!(shared: TestTokenProvider => BearerTokenProviderHandle);
         registry.register_all_shared("ext", (caps.register_shared)(&instance));
 
         let provider: Box<dyn SharedBearerTokenProvider> = registry
@@ -1011,8 +1035,7 @@ mod tests {
         let rc: Rc<dyn Any> = Rc::new(LocalOnlyTokenProvider {
             token: "local_token".to_string(),
         });
-        let caps =
-            crate::extension_capabilities!(LocalOnlyTokenProvider => BearerTokenProviderHandle);
+        let caps = crate::extension_capabilities!(shared: LocalOnlyTokenProvider => BearerTokenProviderHandle);
         registry.register_all_local("ext", (caps.register_local)(Rc::clone(&rc)));
 
         let bindings = HashMap::from([("bearer_token_provider".to_string(), "ext".to_string())]);

@@ -38,7 +38,7 @@ pub static SAMPLE_SHARED_KV_STORE: ExtensionFactory = ExtensionFactory {
     description: "Sample shared-only in-memory key-value store",
     documentation_url: "",
     capabilities: otap_df_engine::extension_capabilities!(
-        SampleSharedKeyValueStore => KeyValueStore
+        shared: SampleSharedKeyValueStore => KeyValueStore
     ),
     create: |_: PipelineContext,
              node: NodeId,

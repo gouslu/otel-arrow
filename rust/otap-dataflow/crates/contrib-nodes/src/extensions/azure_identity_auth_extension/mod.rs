@@ -45,21 +45,17 @@ use otap_df_engine::config::ExtensionConfig;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::extension::{Active, ExtensionWrapper};
 use otap_df_engine::node::NodeId;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use otap_df_otap::OTAP_EXTENSION_FACTORIES;
 
 mod config;
-mod core;
 mod error;
-/// Local (!Send) variant of the extension.
-pub mod local;
-/// Shared (Send) variant of the extension.
-pub mod shared;
+mod extension;
 
 pub use config::{AuthMethod, Config};
 pub use error::Error;
+pub use extension::AzureIdentityAuthExtension;
 
 /// URN identifying the Azure Identity Auth Extension in configuration pipelines.
 pub const AZURE_IDENTITY_AUTH_EXTENSION_URN: &str = "urn:microsoft:extension:azure_identity_auth";
@@ -74,9 +70,7 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
     description: "Azure Identity authentication via managed identity or developer tools",
     documentation_url: "https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/contrib-nodes/src/extensions/azure_identity_auth_extension",
     capabilities: otap_df_engine::extension_capabilities!(
-        shared: shared::AzureIdentityAuthExtension,
-        local: local::AzureIdentityAuthExtension
-        => BearerTokenProvider
+        shared: AzureIdentityAuthExtension => BearerTokenProvider
     ),
     create: |_: PipelineContext,
              node: NodeId,
@@ -94,21 +88,15 @@ pub static AZURE_IDENTITY_AUTH_EXTENSION: ExtensionFactory = ExtensionFactory {
                 error: e.to_string(),
             })?;
 
-        // Create both variants from the same config
-        let local_ext = local::AzureIdentityAuthExtension::new(node.name.to_string(), cfg.clone())
-            .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
+        let ext = AzureIdentityAuthExtension::new(node.name.to_string(), cfg).map_err(|e| {
+            otap_df_config::error::Error::InvalidUserConfig {
                 error: e.to_string(),
-            })?;
-
-        let shared_ext = shared::AzureIdentityAuthExtension::new(node.name.to_string(), cfg)
-            .map_err(|e| otap_df_config::error::Error::InvalidUserConfig {
-                error: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(
             ExtensionWrapper::builder(node, node_config, extension_config)
-                .with_local(Active(Rc::new(local_ext)))
-                .with_shared(Active(shared_ext))
+                .with_shared(Active(ext))
                 .build(),
         )
     },
