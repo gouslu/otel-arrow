@@ -10,7 +10,7 @@ use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
 use otap_df_engine::local::capability::BearerTokenProvider as LocalBearerTokenProvider;
 use otap_df_engine::local::exporter::{EffectHandler, Exporter};
-use otap_df_engine::message::{Message, MessageChannel};
+use otap_df_engine::message::{ExporterMessageChannel, Message};
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_pdata::otlp::OtlpProtoBytes;
 use otap_df_pdata::views::otap::OtapLogsView;
@@ -48,7 +48,6 @@ use std::rc::Rc;
 /// These are rough estimates — tune based on observed metrics in production.
 const MAX_IN_FLIGHT_EXPORTS: usize = 16;
 const PERIODIC_EXPORT_INTERVAL: u64 = 3;
-const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
 /// Buffer time before token expiry to stop accepting pdata.
 /// The auth extension refreshes tokens well before expiry, so this is a
 /// safety margin to avoid sending requests with an about-to-expire token.
@@ -65,7 +64,7 @@ pub struct AzureMonitorExporter {
     client_pool: LogsIngestionClientPool,
     in_flight_exports: InFlightExports,
     last_batch_queued_at: tokio::time::Instant,
-    heartbeat: Heartbeat,
+    heartbeat: Option<Heartbeat>,
 }
 
 impl AzureMonitorExporter {
@@ -90,10 +89,14 @@ impl AzureMonitorExporter {
         let transformer = Transformer::new(&config);
 
         // Create Gzip batcher
-        let gzip_batcher = GzipBatcher::new();
+        let gzip_batcher = GzipBatcher::new(config.api.gzip_compression_level);
 
         // Create heartbeat handler
-        let heartbeat = Heartbeat::new(&config.api)?;
+        let heartbeat = if config.heartbeat.enabled {
+            Some(Heartbeat::new(&config.api, &config.heartbeat.overrides)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
@@ -254,7 +257,8 @@ impl AzureMonitorExporter {
         let log_entries = self.transformer.convert_to_log_analytics(logs_view);
 
         for log_entry in log_entries {
-            match self.gzip_batcher.push(&log_entry) {
+            let entry_len = log_entry.len();
+            match self.gzip_batcher.push(log_entry) {
                 Ok(gzip_batcher::PushResult::Ok(batch_id)) => {
                     // current batch id is being associated with the current message
                     self.state.add_batch_msg_relationship(batch_id, msg_id);
@@ -270,7 +274,7 @@ impl AzureMonitorExporter {
                     otel_warn!(
                         "azure_monitor_exporter.message.log_entry_too_large",
                         msg_id = msg_id,
-                        size_bytes = log_entry.len()
+                        size_bytes = entry_len
                     );
                     if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
                         effect_handler
@@ -454,7 +458,7 @@ impl AzureMonitorExporter {
 impl Exporter<OtapPdata> for AzureMonitorExporter {
     async fn start(
         mut self: Box<Self>,
-        mut msg_chan: MessageChannel<OtapPdata>,
+        mut msg_chan: ExporterMessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, EngineError> {
         otel_info!(
@@ -511,7 +515,9 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                         match HeaderValue::from_str(&format!("Bearer {}", token.token.secret())) {
                             Ok(header) => {
                                 self.client_pool.update_auth(header.clone());
-                                self.heartbeat.update_auth(header);
+                                if let Some(ref mut hb) = self.heartbeat {
+                                    hb.update_auth(header);
+                                }
 
                                 // Compute token_expiry_at from the UNIX timestamp.
                                 let now_epoch = std::time::SystemTime::now()
@@ -534,12 +540,14 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                     }
                 }
 
-                _ = tokio::time::sleep_until(next_heartbeat_send), if has_token => {
-                    next_heartbeat_send = tokio::time::Instant::now() + tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS);
+                _ = tokio::time::sleep_until(next_heartbeat_send), if has_token && self.heartbeat.is_some() => {
+                    next_heartbeat_send = tokio::time::Instant::now() + self.config.heartbeat.frequency;
                     self.metrics.borrow_mut().add_heartbeat();
-                    match self.heartbeat.send().await {
-                        Ok(_) => otel_debug!("azure_monitor_exporter.heartbeat.sent"),
-                        Err(e) => otel_warn!("azure_monitor_exporter.heartbeat.send_failed", error = ?e),
+                    if let Some(ref mut hb) = self.heartbeat {
+                        match hb.send().await {
+                            Ok(_) => otel_debug!("azure_monitor_exporter.heartbeat.sent"),
+                            Err(e) => otel_warn!("azure_monitor_exporter.heartbeat.send_failed", error = ?e),
+                        }
                     }
                 }
 
@@ -613,7 +621,7 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{ApiConfig, SchemaConfig};
+    use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
     use super::*;
     use bytes::Bytes;
     use http::StatusCode;
@@ -675,7 +683,10 @@ mod tests {
                     log_record_mapping: HashMap::new(),
                 },
                 azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
             },
+            auth: AuthConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         }
     }
 

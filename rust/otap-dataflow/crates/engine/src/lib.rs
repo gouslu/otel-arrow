@@ -50,6 +50,8 @@ use std::{
 };
 
 pub mod capability;
+#[doc(hidden)]
+pub mod clock;
 pub mod error;
 pub mod exporter;
 pub mod extension;
@@ -60,9 +62,11 @@ pub mod receiver;
 mod attributes;
 mod channel_metrics;
 mod channel_mode;
+mod completion_emission_metrics;
 pub mod config;
 pub mod context;
 pub mod control;
+mod control_plane_metrics;
 pub mod effect_handler;
 pub mod engine_metrics;
 pub mod entity_context;
@@ -252,7 +256,7 @@ impl Clone for ExtensionFactory {
             name: self.name,
             description: self.description,
             documentation_url: self.documentation_url,
-            capabilities: self.capabilities.clone(),
+            capabilities: self.capabilities,
             create: self.create,
             validate_config: self.validate_config,
         }
@@ -660,7 +664,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         self.validate_connection_wiring_contracts(&config)?;
 
-        let channel_metrics_enabled = telemetry_policy.channel_metrics >= MetricLevel::Basic;
+        let channel_metrics_enabled = telemetry_policy.runtime_metrics >= MetricLevel::Basic;
 
         // First pass: allocate all node IDs from the build_state.
         let mut receiver_count = 0usize;

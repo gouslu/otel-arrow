@@ -64,7 +64,8 @@ use otap_df_engine::ReceivedAtNode;
 use otap_df_engine::Unwindable;
 use otap_df_engine::context::{ControllerContext, PipelineContext};
 use otap_df_engine::control::{
-    PipelineCtrlMsgReceiver, PipelineCtrlMsgSender, pipeline_ctrl_msg_channel,
+    PipelineCompletionMsgReceiver, PipelineCompletionMsgSender, RuntimeCtrlMsgReceiver,
+    RuntimeCtrlMsgSender, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
 };
 use otap_df_engine::entity_context::{
     node_entity_key, pipeline_entity_key, set_pipeline_entity_key,
@@ -969,6 +970,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         // Initialize metrics system and observed event store.
         // ToDo A hierarchical metrics system will be implemented to better support hardware with multiple NUMA nodes.
         let telemetry_config = &engine.telemetry;
+        let telemetry_reporting_interval = engine.telemetry.reporting_interval;
         otel_info!(
             "controller.start",
             num_pipeline_groups = num_pipeline_groups,
@@ -978,10 +980,18 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         // Create the shared telemetry registry first - it will be used by both
         // the observed state store and the internal telemetry system.
         let telemetry_registry = TelemetryRegistryHandle::new();
+        let log_tap_handle = telemetry_config
+            .logs
+            .tap
+            .enabled
+            .then(|| otap_df_telemetry::log_tap::build(&telemetry_config.logs.tap));
 
         // Create the observed state store for the telemetry system.
-        let obs_state_store =
-            ObservedStateStore::new(&engine.observed_state, telemetry_registry.clone());
+        let obs_state_store = ObservedStateStore::new_with_log_tap(
+            &engine.observed_state,
+            telemetry_registry.clone(),
+            log_tap_handle.clone(),
+        );
         let obs_state_handle = obs_state_store.handle();
         let engine_evt_reporter =
             obs_state_store.engine_reporter(engine.observed_state.engine_events);
@@ -999,6 +1009,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             telemetry_registry.clone(),
             console_async_reporter,
             engine_context,
+            log_tap_handle.clone(),
         )?;
 
         let admin_tracing_setup = telemetry_system.admin_tracing_setup();
@@ -1054,6 +1065,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             &controller_ctx,
             &engine_evt_reporter,
             &metrics_reporter,
+            telemetry_reporting_interval,
             internal_tracing_setup,
         )?;
 
@@ -1166,7 +1178,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         {
             let core_allocation = pipeline_entry
                 .policies
-                .effective_resources()
+                .resources
                 .core_allocation
                 .to_string();
             let channel_capacity_policy = pipeline_entry.policies.channel_capacity;
@@ -1189,9 +1201,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     pipeline_id: pipeline_id.clone(),
                     core_id: core_id.id,
                 };
-                let (pipeline_ctrl_msg_tx, pipeline_ctrl_msg_rx) =
-                    pipeline_ctrl_msg_channel(channel_capacity_policy.control.pipeline);
-                ctrl_msg_senders.push(pipeline_ctrl_msg_tx.clone());
+                let (runtime_ctrl_msg_tx, runtime_ctrl_msg_rx) =
+                    runtime_ctrl_msg_channel(channel_capacity_policy.control.pipeline);
+                let (pipeline_completion_msg_tx, pipeline_completion_msg_rx) =
+                    pipeline_completion_msg_channel(channel_capacity_policy.control.completion);
+                ctrl_msg_senders.push(runtime_ctrl_msg_tx.clone());
 
                 let pipeline_config = pipeline.clone();
                 let pipeline_factory = self.pipeline_factory;
@@ -1235,12 +1249,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                             pipeline_config,
                             effective_channel_capacity_policy,
                             effective_telemetry_policy,
+                            telemetry_reporting_interval,
                             pipeline_factory,
                             pipeline_handle,
                             engine_evt_reporter,
                             metrics_reporter,
-                            pipeline_ctrl_msg_tx,
-                            pipeline_ctrl_msg_rx,
+                            runtime_ctrl_msg_tx,
+                            runtime_ctrl_msg_rx,
+                            pipeline_completion_msg_tx,
+                            pipeline_completion_msg_rx,
                             engine_tracing_setup,
                             None,
                         )
@@ -1277,6 +1294,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     obs_state_handle,
                     admin_senders,
                     telemetry_registry,
+                    log_tap_handle,
                     cancellation_token,
                 )
             },
@@ -1464,10 +1482,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
             .map(|pipeline_entry| {
                 Self::select_cores_for_allocation(
                     available_core_ids.to_vec(),
-                    &pipeline_entry
-                        .policies
-                        .effective_resources()
-                        .core_allocation,
+                    &pipeline_entry.policies.resources.core_allocation,
                 )
             })
             .collect()
@@ -1497,6 +1512,7 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         controller_ctx: &ControllerContext,
         engine_evt_reporter: &ObservedEventReporter,
         metrics_reporter: &MetricsReporter,
+        telemetry_reporting_interval: std::time::Duration,
         tracing_setup: TracingSetup,
     ) -> Result<Option<(String, thread::JoinHandle<Result<Vec<()>, Error>>)>, Error> {
         let (internal_config, channel_capacity_policy, telemetry_policy): (
@@ -1548,7 +1564,9 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
 
         // Create control message channel for internal pipeline
         let (internal_ctrl_tx, internal_ctrl_rx) =
-            pipeline_ctrl_msg_channel(channel_capacity_policy.control.pipeline);
+            runtime_ctrl_msg_channel(channel_capacity_policy.control.pipeline);
+        let (internal_return_tx, internal_return_rx) =
+            pipeline_completion_msg_channel(channel_capacity_policy.control.completion);
 
         // Create a channel to signal startup success/failure
         let (startup_tx, startup_rx) = std_mpsc::sync_channel::<Result<(), EngineError>>(1);
@@ -1568,12 +1586,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     internal_config,
                     internal_channel_capacity_policy,
                     internal_telemetry_policy,
+                    telemetry_reporting_interval,
                     pipeline_factory,
                     internal_pipeline_ctx,
                     internal_evt_reporter,
                     internal_metrics_reporter,
                     internal_ctrl_tx,
                     internal_ctrl_rx,
+                    internal_return_tx,
+                    internal_return_rx,
                     tracing_setup,
                     Some((its_settings, startup_tx)),
                 )
@@ -1615,12 +1636,15 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
         pipeline_config: PipelineConfig,
         channel_capacity_policy: ChannelCapacityPolicy,
         telemetry_policy: TelemetryPolicy,
+        telemetry_reporting_interval: std::time::Duration,
         pipeline_factory: &'static PipelineFactory<PData>,
         pipeline_context: PipelineContext,
         obs_evt_reporter: ObservedEventReporter,
         metrics_reporter: MetricsReporter,
-        pipeline_ctrl_msg_tx: PipelineCtrlMsgSender<PData>,
-        pipeline_ctrl_msg_rx: PipelineCtrlMsgReceiver<PData>,
+        runtime_ctrl_msg_tx: RuntimeCtrlMsgSender<PData>,
+        runtime_ctrl_msg_rx: RuntimeCtrlMsgReceiver<PData>,
+        pipeline_completion_msg_tx: PipelineCompletionMsgSender<PData>,
+        pipeline_completion_msg_rx: PipelineCompletionMsgReceiver<PData>,
         tracing_setup: TracingSetup,
         internal_telemetry: Option<(
             InternalTelemetrySettings,
@@ -1702,8 +1726,11 @@ impl<PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + U
                     pipeline_context,
                     obs_evt_reporter,
                     metrics_reporter,
-                    pipeline_ctrl_msg_tx,
-                    pipeline_ctrl_msg_rx,
+                    telemetry_reporting_interval,
+                    runtime_ctrl_msg_tx,
+                    runtime_ctrl_msg_rx,
+                    pipeline_completion_msg_tx,
+                    pipeline_completion_msg_rx,
                 )
                 .map_err(|e| {
                     otel_error!(
@@ -1745,7 +1772,7 @@ fn error_summary_from_gen(error: &Error) -> ErrorSummary {
 mod tests {
     use super::*;
     use otap_df_config::engine::{ResolvedPipelineConfig, ResolvedPipelineRole};
-    use otap_df_config::policy::{CoreRange, Policies, ResourcesPolicy};
+    use otap_df_config::policy::{CoreRange, ResolvedPolicies, ResourcesPolicy};
     use otap_df_config::topic::{TopicAckPropagationMode, TopicBroadcastOnLagPolicy};
 
     fn available_core_ids() -> Vec<CoreId> {
@@ -1790,15 +1817,14 @@ connections:
         pipeline_id: &str,
         core_allocation: CoreAllocation,
     ) -> ResolvedPipelineConfig {
-        let policies = Policies {
-            resources: Some(ResourcesPolicy { core_allocation }),
-            ..Default::default()
-        };
         ResolvedPipelineConfig {
             pipeline_group_id: pipeline_group_id.to_string().into(),
             pipeline_id: pipeline_id.to_string().into(),
             pipeline: minimal_pipeline_config(),
-            policies,
+            policies: ResolvedPolicies {
+                resources: ResourcesPolicy { core_allocation },
+                ..Default::default()
+            },
             role: ResolvedPipelineRole::Regular,
         }
     }

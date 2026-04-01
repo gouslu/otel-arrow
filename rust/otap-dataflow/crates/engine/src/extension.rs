@@ -502,6 +502,7 @@ impl ExtensionWrapper {
     ///     .with_shared(Active(shared_ext))
     ///     .build()
     /// ```
+    #[must_use]
     pub fn builder(
         node_id: NodeId,
         user_config: Arc<NodeUserConfig>,

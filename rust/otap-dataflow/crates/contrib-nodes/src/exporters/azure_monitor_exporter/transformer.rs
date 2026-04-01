@@ -518,7 +518,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_config() -> Config {
-        use super::super::config::{ApiConfig, SchemaConfig};
+        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
 
         Config {
             api: ApiConfig {
@@ -538,7 +538,10 @@ mod tests {
                     ]),
                 },
                 azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
             },
+            auth: AuthConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         }
     }
 
@@ -826,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_empty_schema_mappings() {
-        use super::super::config::{ApiConfig, SchemaConfig};
+        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
 
         let config = Config {
             api: ApiConfig {
@@ -839,7 +842,10 @@ mod tests {
                     log_record_mapping: HashMap::new(),
                 },
                 azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
             },
+            auth: AuthConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
         };
 
         let transformer = Transformer::new(&config);

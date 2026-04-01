@@ -19,7 +19,7 @@ use otap_df_engine::exporter::ExporterWrapper;
 use otap_df_engine::message::Message;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::shared::capability::KeyValueStore as SharedKeyValueStoreTrait;
-use otap_df_engine::shared::exporter::{EffectHandler, Exporter, MessageChannel};
+use otap_df_engine::shared::exporter::{EffectHandler, Exporter, ExporterMessageChannel};
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_otap::OTAP_EXPORTER_FACTORIES;
 use otap_df_otap::pdata::OtapPdata;
@@ -62,7 +62,7 @@ pub static SHARED_KV_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
 impl Exporter<OtapPdata> for SharedKvExporter {
     async fn start(
         mut self: Box<Self>,
-        mut msg_chan: MessageChannel<OtapPdata>,
+        mut msg_chan: ExporterMessageChannel<OtapPdata>,
         effect_handler: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         otel_info!("shared_kv_exporter.start");

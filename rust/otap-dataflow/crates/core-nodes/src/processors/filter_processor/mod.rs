@@ -496,8 +496,9 @@ mod tests {
                                 .finish(),
                         ])
                         .links(vec![
-                            // no trace_id/span_id
                             Link::build()
+                                .trace_id([1u8; 16])
+                                .span_id([1u8; 8])
                                 .trace_state("link-state-1")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -534,6 +535,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([2u8; 16])
+                                .span_id([2u8; 8])
                                 .trace_state("link-state-2")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("external")),
@@ -568,6 +571,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([3u8; 16])
+                                .span_id([3u8; 8])
                                 .trace_state("link-state-3")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -622,6 +627,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([4u8; 16])
+                                .span_id([4u8; 8])
                                 .trace_state("link-state-s1")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -1325,6 +1332,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([1u8; 16])
+                                .span_id([1u8; 8])
                                 .trace_state("link-state-1")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -1431,6 +1440,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([1u8; 16])
+                                .span_id([1u8; 8])
                                 .trace_state("link-state-1")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -1469,6 +1480,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([2u8; 16])
+                                .span_id([2u8; 8])
                                 .trace_state("link-state-2")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("external")),
@@ -1505,6 +1518,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([3u8; 16])
+                                .span_id([3u8; 8])
                                 .trace_state("link-state-3")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),
@@ -1638,6 +1653,8 @@ mod tests {
                         ])
                         .links(vec![
                             Link::build()
+                                .trace_id([1u8; 16])
+                                .span_id([1u8; 8])
                                 .trace_state("link-state-1")
                                 .attributes(vec![
                                     KeyValue::new("link_tag", AnyValue::new_string("internal")),

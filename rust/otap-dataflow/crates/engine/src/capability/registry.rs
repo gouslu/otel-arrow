@@ -321,6 +321,7 @@ impl CapabilityRegistry {
     }
 
     /// Get a shared trait implementation by extension name.
+    #[must_use]
     pub fn get<T: ?Sized + 'static>(&self, name: &str) -> Option<Box<T>> {
         let key = (name.to_string(), TypeId::of::<Box<T>>());
         let entry = self.shared_handles.get(&key)?;
