@@ -8,8 +8,9 @@
 //! a `KNOWN_CAPABILITIES` entry, coercion functions, and a zero-sized registration
 //! struct. The registry stores and resolves capability bindings.
 //!
-//! Consumer code uses `capabilities.require_local::<dyn Trait>()` or
-//! `capabilities.require_shared::<dyn Trait>()` in node factories.
+//! Consumer code uses `capabilities.require_local::<T>()` or
+//! `capabilities.require_shared::<T>()` in node factories, where `T` is the
+//! zero-sized registration struct (e.g., `BearerTokenProvider`, `KeyValueStore`).
 
 /// Capability registry and sealed trait infrastructure.
 pub mod registry;

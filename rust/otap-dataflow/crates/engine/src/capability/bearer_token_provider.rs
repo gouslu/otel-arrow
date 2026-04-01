@@ -10,8 +10,8 @@
 //!
 //! Extension authors import via `local::capability::BearerTokenProvider` and
 //! `shared::capability::BearerTokenProvider`. Consumers use
-//! `capabilities.require_local::<dyn BearerTokenProvider>()` or
-//! `capabilities.require_shared::<dyn BearerTokenProvider>()`.
+//! `capabilities.require_local::<BearerTokenProvider>()` or
+//! `capabilities.require_shared::<BearerTokenProvider>()`.
 
 use std::borrow::Cow;
 
