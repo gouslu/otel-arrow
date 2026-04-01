@@ -453,7 +453,24 @@ these during build to populate the `CapabilityRegistry`.
 ### Active Extension (Azure Identity Auth)
 
 ```rust
-// Factory
+// Factory — shared-only (piggyback)
+ExtensionWrapper::builder(node, node_config, ext_config)
+    .with_shared(Active(ext))
+    .build()
+```
+
+The shared variant implements `Extension` with its own event
+loop. Local consumers are served automatically via the
+`SharedAsLocal` adapter — no separate local type needed.
+
+### Dual-Type Active Extension
+
+For extensions that need genuinely different local and shared
+implementations (e.g., lock-free `Rc<RefCell>` locally vs
+thread-safe `Arc<RwLock>` shared):
+
+```rust
+// Factory — separate types with independent lifecycles
 ExtensionWrapper::builder(node, node_config, ext_config)
     .with_local(Active(Rc::new(local_ext)))
     .with_shared(Active(shared_ext))
