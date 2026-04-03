@@ -856,8 +856,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                     exporters.push(wrapper);
                 }
                 otap_df_config::node::NodeKind::Extension => {
-                    // Rejected in first pass — extensions must be in the `extensions` section.
-                    unreachable!("rejected in first pass");
+                    return Err(Error::ExtensionInNodesSection { node: name.clone() });
                 }
                 otap_df_config::node::NodeKind::ProcessorChain => {
                     // ToDo(LQ): Implement processor chain optimization to eliminate intermediary channels.
