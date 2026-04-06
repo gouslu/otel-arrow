@@ -401,7 +401,7 @@ impl CapabilityRegistry {
     /// - A binding references a capability that the specific extension doesn't provide.
     pub fn resolve_bindings(
         &self,
-        bindings: &HashMap<String, String>,
+        bindings: &HashMap<otap_df_config::CapabilityId, otap_df_config::NodeId>,
     ) -> Result<Capabilities, otap_df_config::error::Error> {
         let mut capabilities = Capabilities::new();
         for (capability_name, extension_name) in bindings {
@@ -975,6 +975,21 @@ mod tests {
         }
     }
 
+    /// Helper: build a test capability bindings map.
+    fn bindings(
+        pairs: &[(&str, &str)],
+    ) -> HashMap<otap_df_config::CapabilityId, otap_df_config::NodeId> {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    otap_df_config::CapabilityId::from(k.to_string()),
+                    otap_df_config::NodeId::from(v.to_string()),
+                )
+            })
+            .collect()
+    }
+
     /// Helper: register a shared TestTokenProvider with the given name.
     fn register_provider(registry: &mut CapabilityRegistry, name: &str, token: &str) {
         let instance = TestTokenProvider {
@@ -1049,7 +1064,7 @@ mod tests {
         let caps = crate::extension_capabilities!(shared: LocalOnlyTokenProvider => BearerTokenProviderHandle);
         registry.register_all_local("ext", (caps.register_local)(Rc::clone(&rc)));
 
-        let bindings = HashMap::from([("bearer_token_provider".to_string(), "ext".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "ext")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
         let handle = caps.require_local::<BearerTokenProviderHandle>().unwrap();
 
@@ -1188,10 +1203,7 @@ mod tests {
     #[test]
     fn test_resolve_bindings_unknown_extension() {
         let registry = CapabilityRegistry::new();
-        let bindings = HashMap::from([(
-            "bearer_token_provider".to_string(),
-            "nonexistent".to_string(),
-        )]);
+        let bindings = bindings(&[("bearer_token_provider", "nonexistent")]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1205,7 +1217,7 @@ mod tests {
     fn test_resolve_bindings_unknown_capability_name() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([("totally_made_up".to_string(), "azure_auth".to_string())]);
+        let bindings = bindings(&[("totally_made_up", "azure_auth")]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1223,10 +1235,7 @@ mod tests {
     fn test_resolve_bindings_valid() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([(
-            "bearer_token_provider".to_string(),
-            "azure_auth".to_string(),
-        )]);
+        let bindings = bindings(&[("bearer_token_provider", "azure_auth")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
         assert!(!caps.is_empty());
     }
@@ -1261,8 +1270,7 @@ mod tests {
         // Extension "other_ext" exists but only provides "other_cap", not bearer_token_provider.
         let mut registry = CapabilityRegistry::new();
         register_fake_capability(&mut registry, "other_ext", "other_cap");
-        let bindings =
-            HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "other_ext")]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1280,8 +1288,7 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
         register_fake_capability(&mut registry, "other_ext", "other_cap");
-        let bindings =
-            HashMap::from([("bearer_token_provider".to_string(), "other_ext".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "other_ext")]);
         let err = registry.resolve_bindings(&bindings).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -1308,10 +1315,7 @@ mod tests {
     fn test_unused_bindings_detected() {
         let mut registry = CapabilityRegistry::new();
         register_provider(&mut registry, "azure_auth", "token");
-        let bindings = HashMap::from([(
-            "bearer_token_provider".to_string(),
-            "azure_auth".to_string(),
-        )]);
+        let bindings = bindings(&[("bearer_token_provider", "azure_auth")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Before any access, all bindings are unused.
@@ -1332,7 +1336,7 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_dual_provider(&mut registry, "auth", "local_token", "shared_token");
 
-        let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "auth")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         let auth = caps.require_local::<BearerTokenProviderHandle>().unwrap();
@@ -1345,7 +1349,7 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_dual_provider(&mut registry, "auth", "local_token", "shared_token");
 
-        let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "auth")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         let auth = caps.require_shared::<BearerTokenProviderHandle>().unwrap();
@@ -1358,7 +1362,7 @@ mod tests {
         let mut registry = CapabilityRegistry::new();
         register_local_only_provider(&mut registry, "auth", "local_only_token");
 
-        let bindings = HashMap::from([("bearer_token_provider".to_string(), "auth".to_string())]);
+        let bindings = bindings(&[("bearer_token_provider", "auth")]);
         let caps = registry.resolve_bindings(&bindings).unwrap();
 
         // Shared consumer should not get local-only capability
