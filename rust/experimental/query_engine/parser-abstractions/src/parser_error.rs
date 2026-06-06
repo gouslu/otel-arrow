@@ -28,6 +28,11 @@ pub enum ParserError {
         location: QueryLocation,
         key: String,
     },
+
+    /// Returned when a `ParserBudget` configured on `ParserOptions` is
+    /// exhausted. Not a transient failure.
+    #[error("{0}")]
+    BudgetExceeded(String),
 }
 
 impl From<&ExpressionError> for ParserError {

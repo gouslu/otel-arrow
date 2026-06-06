@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use data_engine_expressions::*;
 
@@ -34,6 +35,7 @@ pub struct ParserOptions {
     pub(crate) summary_map_schema: Option<ParserMapSchema>,
     pub(crate) attached_data_names: HashSet<Box<str>>,
     pub(crate) functions: Vec<ParserFunctionDefinition>,
+    pub(crate) budget: Option<ParserBudget>,
 }
 
 impl ParserOptions {
@@ -43,6 +45,7 @@ impl ParserOptions {
             summary_map_schema: None,
             attached_data_names: HashSet::new(),
             functions: Vec::new(),
+            budget: None,
         }
     }
 
@@ -89,6 +92,79 @@ impl ParserOptions {
 
     pub fn get_summary_map_schema(&self) -> Option<&ParserMapSchema> {
         self.summary_map_schema.as_ref()
+    }
+
+    /// Set a parsing budget. Concrete parsers check it at coarse
+    /// boundaries and return `ParserError::BudgetExceeded` when any
+    /// configured limit is reached.
+    pub fn with_budget(mut self, budget: ParserBudget) -> ParserOptions {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub fn get_budget(&self) -> Option<&ParserBudget> {
+        self.budget.as_ref()
+    }
+}
+
+/// Optional limits on parser work: input length, top-level statement
+/// count, and a wall-clock deadline. Any combination may be set; unset
+/// fields impose no limit.
+#[derive(Clone, Debug, Default)]
+pub struct ParserBudget {
+    max_input_bytes: Option<usize>,
+    max_top_level_statements: Option<usize>,
+    deadline: Option<Instant>,
+}
+
+impl ParserBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_input_bytes(mut self, bytes: usize) -> Self {
+        self.max_input_bytes = Some(bytes);
+        self
+    }
+
+    pub fn with_max_top_level_statements(mut self, count: usize) -> Self {
+        self.max_top_level_statements = Some(count);
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    pub fn max_input_bytes(&self) -> Option<usize> {
+        self.max_input_bytes
+    }
+
+    pub fn max_top_level_statements(&self) -> Option<usize> {
+        self.max_top_level_statements
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Returns `Some(reason)` if the statement-count or deadline limit
+    /// would be exceeded, `None` otherwise.
+    pub fn check(&self, statements_processed: usize) -> Option<String> {
+        if let Some(max) = self.max_top_level_statements
+            && statements_processed >= max
+        {
+            return Some(format!(
+                "parser budget exceeded: more than {max} top-level statements"
+            ));
+        }
+        if let Some(deadline) = self.deadline
+            && Instant::now() >= deadline
+        {
+            return Some("parser budget exceeded: deadline elapsed".to_string());
+        }
+        None
     }
 }
 

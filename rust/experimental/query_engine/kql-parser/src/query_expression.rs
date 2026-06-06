@@ -18,6 +18,24 @@ pub(crate) fn parse_query(
 ) -> Result<PipelineExpression, Vec<ParserError>> {
     let mut errors = Vec::new();
 
+    let budget = options.get_budget().cloned();
+    if let Some(ref budget) = budget {
+        if let Some(max) = budget.max_input_bytes()
+            && query.len() > max
+        {
+            errors.push(ParserError::BudgetExceeded(format!(
+                "parser budget exceeded: input length {} bytes exceeds maximum {} bytes",
+                query.len(),
+                max
+            )));
+            return Err(errors);
+        }
+        if let Some(reason) = budget.check(0) {
+            errors.push(ParserError::BudgetExceeded(reason));
+            return Err(errors);
+        }
+    }
+
     let mut state = ParserState::new_with_options(query, options);
 
     let parse_result = KqlPestParser::parse(Rule::query, query);
@@ -35,7 +53,14 @@ pub(crate) fn parse_query(
 
     let query_rules = parse_result.unwrap().next().unwrap().into_inner();
 
-    for rule in query_rules {
+    for (top_level_statements, rule) in query_rules.enumerate() {
+        if let Some(ref budget) = budget
+            && let Some(reason) = budget.check(top_level_statements)
+        {
+            errors.push(ParserError::BudgetExceeded(reason));
+            return Err(errors);
+        }
+
         match rule.as_rule() {
             Rule::variable_definition_expression => {
                 match parse_variable_definition_expression(rule, &state) {
