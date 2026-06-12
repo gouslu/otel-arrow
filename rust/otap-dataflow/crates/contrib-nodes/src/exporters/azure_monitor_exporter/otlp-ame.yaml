@@ -35,6 +35,8 @@ groups:
 
           azure-monitor-exporter:
             type: "urn:microsoft:exporter:azure_monitor"
+            capabilities:
+              bearer_token_provider: azure_identity
             config:
               # API configuration - Update with your actual values
               api:
@@ -71,20 +73,8 @@ groups:
                       "exception.message": "ExceptionMessage"
                       "user.id": "UserId"
 
-              # Authentication configuration for AKS
-              auth:
-                # Use managed identity for AKS workloads
-                method: "managedidentity"  # or "msi"
-
-                # For user-assigned managed identity (common in AKS)
-                # Get this from your AKS managed identity configuration
-                client_id: "YOUR-USER-ASSIGNED-IDENTITY-CLIENT-ID"
-
-                # For system-assigned managed identity (less common in AKS)
-                # Comment out the client_id field above
-
-                # OAuth scope for Azure Monitor
-                scope: "https://monitor.azure.com/.default"
+              # Authentication is provided by the `azure_identity` extension
+              # (see the `extensions:` section below).
 
               # Heartbeat configuration (optional, disabled by default)
               heartbeat:
@@ -97,6 +87,14 @@ groups:
                 #   os_name: "Ubuntu"
                 #   os_major_version: "22"
                 #   os_minor_version: "04"
+
+        extensions:
+          azure_identity:
+            type: "urn:microsoft:extension:azure_identity_auth"
+            config:
+              method: managed_identity
+              client_id: "YOUR-USER-ASSIGNED-IDENTITY-CLIENT-ID"
+              scope: "https://monitor.azure.com/.default"
 
         connections:
           - from: otlp-receiver

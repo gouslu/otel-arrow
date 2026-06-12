@@ -265,9 +265,15 @@ pub fn system_info<PData: 'static + Clone + Debug>(
         .collect();
     let mut exporters_sorted: Vec<&str> =
         factory.get_exporter_factory_map().keys().copied().collect();
+    let mut extensions_sorted: Vec<&str> = factory
+        .get_extension_factory_map()
+        .keys()
+        .copied()
+        .collect();
     receivers_sorted.sort();
     processors_sorted.sort();
     exporters_sorted.sort();
+    extensions_sorted.sort();
 
     format!(
         "System Information:
@@ -280,6 +286,7 @@ Available Component URNs:
   Receivers: {}
   Processors: {}
   Exporters: {}
+  Extensions: {}
 
 Example configuration files can be found in the configs/ directory.{}",
         available_cores,
@@ -290,6 +297,7 @@ Example configuration files can be found in the configs/ directory.{}",
         receivers_sorted.join(", "),
         processors_sorted.join(", "),
         exporters_sorted.join(", "),
+        extensions_sorted.join(", "),
         debug_warning
     )
 }

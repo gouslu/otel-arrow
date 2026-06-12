@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use async_trait::async_trait;
-use azure_core::credentials::AccessToken;
+use futures::StreamExt;
 use otap_df_channel::error::RecvError;
 use otap_df_config::SignalType;
 use otap_df_engine::ConsumerEffectHandlerExtension;
+use otap_df_engine::capability::bearer_token_provider::local;
 use otap_df_engine::context::PipelineContext;
 use otap_df_engine::control::{AckMsg, NackMsg, NodeControlMsg};
 use otap_df_engine::error::Error as EngineError;
@@ -17,7 +18,6 @@ use otap_df_pdata::views::otap::OtapLogsView;
 use otap_df_pdata::views::otlp::bytes::logs::RawLogsData;
 use otap_df_pdata::{OtapArrowRecords, OtapPayload};
 
-use super::auth::{Auth, PendingTokenRefresh};
 use super::client::LogsIngestionClientPool;
 use super::config::Config;
 use super::error::Error;
@@ -41,13 +41,6 @@ use std::rc::Rc;
 const MAX_IN_FLIGHT_EXPORTS: usize = 16;
 const PERIODIC_EXPORT_INTERVAL: u64 = 3;
 
-/// Minimum interval between token refresh attempts (10 seconds).
-const MIN_TOKEN_REFRESH_INTERVAL_SECS: u64 = 10;
-/// Buffer time before token expiry to trigger a refresh.
-/// Azure Identity SDK caches tokens internally and won't issue a new token
-/// until ~5 minutes before expiry, so we schedule refresh at 295 seconds before expiry.
-const TOKEN_EXPIRY_BUFFER_SECS: u64 = 295;
-
 /// Azure Monitor exporter.
 pub struct AzureMonitorExporter {
     config: Config,
@@ -59,11 +52,20 @@ pub struct AzureMonitorExporter {
     in_flight_exports: InFlightExports,
     last_batch_queued_at: tokio::time::Instant,
     heartbeat: Option<Heartbeat>,
+    /// Source of bearer tokens. Provided by the `azure-identity-auth`
+    /// extension (or any other implementation of `BearerTokenProvider`);
+    /// resolved by the factory and injected here so the constructor is
+    /// capability-agnostic and unit-testable.
+    token_provider: Box<dyn local::BearerTokenProvider>,
 }
 
 impl AzureMonitorExporter {
     /// Build a new exporter from configuration.
-    pub fn new(pipeline_ctx: PipelineContext, config: Config) -> Result<Self, Error> {
+    pub fn new(
+        pipeline_ctx: PipelineContext,
+        config: Config,
+        token_provider: Box<dyn local::BearerTokenProvider>,
+    ) -> Result<Self, Error> {
         // Validate configuration
         config
             .validate()
@@ -98,6 +100,7 @@ impl AzureMonitorExporter {
             in_flight_exports: InFlightExports::new(MAX_IN_FLIGHT_EXPORTS),
             last_batch_queued_at: tokio::time::Instant::now(),
             heartbeat,
+            token_provider,
         })
     }
 
@@ -366,25 +369,6 @@ impl AzureMonitorExporter {
         Ok(())
     }
 
-    #[inline]
-    fn get_next_token_refresh(token: AccessToken) -> tokio::time::Instant {
-        let now = azure_core::time::OffsetDateTime::now_utc();
-        let duration_remaining = if token.expires_on > now {
-            (token.expires_on - now).unsigned_abs()
-        } else {
-            std::time::Duration::ZERO
-        };
-
-        let token_valid_until = tokio::time::Instant::now() + duration_remaining;
-        let next_token_refresh =
-            token_valid_until - tokio::time::Duration::from_secs(TOKEN_EXPIRY_BUFFER_SECS);
-        std::cmp::max(
-            next_token_refresh,
-            tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(MIN_TOKEN_REFRESH_INTERVAL_SECS),
-        )
-    }
-
     async fn handle_message(
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
@@ -464,17 +448,10 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             endpoint = self.config.api.dcr_endpoint.as_str(),
             stream = self.config.api.stream_name.as_str(),
             dcr = self.config.api.dcr.as_str(),
-            auth_method = self.config.auth.auth_method_name(),
             gzip_compression_level = self.config.api.gzip_compression_level
         );
 
         let mut msg_id = 0;
-        let auth = Auth::new(&self.config.auth, self.metrics.clone()).map_err(|e| {
-            let error = Error::AuthHandlerCreation(Box::new(e));
-            EngineError::InternalError {
-                message: error.to_string(),
-            }
-        })?;
 
         self.client_pool
             .initialize(&self.config.api)
@@ -490,15 +467,26 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             + tokio::time::Duration::from_secs(PERIODIC_EXPORT_INTERVAL);
         let mut next_heartbeat_send = tokio::time::Instant::now();
 
-        // Token acquisition starts immediately in the event loop.
-        // pdata is not accepted until we have a valid token with sufficient remaining lifetime.
-        let mut next_token_refresh = tokio::time::Instant::now();
+        // Subscribe to the bearer-token stream. The extension publishes the
+        // current (and every subsequent) token here; until the first one
+        // arrives we refuse pdata, matching the legacy in-process behavior.
+        // We track when the current token expires (as a monotonic `Instant`)
+        // instead of a plain boolean so a stalled provider that fails to
+        // refresh before expiry automatically flips us back to "not accepting
+        // pdata".
+        let mut tokens = self.token_provider.token_stream();
+        // Initialize to "now" — i.e., already expired. The first published
+        // token bumps this forward; until then `has_token` evaluates false
+        // and pdata is gated off, matching the legacy in-process behavior.
         let mut token_expiry_at = tokio::time::Instant::now();
-        let mut auth = Some(auth);
-        let mut pending_token = PendingTokenRefresh::new();
+        let mut first_token_seen = false;
+        // Safety margin: stop accepting pdata this many seconds before the
+        // current token's actual expiry, so in-flight requests don't race the
+        // expiry boundary. The extension is expected to publish a refreshed
+        // token well before this window opens.
+        const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
 
         loop {
-            // We have a valid token when it won't expire within the buffer window
             let has_token = token_expiry_at
                 > tokio::time::Instant::now()
                     + tokio::time::Duration::from_secs(TOKEN_EXPIRY_BUFFER_SECS);
@@ -508,64 +496,42 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             tokio::select! {
                 biased;
 
-                // Start token acquisition when the timer fires and no acquisition is in progress
-                _ = tokio::time::sleep_until(next_token_refresh), if !pending_token.is_pending() => {
-                    pending_token.start(auth.take().expect("auth must be available when no token future is pending"));
-                }
-
-                // Poll the in-flight token acquisition (non-blocking for the rest of the loop)
-                token_result = pending_token.next_completion() => {
-                    auth = Some(token_result.auth);
-                    match token_result.result {
-                        Ok(access_token) => {
-                            match HeaderValue::from_str(&format!("Bearer {}", access_token.token.secret())) {
-                                Ok(header) => {
-                                    self.client_pool.update_auth(header.clone());
-                                    if let Some(ref mut hb) = self.heartbeat {
-                                        hb.update_auth(header.clone());
-                                    }
-
-                                    // Compute expiry before consuming access_token
-                                    let now_utc = azure_core::time::OffsetDateTime::now_utc();
-                                    let expires_in = if access_token.expires_on > now_utc {
-                                        (access_token.expires_on - now_utc).unsigned_abs()
-                                    } else {
-                                        std::time::Duration::ZERO
-                                    };
-                                    token_expiry_at = tokio::time::Instant::now() + expires_in;
-
-                                    next_token_refresh = Self::get_next_token_refresh(access_token);
-
-                                    let refresh_in = next_token_refresh.saturating_duration_since(tokio::time::Instant::now());
-                                    let total_secs = refresh_in.as_secs();
-                                    let hours = total_secs / 3600;
-                                    let minutes = (total_secs % 3600) / 60;
-                                    let seconds = total_secs % 60;
-
-                                    otel_info!("azure_monitor_exporter.auth.token_acquired", next_refresh_in = format!("{}h {}m {}s", hours, minutes, seconds));
-                                }
-                                Err(e) => {
-                                    otel_error!("azure_monitor_exporter.auth.header_creation_failed", error = ?e);
-                                    let jitter = 1.0 + (rand::random::<f64>() * 0.6 - 0.3);
-                                    next_token_refresh = tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(10.0 * jitter);
-                                }
-                            }
-                        }
+                // A fresh token from the auth extension — rebuild the bearer
+                // header and propagate it to the client pool and heartbeat.
+                Some(item) = tokens.next() => {
+                    let token = match item {
+                        Ok(t) => t,
                         Err(e) => {
-                            let error_msg = e.to_string();
-                            let first_line = error_msg.lines().next().unwrap_or(&error_msg);
-
-                            otel_warn!(
-                                "azure_monitor_exporter.auth.token_acquisition_failed",
-                                error = %first_line
-                            );
-                            otel_debug!(
-                                "azure_monitor_exporter.auth.token_acquisition_failed.details",
+                            otel_error!(
+                                "azure_monitor_exporter.auth.token_error",
                                 error = %e
                             );
-                            self.metrics.borrow_mut().add_auth_failure();
-                            let jitter = 1.0 + (rand::random::<f64>() * 0.6 - 0.3);
-                            next_token_refresh = tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(10.0 * jitter);
+                            continue;
+                        }
+                    };
+                    match HeaderValue::from_str(&format!("Bearer {}", token.token.secret())) {
+                        Ok(header) => {
+                            self.client_pool.update_auth(header.clone());
+                            if let Some(ref mut hb) = self.heartbeat {
+                                hb.update_auth(header);
+                            }
+                            if !first_token_seen {
+                                otel_info!("azure_monitor_exporter.auth.first_token_received");
+                                first_token_seen = true;
+                            }
+                            token_expiry_at = match token.expires_on {
+                                Some(exp) => tokio::time::Instant::from_std(exp),
+                                None => tokio::time::Instant::now()
+                                    + tokio::time::Duration::from_secs(365 * 24 * 60 * 60),
+                            };
+                        }
+                        Err(e) => {
+                            // Should never happen for a syntactically-valid token,
+                            // but log defensively and keep the previous header.
+                            otel_error!(
+                                "azure_monitor_exporter.auth.header_creation_failed",
+                                error = ?e
+                            );
                         }
                     }
                 }
@@ -605,7 +571,6 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                             if tracing::enabled!(tracing::Level::DEBUG) {
                                 let m = self.metrics.borrow();
                                 let cl = m.client_success_latency();
-                                let al = m.auth_success_latency();
                                 let bs = m.batch_size();
                                 otel_debug!(
                                     "azure_monitor_exporter.metrics.collect",
@@ -619,8 +584,6 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                                     client_success_latency_min_ms = if cl.count > 0 { cl.min } else { 0.0 },
                                     client_success_latency_max_ms = if cl.count > 0 { cl.max } else { 0.0 },
                                     client_success_latency_count = cl.count,
-                                    auth_success_latency_avg_ms = if al.count > 0 { al.sum / al.count as f64 } else { 0.0 },
-                                    auth_success_latency_count = al.count,
                                     batch_size_avg_bytes = if bs.count > 0 { bs.sum / bs.count as f64 } else { 0.0 },
                                     batch_size_min_bytes = if bs.count > 0 { bs.min } else { 0.0 },
                                     batch_size_max_bytes = if bs.count > 0 { bs.max } else { 0.0 },
@@ -650,13 +613,14 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
+    use super::super::config::{ApiConfig, HeartbeatConfig, SchemaConfig};
     use super::*;
-    use azure_core::time::OffsetDateTime;
     use bytes::Bytes;
+    use futures::stream;
     use http::StatusCode;
     use otap_df_channel::mpsc;
     use otap_df_engine::Interests;
+    use otap_df_engine::capability::bearer_token_provider::{BearerToken, local};
     use otap_df_engine::context::{ControllerContext, PipelineContext};
     use otap_df_engine::local::exporter::EffectHandler;
     use otap_df_engine::local::message::LocalReceiver;
@@ -666,7 +630,48 @@ mod tests {
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use otap_df_telemetry::reporter::MetricsReporter;
     use std::collections::HashMap;
+    use std::pin::Pin;
     use std::time::{Duration, Instant};
+
+    /// Minimal stand-in for an extension-backed `BearerTokenProvider`. Returns a
+    /// fixed token from both the cache fast path (`get_token`) and the live
+    /// stream — sufficient for unit tests that construct the exporter without
+    /// driving its `start()` loop.
+    struct StubBearerTokenProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl local::BearerTokenProvider for StubBearerTokenProvider {
+        async fn get_token(
+            &self,
+        ) -> Result<BearerToken, otap_df_engine::capability::CapabilityError> {
+            Ok(BearerToken::new(
+                "stub",
+                Instant::now() + Duration::from_secs(3600),
+            ))
+        }
+
+        fn token_stream(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<BearerToken, otap_df_engine::capability::CapabilityError>,
+                    > + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(stream::once(async {
+                Ok(BearerToken::new(
+                    "stub",
+                    Instant::now() + Duration::from_secs(3600),
+                ))
+            }))
+        }
+    }
+
+    fn stub_token_provider() -> Box<dyn local::BearerTokenProvider> {
+        Box::new(StubBearerTokenProvider)
+    }
 
     fn create_test_pipeline_ctx() -> PipelineContext {
         otap_df_otap::crypto::ensure_crypto_provider();
@@ -690,7 +695,6 @@ mod tests {
                 gzip_compression_level: 6,
                 user_agent: None,
             },
-            auth: AuthConfig::default(),
             heartbeat: HeartbeatConfig::default(),
         }
     }
@@ -720,39 +724,15 @@ mod tests {
     fn test_new_validates_config() {
         let config = create_test_config();
         let pipeline_ctx = create_test_pipeline_ctx();
-        let _ = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
-    }
-
-    #[test]
-    fn test_get_next_token_refresh_logic() {
-        let now = OffsetDateTime::now_utc();
-        let expires_on = now + azure_core::time::Duration::seconds(3600);
-
-        let token = AccessToken {
-            token: "secret".into(),
-            expires_on,
-        };
-
-        let refresh_at = AzureMonitorExporter::get_next_token_refresh(token);
-        let duration_until_refresh = refresh_at.duration_since(tokio::time::Instant::now());
-
-        // Should be 3600 - 295 = 3305 seconds before refresh
-        // Allow some delta for execution time
-        let expected = 3305.0;
-        let actual = duration_until_refresh.as_secs_f64();
-        assert!(
-            (actual - expected).abs() < 5.0,
-            "Expected ~{}, got {}",
-            expected,
-            actual
-        );
+        let _ = AzureMonitorExporter::new(pipeline_ctx, config, stub_token_provider()).unwrap();
     }
 
     #[tokio::test]
     async fn test_handle_export_success() {
         let config = create_test_config();
         let pipeline_ctx = create_test_pipeline_ctx();
-        let mut exporter = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
+        let mut exporter =
+            AzureMonitorExporter::new(pipeline_ctx, config, stub_token_provider()).unwrap();
 
         let (_, reporter) = MetricsReporter::create_new_and_receiver(10);
         let node_id = NodeId {
@@ -793,7 +773,8 @@ mod tests {
     async fn test_handle_export_failure() {
         let config = create_test_config();
         let pipeline_ctx = create_test_pipeline_ctx();
-        let mut exporter = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
+        let mut exporter =
+            AzureMonitorExporter::new(pipeline_ctx, config, stub_token_provider()).unwrap();
 
         let (_, reporter) = MetricsReporter::create_new_and_receiver(10);
         let node_id = NodeId {

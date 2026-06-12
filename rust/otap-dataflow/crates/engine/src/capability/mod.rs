@@ -15,6 +15,12 @@
 pub mod factory;
 pub mod registry;
 
+mod error;
+
+/// Bearer token provider capability.
+pub mod bearer_token_provider;
+
+pub use error::{CapabilityError, CapabilityErrorSource};
 pub use factory::{LocalInstanceFactory, SharedInstanceFactory};
 
 // ── Sealed ExtensionCapability trait ─────────────────────────────────────────

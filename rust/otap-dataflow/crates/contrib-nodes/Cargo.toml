@@ -87,9 +87,7 @@ geneva-exporter = [
 ]
 azure-monitor-exporter = [
     "dep:opentelemetry-proto",
-    "dep:azure_identity",
     "dep:reqwest",
-    "dep:azure_core",
     "dep:ahash",
     "dep:sysinfo",
     "dep:chrono",

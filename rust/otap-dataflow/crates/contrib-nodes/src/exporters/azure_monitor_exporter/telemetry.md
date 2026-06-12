@@ -21,8 +21,6 @@ by the crate and log events emitted via `otel_*` log macros.
 | `exporter.azure_monitor.laclient_http_413` | Number of HTTP 413 responses. | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/client.rs` |
 | `exporter.azure_monitor.laclient_http_429` | Number of HTTP 429 responses. | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/client.rs` |
 | `exporter.azure_monitor.laclient_http_5xx` | Number of HTTP 5xx responses. | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/client.rs` |
-| `exporter.azure_monitor.auth_failures` | Number of failed authentication attempts. | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/auth.rs` |
-| `exporter.azure_monitor.auth_success_latency` | Authentication success latency in milliseconds (min/max/sum/count). | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/auth.rs` |
 | `exporter.azure_monitor.batch_size` | Compressed batch size in bytes (min/max/sum/count). | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/client.rs` |
 | `exporter.azure_monitor.batch_uncompressed_size` | Uncompressed batch size in bytes (min/max/sum/count). | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/exporter.rs` |
 | `exporter.azure_monitor.in_flight_exports` | Current number of in-flight export requests. | `crates/contrib-nodes/src/exporters/azure_monitor_exporter/exporter.rs` |

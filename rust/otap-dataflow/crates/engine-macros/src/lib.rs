@@ -60,7 +60,7 @@ pub fn pipeline_factory(args: TokenStream, input: TokenStream) -> TokenStream {
 /// #[capability(name = "bearer_token_provider", description = "Provides bearer tokens")]
 /// pub trait BearerTokenProvider {
 ///     async fn get_token(&self) -> Result<BearerToken, Error>;
-///     fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>>;
+///     fn token_stream(&self) -> Pin<Box<dyn Stream<Item = Result<BearerToken, Error>> + Send>>;
 /// }
 /// ```
 ///
@@ -74,7 +74,7 @@ pub fn pipeline_factory(args: TokenStream, input: TokenStream) -> TokenStream {
 ///     #[async_trait(?Send)]
 ///     pub trait BearerTokenProvider {
 ///         async fn get_token(&self) -> Result<BearerToken, Error>;
-///         fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>>;
+///         fn token_stream(&self) -> Pin<Box<dyn Stream<Item = Result<BearerToken, Error>> + Send>>;
 ///     }
 /// }
 ///
@@ -83,7 +83,7 @@ pub fn pipeline_factory(args: TokenStream, input: TokenStream) -> TokenStream {
 ///     #[async_trait]
 ///     pub trait BearerTokenProvider: Send {
 ///         async fn get_token(&self) -> Result<BearerToken, Error>;
-///         fn subscribe_token_refresh(&self) -> watch::Receiver<Option<BearerToken>>;
+///         fn token_stream(&self) -> Pin<Box<dyn Stream<Item = Result<BearerToken, Error>> + Send>>;
 ///     }
 /// }
 ///

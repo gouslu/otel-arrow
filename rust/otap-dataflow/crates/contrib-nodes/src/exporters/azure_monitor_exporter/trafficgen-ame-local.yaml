@@ -49,6 +49,8 @@ groups:
 
           azure-monitor-exporter:
             type: "urn:microsoft:exporter:azure_monitor"
+            capabilities:
+              bearer_token_provider: azure_identity
             config:
               api:
                 # Point to local mock server instead of real Azure endpoint
@@ -70,8 +72,15 @@ groups:
                       "thread.id": "ThreadId"
                       "thread.name": "ThreadName"
 
-              auth:
-                method: "dev"
+              # Authentication is provided by the `azure_identity` extension
+              # (see the `extensions:` section below).
+
+        extensions:
+          azure_identity:
+            type: "urn:microsoft:extension:azure_identity_auth"
+            config:
+              method: development
+              scope: "https://monitor.azure.com/.default"
 
         connections:
           - from: traffic-generator

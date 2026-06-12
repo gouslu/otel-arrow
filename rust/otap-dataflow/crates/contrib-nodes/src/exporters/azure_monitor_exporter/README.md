@@ -80,21 +80,24 @@ config:
         "attributes":
           "message": "ParsedMessage"
 
-  # Authentication configuration. Use "msi" for managed identity or "dev" for
-  # local Azure developer credentials.
-  auth:
-    method: msi
-
-  # Optional heartbeat rows.
-  heartbeat:
-    enabled: false
-    frequency: 60s
+      # Authentication is provided by the `azure_identity_auth` extension.
+      # The exporter receives bearer tokens through the `bearer_token_provider`
+      # capability (see the `extensions:` section + `capabilities:` binding
+      # in the example YAML configurations bundled with this crate).
 ```
 
 ### Authentication
 
-The exporter uses Azure SDK authentication. `auth.method: msi` uses managed
-identity; `auth.method: dev` uses local Azure developer credentials.
+This exporter no longer owns authentication. It declares a
+`bearer_token_provider` capability dependency and is wired to an extension
+(typically `azure_identity_auth`) that fetches and refreshes tokens in the
+background. The exporter starts in a "no token, no pdata" state and only
+begins accepting data once the extension has published a valid token; if the
+extension fails to refresh before expiry, the exporter automatically stops
+accepting new pdata until a fresh token arrives.
+
+See the bundled `otlp-ame.yaml`, `trafficgen-ame.yaml`, and
+`trafficgen-ame-local.yaml` for example wiring.
 
 ## Usage
 
