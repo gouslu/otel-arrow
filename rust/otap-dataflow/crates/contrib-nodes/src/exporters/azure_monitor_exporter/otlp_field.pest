@@ -1,0 +1,47 @@
+source_expr = { SOI ~ path ~ EOI }
+
+path = { resource_path | scope_path | log_record_path }
+
+resource_path  = { "resource" ~ "." ~ (attributes_access | resource_field) }
+resource_field = { "dropped_attributes_count" }
+
+scope_path  = { "scope" ~ "." ~ (attributes_access | scope_field) }
+scope_field = { "name" | "version" | "dropped_attributes_count" }
+
+log_record_path  = { "log_record" ~ "." ~ (attributes_access | log_record_field) }
+log_record_field = { "body" | "severity_text" | "severity_number"
+                   | "time_unix_nano" | "observed_time_unix_nano"
+                   | "trace_id" | "span_id" | "flags" | "event_name"
+                   | "dropped_attributes_count" }
+
+attributes_access = {
+    "attributes" ~ "["
+    ~ (single_quoted_string_literal | double_quoted_string_literal)
+    ~ "]"
+}
+
+single_quoted_string_literal = @{
+    "'" ~ single_quoted_string_content ~ "'"
+}
+double_quoted_string_literal = @{
+    "\"" ~ double_quoted_string_content ~ "\""
+}
+
+single_quoted_string_content = {
+    (escape_sequence | single_quoted_unescaped_char)*
+}
+double_quoted_string_content = {
+    (escape_sequence | double_quoted_unescaped_char)*
+}
+
+escape_sequence = {
+  "\\" ~ (
+      "n" | "r" | "t"
+    | "b" | "f"
+    | "\\" | "/" | "'" | "\""
+    | "u" ~ ASCII_HEX_DIGIT{4}
+  )
+}
+
+single_quoted_unescaped_char = { !("'"  | "\\" | "\n" | "\r") ~ ANY }
+double_quoted_unescaped_char = { !("\"" | "\\" | "\n" | "\r") ~ ANY }

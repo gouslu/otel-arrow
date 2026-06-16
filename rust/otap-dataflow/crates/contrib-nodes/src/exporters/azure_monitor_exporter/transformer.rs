@@ -13,8 +13,9 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::config::{Config, SchemaConfig};
+use super::config::{Config, SchemaConfig, SchemaConfigV2};
 use super::error::Error;
+use super::otlp_field::{self, LogRecordField, OtlpField, ResourceField, ScopeField};
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
@@ -27,81 +28,51 @@ struct FieldMapping {
     dest_key_json: Vec<u8>,
 }
 
-/// Enum representing known log record fields for fast matching
-#[derive(Debug, Clone, Copy)]
-enum LogRecordField {
-    TimeUnixNano,
-    ObservedTimeUnixNano,
-    TraceId,
-    SpanId,
-    Flags,
-    SeverityNumber,
-    SeverityText,
-    Body,
-    EventName,
-}
-
-impl LogRecordField {
-    /// Parse a field name string into a LogRecordField enum
-    fn from_str(s: &str) -> Option<Self> {
-        if s.eq_ignore_ascii_case("time_unix_nano") {
-            Some(Self::TimeUnixNano)
-        } else if s.eq_ignore_ascii_case("observed_time_unix_nano") {
-            Some(Self::ObservedTimeUnixNano)
-        } else if s.eq_ignore_ascii_case("trace_id") {
-            Some(Self::TraceId)
-        } else if s.eq_ignore_ascii_case("span_id") {
-            Some(Self::SpanId)
-        } else if s.eq_ignore_ascii_case("flags") {
-            Some(Self::Flags)
-        } else if s.eq_ignore_ascii_case("severity_number") {
-            Some(Self::SeverityNumber)
-        } else if s.eq_ignore_ascii_case("severity_text") {
-            Some(Self::SeverityText)
-        } else if s.eq_ignore_ascii_case("body") {
-            Some(Self::Body)
-        } else if s.eq_ignore_ascii_case("event_name") {
-            // Add this
-            Some(Self::EventName)
-        } else {
-            None
-        }
-    }
-}
-
 /// Pre-parsed schema configuration for faster runtime processing
 #[derive(Debug, Clone)]
 struct ParsedSchema {
-    /// Resource attribute mappings (source -> dest)
-    resource_mapping: HashMap<String, String>,
-    /// Scope attribute mappings (source -> dest)
-    scope_mapping: HashMap<String, String>,
+    /// Resource attribute mappings (source -> dest columns; v2 allows fan-out)
+    resource_mapping: HashMap<String, Vec<String>>,
+    /// Scope attribute mappings (source -> dest columns; v2 allows fan-out)
+    scope_mapping: HashMap<String, Vec<String>>,
+    /// Direct resource-level field mappings (v2 only)
+    resource_fields: Vec<(ResourceField, String)>,
+    /// Direct scope-level field mappings (v2 only)
+    scope_fields: Vec<(ScopeField, String)>,
     /// Pre-parsed log record field mappings
     field_mappings: Vec<FieldMapping>,
-    /// Pre-parsed attribute mappings (source attr -> pre-serialized JSON key)
-    attribute_mapping: HashMap<String, Vec<u8>>,
+    /// Pre-parsed attribute mappings (source attr -> pre-serialized JSON keys; v2 allows fan-out)
+    attribute_mapping: HashMap<String, Vec<Vec<u8>>>,
 }
 
 impl ParsedSchema {
     fn from_config(schema: &SchemaConfig) -> Result<Self, Error> {
-        let mut field_mappings = Vec::new();
-        let mut attribute_mapping = HashMap::new();
+        match schema {
+            SchemaConfig::V1(v1) => Self::from_v1(v1),
+            SchemaConfig::V2(v2) => Self::from_v2(v2),
+        }
+    }
 
-        for (key, value) in &schema.log_record_mapping {
+    fn from_v1(v1: &super::config::SchemaConfigV1) -> Result<Self, Error> {
+        let mut field_mappings = Vec::new();
+        let mut attribute_mapping: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+
+        for (key, value) in &v1.log_record_mapping {
             if key.eq_ignore_ascii_case("attributes") {
-                // Parse attribute mappings
                 if let Some(attr_map) = value.as_object() {
                     for (attr_key, attr_dest) in attr_map {
                         let dest = attr_dest
                             .as_str()
                             .map(String::from)
                             .unwrap_or_else(|| attr_dest.to_string());
-                        _ = attribute_mapping.insert(attr_key.clone(), serialize_json_key(&dest));
+                        attribute_mapping
+                            .entry(attr_key.clone())
+                            .or_default()
+                            .push(serialize_json_key(&dest));
                     }
                 }
             } else {
-                // Parse field mapping
-                let source = LogRecordField::from_str(key)
+                let source = LogRecordField::from_str_ci(key)
                     .ok_or_else(|| Error::UnknownLogRecordField { field: key.clone() })?;
                 let dest = value
                     .as_str()
@@ -113,12 +84,78 @@ impl ParsedSchema {
             }
         }
 
+        let resource_mapping = v1
+            .resource_mapping
+            .iter()
+            .map(|(k, v)| (k.clone(), vec![v.clone()]))
+            .collect();
+        let scope_mapping = v1
+            .scope_mapping
+            .iter()
+            .map(|(k, v)| (k.clone(), vec![v.clone()]))
+            .collect();
+
         Ok(Self {
-            resource_mapping: schema.resource_mapping.clone(),
-            scope_mapping: schema.scope_mapping.clone(),
+            resource_mapping,
+            scope_mapping,
+            resource_fields: Vec::new(),
+            scope_fields: Vec::new(),
             field_mappings,
             attribute_mapping,
         })
+    }
+
+    fn from_v2(v2: &SchemaConfigV2) -> Result<Self, Error> {
+        let mut parsed = Self {
+            resource_mapping: HashMap::new(),
+            scope_mapping: HashMap::new(),
+            resource_fields: Vec::new(),
+            scope_fields: Vec::new(),
+            field_mappings: Vec::new(),
+            attribute_mapping: HashMap::new(),
+        };
+
+        for (column, source) in &v2.0 {
+            match otlp_field::parse_otlp_field(source).map_err(|reason| {
+                Error::Config(format!("Invalid v2 source '{source}': {reason}"))
+            })? {
+                OtlpField::ResourceAttribute(key) => {
+                    parsed
+                        .resource_mapping
+                        .entry(key)
+                        .or_default()
+                        .push(column.clone());
+                }
+                OtlpField::ResourceField(field) => {
+                    parsed.resource_fields.push((field, column.clone()));
+                }
+                OtlpField::ScopeAttribute(key) => {
+                    parsed
+                        .scope_mapping
+                        .entry(key)
+                        .or_default()
+                        .push(column.clone());
+                }
+                OtlpField::ScopeField(field) => {
+                    parsed.scope_fields.push((field, column.clone()));
+                }
+                OtlpField::LogRecordAttribute(key) => {
+                    parsed
+                        .attribute_mapping
+                        .entry(key)
+                        .or_default()
+                        .push(serialize_json_key(column));
+                }
+                OtlpField::LogRecordField(field) => {
+                    parsed.field_mappings.push(FieldMapping {
+                        source: field,
+                        dest_key_json: serialize_json_key(column),
+                    });
+                }
+            }
+        }
+
+        Ok(parsed)
     }
 }
 
@@ -250,14 +287,16 @@ impl Transformer {
         if !self.schema.attribute_mapping.is_empty() {
             for attr in log_record.attributes() {
                 let attr_key: Cow<'_, str> = String::from_utf8_lossy(attr.key());
-                if let Some(dest) = self.schema.attribute_mapping.get(attr_key.as_ref()) {
+                if let Some(dests) = self.schema.attribute_mapping.get(attr_key.as_ref()) {
                     if let Some(val) = attr.value() {
-                        if has_field {
-                            out.push(b',');
+                        for dest in dests {
+                            if has_field {
+                                out.push(b',');
+                            }
+                            has_field = true;
+                            out.extend_from_slice(dest);
+                            Self::write_any_value_json(&val, out);
                         }
-                        has_field = true;
-                        out.extend_from_slice(dest);
-                        Self::write_any_value_json(&val, out);
                     }
                 }
             }
@@ -303,6 +342,9 @@ impl Transformer {
             },
             LogRecordField::EventName => {
                 Self::write_json_string(log_record.event_name().unwrap_or(b""), out);
+            }
+            LogRecordField::DroppedAttributesCount => {
+                Self::write_u64(log_record.dropped_attributes_count().into(), out);
             }
         }
     }
@@ -523,11 +565,26 @@ impl Transformer {
         resource: &R,
         map: &mut serde_json::Map<String, Value>,
     ) {
-        for attr in resource.attributes() {
-            let key: Cow<'_, str> = String::from_utf8_lossy(attr.key());
-            if let Some(mapped_name) = self.schema.resource_mapping.get(key.as_ref()) {
-                if let Some(value) = attr.value() {
-                    _ = map.insert(mapped_name.clone(), Self::convert_any_value(&value));
+        if !self.schema.resource_mapping.is_empty() {
+            for attr in resource.attributes() {
+                let key: Cow<'_, str> = String::from_utf8_lossy(attr.key());
+                if let Some(dests) = self.schema.resource_mapping.get(key.as_ref()) {
+                    if let Some(value) = attr.value() {
+                        let converted = Self::convert_any_value(&value);
+                        for dest in dests {
+                            _ = map.insert(dest.clone(), converted.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for (field, dest) in &self.schema.resource_fields {
+            match field {
+                ResourceField::DroppedAttributesCount => {
+                    _ = map.insert(
+                        dest.clone(),
+                        Value::Number(resource.dropped_attributes_count().into()),
+                    );
                 }
             }
         }
@@ -539,13 +596,32 @@ impl Transformer {
         scope: &S,
         map: &mut serde_json::Map<String, Value>,
     ) {
-        for attr in scope.attributes() {
-            let key: Cow<'_, str> = String::from_utf8_lossy(attr.key());
-            if let Some(mapped_name) = self.schema.scope_mapping.get(key.as_ref()) {
-                if let Some(value) = attr.value() {
-                    _ = map.insert(mapped_name.clone(), Self::convert_any_value(&value));
+        if !self.schema.scope_mapping.is_empty() {
+            for attr in scope.attributes() {
+                let key: Cow<'_, str> = String::from_utf8_lossy(attr.key());
+                if let Some(dests) = self.schema.scope_mapping.get(key.as_ref()) {
+                    if let Some(value) = attr.value() {
+                        let converted = Self::convert_any_value(&value);
+                        for dest in dests {
+                            _ = map.insert(dest.clone(), converted.clone());
+                        }
+                    }
                 }
             }
+        }
+        for (field, dest) in &self.schema.scope_fields {
+            let value = match field {
+                ScopeField::Name => {
+                    Value::String(scope.name().map(Self::str_to_string).unwrap_or_default())
+                }
+                ScopeField::Version => {
+                    Value::String(scope.version().map(Self::str_to_string).unwrap_or_default())
+                }
+                ScopeField::DroppedAttributesCount => {
+                    Value::Number(scope.dropped_attributes_count().into())
+                }
+            };
+            _ = map.insert(dest.clone(), value);
         }
     }
 
@@ -638,14 +714,16 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_config() -> Config {
-        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
+        use super::super::config::{
+            ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV1,
+        };
 
         Config {
             api: ApiConfig {
                 dcr_endpoint: "https://test.com".into(),
                 stream_name: "test-stream".into(),
                 dcr: "test-dcr".into(),
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([(
                         "service.name".into(),
                         "ServiceName".into(),
@@ -656,7 +734,7 @@ mod tests {
                         ("severity_text".into(), json!("Severity")),
                         ("attributes".into(), json!({"test.attr": "TestAttr"})),
                     ]),
-                },
+                }),
                 azure_monitor_source_resourceid: None,
                 gzip_compression_level: 6,
                 user_agent: None,
@@ -730,7 +808,7 @@ mod tests {
     #[test]
     fn test_all_log_record_fields() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping = HashMap::from([
             ("time_unix_nano".to_string(), json!("Time")),
             ("observed_time_unix_nano".to_string(), json!("ObservedTime")),
             ("trace_id".to_string(), json!("TraceId")),
@@ -860,16 +938,22 @@ mod tests {
         _ = config
             .api
             .schema
+            .as_v1_mut()
+            .unwrap()
             .log_record_mapping
             .insert("trace_id".into(), json!("TraceId"));
         _ = config
             .api
             .schema
+            .as_v1_mut()
+            .unwrap()
             .log_record_mapping
             .insert("span_id".into(), json!("SpanId"));
         _ = config
             .api
             .schema
+            .as_v1_mut()
+            .unwrap()
             .log_record_mapping
             .insert("body".into(), json!("Body"));
 
@@ -925,6 +1009,8 @@ mod tests {
         _ = config
             .api
             .schema
+            .as_v1_mut()
+            .unwrap()
             .log_record_mapping
             .insert("invalid_field".into(), json!("Invalid"));
 
@@ -945,6 +1031,8 @@ mod tests {
         _ = config
             .api
             .schema
+            .as_v1_mut()
+            .unwrap()
             .log_record_mapping
             .insert("body".into(), json!({"nested": "object"}));
 
@@ -955,18 +1043,20 @@ mod tests {
 
     #[test]
     fn test_empty_schema_mappings() {
-        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
+        use super::super::config::{
+            ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV1,
+        };
 
         let config = Config {
             api: ApiConfig {
                 dcr_endpoint: "https://test.com".into(),
                 stream_name: "test-stream".into(),
                 dcr: "test-dcr".into(),
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::new(),
                     scope_mapping: HashMap::new(),
                     log_record_mapping: HashMap::new(),
-                },
+                }),
                 azure_monitor_source_resourceid: None,
                 gzip_compression_level: 6,
                 user_agent: None,
@@ -1108,7 +1198,8 @@ mod tests {
     #[test]
     fn test_empty_body_string() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([("body".into(), json!("Body"))]);
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping =
+            HashMap::from([("body".into(), json!("Body"))]);
 
         let transformer = Transformer::new(&config);
 
@@ -1151,7 +1242,7 @@ mod tests {
     #[test]
     fn test_case_insensitive_field_names() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping = HashMap::from([
             ("TIME_UNIX_NANO".into(), json!("Time")),
             ("Body".into(), json!("Body")),
             ("SEVERITY_TEXT".into(), json!("Severity")),
@@ -1226,7 +1317,7 @@ mod tests {
     #[test]
     fn test_event_name_field() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping = HashMap::from([
             ("event_name".into(), json!("EventName")),
             ("severity_text".into(), json!("Severity")),
         ]);
@@ -1347,7 +1438,7 @@ mod tests {
     #[test]
     fn test_utf8_multibyte_strings() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping = HashMap::from([
             ("body".into(), json!("Body")),
             ("severity_text".into(), json!("Sev")),
         ]);
@@ -1490,7 +1581,7 @@ mod tests {
     fn test_null_safe_attribute_value_extraction() {
         // Test each value type mapped as a log record attribute
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([(
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping = HashMap::from([(
             "attributes".into(),
             json!({
                 "str_attr": "StrCol",
@@ -1635,7 +1726,8 @@ mod tests {
     #[test]
     fn test_invalid_utf8_body_produces_valid_json() {
         let mut config = create_test_config();
-        config.api.schema.log_record_mapping = HashMap::from([("body".into(), json!("Body"))]);
+        config.api.schema.as_v1_mut().unwrap().log_record_mapping =
+            HashMap::from([("body".into(), json!("Body"))]);
 
         let transformer = Transformer::new(&config);
 
@@ -1707,5 +1799,584 @@ mod tests {
             body.contains('\u{FFFD}'),
             "expected replacement character in body, got: {body:?}"
         );
+    }
+
+    fn make_v2_config(schema_map: HashMap<String, String>) -> Config {
+        use super::super::config::{
+            ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV2,
+        };
+        Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://test.com".into(),
+                stream_name: "test-stream".into(),
+                dcr: "test-dcr".into(),
+                schema: SchemaConfig::V2(SchemaConfigV2(schema_map)),
+                azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
+                user_agent: None,
+            },
+            auth: AuthConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_v2_full_pipeline() {
+        let schema = HashMap::from([
+            (
+                "ServiceName".into(),
+                "resource.attributes['service.name']".into(),
+            ),
+            (
+                "ResourceDropped".into(),
+                "resource.dropped_attributes_count".into(),
+            ),
+            ("ScopeName".into(), "scope.name".into()),
+            ("ScopeVersion".into(), "scope.version".into()),
+            (
+                "ScopeDropped".into(),
+                "scope.dropped_attributes_count".into(),
+            ),
+            (
+                "InstrumentationLibrary".into(),
+                "scope.attributes['otel.library.name']".into(),
+            ),
+            ("Message".into(), "log_record.body".into()),
+            ("Severity".into(), "log_record.severity_text".into()),
+            (
+                "LogDropped".into(),
+                "log_record.dropped_attributes_count".into(),
+            ),
+            (
+                "HttpMethod".into(),
+                "log_record.attributes['http.method']".into(),
+            ),
+        ]);
+        let config = make_v2_config(schema);
+        let transformer = Transformer::try_new(&config).expect("v2 config should build");
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("svc".into())),
+                        }),
+                    }],
+                    dropped_attributes_count: 3,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "my-scope".into(),
+                        version: "1.2.3".into(),
+                        attributes: vec![KeyValue {
+                            key: "otel.library.name".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("lib".into())),
+                            }),
+                        }],
+                        dropped_attributes_count: 5,
+                    }),
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("hello".into())),
+                        }),
+                        severity_text: "INFO".into(),
+                        dropped_attributes_count: 7,
+                        attributes: vec![KeyValue {
+                            key: "http.method".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("GET".into())),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let bytes = request.encode_to_vec();
+        let logs_view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&logs_view);
+        assert_eq!(result.len(), 1);
+        let json: Value = serde_json::from_slice(&result[0]).unwrap();
+
+        assert_eq!(json["ServiceName"], "svc");
+        assert_eq!(json["ResourceDropped"], 3);
+        assert_eq!(json["ScopeName"], "my-scope");
+        assert_eq!(json["ScopeVersion"], "1.2.3");
+        assert_eq!(json["ScopeDropped"], 5);
+        assert_eq!(json["InstrumentationLibrary"], "lib");
+        assert_eq!(json["Message"], "hello");
+        assert_eq!(json["Severity"], "INFO");
+        assert_eq!(json["LogDropped"], 7);
+        assert_eq!(json["HttpMethod"], "GET");
+    }
+
+    #[test]
+    fn test_v2_double_quoted_attribute_key() {
+        let schema = HashMap::from([(
+            "ServiceName".into(),
+            "resource.attributes[\"service.name\"]".into(),
+        )]);
+        let config = make_v2_config(schema);
+        let transformer = Transformer::try_new(&config).unwrap();
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("svc".into())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord::default()],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let bytes = request.encode_to_vec();
+        let logs_view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&logs_view);
+        let json: Value = serde_json::from_slice(&result[0]).unwrap();
+        assert_eq!(json["ServiceName"], "svc");
+    }
+
+    #[test]
+    fn test_v2_same_source_fans_out_to_multiple_columns() {
+        let schema = HashMap::from([
+            (
+                "ResAttrA".to_string(),
+                "resource.attributes['service.name']".to_string(),
+            ),
+            (
+                "ResAttrB".to_string(),
+                "resource.attributes['service.name']".to_string(),
+            ),
+            (
+                "ScopeAttrA".to_string(),
+                "scope.attributes['lib']".to_string(),
+            ),
+            (
+                "ScopeAttrB".to_string(),
+                "scope.attributes['lib']".to_string(),
+            ),
+            (
+                "LogAttrA".to_string(),
+                "log_record.attributes['http.method']".to_string(),
+            ),
+            (
+                "LogAttrB".to_string(),
+                "log_record.attributes['http.method']".to_string(),
+            ),
+        ]);
+        let config = make_v2_config(schema);
+        let transformer = Transformer::try_new(&config).unwrap();
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("svc".into())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: String::new(),
+                        version: String::new(),
+                        attributes: vec![KeyValue {
+                            key: "lib".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("std".into())),
+                            }),
+                        }],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        attributes: vec![KeyValue {
+                            key: "http.method".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("GET".into())),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let bytes = request.encode_to_vec();
+        let logs_view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&logs_view);
+        let json: Value = serde_json::from_slice(&result[0]).unwrap();
+        assert_eq!(json["ResAttrA"], "svc");
+        assert_eq!(json["ResAttrB"], "svc");
+        assert_eq!(json["ScopeAttrA"], "std");
+        assert_eq!(json["ScopeAttrB"], "std");
+        assert_eq!(json["LogAttrA"], "GET");
+        assert_eq!(json["LogAttrB"], "GET");
+    }
+
+    #[test]
+    fn test_v2_parse_errors() {
+        for bad in [
+            "garbage",
+            "resource",
+            "resource.nope",
+            "scope.bogus",
+            "log_record.not_a_field",
+            "resource.attributes[service.name]",
+            "resource.attributes['unclosed",
+            "resource.attributes",
+            "resource.attributes.service_name",
+            r"resource.attributes['\uD800']",
+            r"resource.attributes['\uDFFF']",
+        ] {
+            let schema = HashMap::from([("Col".into(), bad.into())]);
+            let config = make_v2_config(schema);
+            assert!(
+                Transformer::try_new(&config).is_err(),
+                "expected parse error for source {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_escaped_attribute_key_decodes() {
+        let schema = HashMap::from([(
+            "Apostrophe".into(),
+            r"log_record.attributes['it\'s']".into(),
+        )]);
+        let config = make_v2_config(schema);
+        let transformer = Transformer::try_new(&config).expect("should build");
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        attributes: vec![KeyValue {
+                            key: "it's".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("yes".into())),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let bytes = request.encode_to_vec();
+        let view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&view);
+        let json: Value = serde_json::from_slice(&result[0]).unwrap();
+        assert_eq!(json["Apostrophe"], "yes");
+    }
+
+    #[test]
+    fn test_v2_unicode_escape_decodes() {
+        let schema = HashMap::from([(
+            "EAcute".into(),
+            r"log_record.attributes['caf\u00e9']".into(),
+        )]);
+        let config = make_v2_config(schema);
+        let transformer = Transformer::try_new(&config).expect("should build");
+
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        attributes: vec![KeyValue {
+                            key: "café".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("hot".into())),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let bytes = request.encode_to_vec();
+        let view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&view);
+        let json: Value = serde_json::from_slice(&result[0]).unwrap();
+        assert_eq!(json["EAcute"], "hot");
+    }
+
+    /// Invariant: every source string that passes config validation must
+    /// also be parseable by the transformer. (Transformer may be more
+    /// permissive; that's fine. The other direction would mean a config
+    /// could pass validation yet break at transformer construction.)
+    #[test]
+    fn test_config_accepted_sources_are_transformer_parseable() {
+        use super::super::config::SchemaConfig as Sc;
+        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfigV2};
+
+        let corpus = [
+            // resource
+            "resource.dropped_attributes_count",
+            "resource.attributes['service.name']",
+            "resource.attributes[\"k8s.pod.name\"]",
+            // scope
+            "scope.name",
+            "scope.version",
+            "scope.dropped_attributes_count",
+            "scope.attributes['otel.library.name']",
+            // log_record fields (all)
+            "log_record.body",
+            "log_record.severity_text",
+            "log_record.severity_number",
+            "log_record.time_unix_nano",
+            "log_record.observed_time_unix_nano",
+            "log_record.trace_id",
+            "log_record.span_id",
+            "log_record.flags",
+            "log_record.event_name",
+            "log_record.dropped_attributes_count",
+            // log_record attributes incl. escape sequences
+            "log_record.attributes['http.method']",
+            r"log_record.attributes['it\'s']",
+            r#"log_record.attributes["say \"hi\""]"#,
+            r"log_record.attributes['line\nbreak']",
+            r"log_record.attributes['tab\there']",
+            r"log_record.attributes['back\\slash']",
+            r"log_record.attributes['slash\/here']",
+            r"log_record.attributes['caf\u00e9']",
+            r"log_record.attributes['\b\f\r']",
+        ];
+
+        for source in corpus {
+            let mut map = HashMap::new();
+            _ = map.insert("Col".to_string(), source.to_string());
+            let config = Config {
+                api: ApiConfig {
+                    dcr_endpoint: "https://example.com".into(),
+                    stream_name: "s".into(),
+                    dcr: "d".into(),
+                    schema: Sc::V2(SchemaConfigV2(map)),
+                    azure_monitor_source_resourceid: None,
+                    gzip_compression_level: 6,
+                    user_agent: None,
+                },
+                auth: AuthConfig::default(),
+                heartbeat: HeartbeatConfig::default(),
+            };
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("config rejected {source:?}: {e}"));
+            _ = Transformer::try_new(&config).unwrap_or_else(|e| {
+                panic!(
+                    "config accepted {source:?} but transformer rejected it: {e} \
+                     — config and transformer have drifted"
+                )
+            });
+        }
+    }
+
+    fn make_v1_config(v1: super::super::config::SchemaConfigV1) -> Config {
+        use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
+        Config {
+            api: ApiConfig {
+                dcr_endpoint: "https://test.com".into(),
+                stream_name: "test-stream".into(),
+                dcr: "test-dcr".into(),
+                schema: SchemaConfig::V1(v1),
+                azure_monitor_source_resourceid: None,
+                gzip_compression_level: 6,
+                user_agent: None,
+            },
+            auth: AuthConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+        }
+    }
+
+    /// Builds a fixed OTLP payload exercising every v1-expressible source:
+    /// one resource attribute, one scope attribute, a log record field,
+    /// and a log record attribute.
+    fn parity_request() -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("svc".into())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "scope1".into(),
+                        version: String::new(),
+                        attributes: vec![KeyValue {
+                            key: "otel.library.name".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("lib".into())),
+                            }),
+                        }],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        body: Some(AnyValue {
+                            value: Some(OtelAnyValueEnum::StringValue("hello".into())),
+                        }),
+                        severity_text: "INFO".into(),
+                        severity_number: 9,
+                        attributes: vec![KeyValue {
+                            key: "http.method".into(),
+                            value: Some(AnyValue {
+                                value: Some(OtelAnyValueEnum::StringValue("GET".into())),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn run_config(config: &Config) -> Value {
+        let transformer = Transformer::try_new(config).expect("config should build");
+        let bytes = parity_request().encode_to_vec();
+        let view = RawLogsData::new(&bytes);
+        let result = transformer.convert_to_log_analytics(&view);
+        assert_eq!(result.len(), 1);
+        serde_json::from_slice(&result[0]).expect("valid JSON")
+    }
+
+    /// For every v1-expressible source, v1 and the equivalent v2 config
+    /// must produce identical transformer output. This guarantees that the
+    /// v1 -> v2 migration path is lossless.
+    #[test]
+    fn test_v1_v2_parity_resource_attribute() {
+        use super::super::config::SchemaConfigV1;
+        let v1 = make_v1_config(SchemaConfigV1 {
+            resource_mapping: HashMap::from([("service.name".into(), "ServiceName".into())]),
+            ..Default::default()
+        });
+        let v2 = make_v2_config(HashMap::from([(
+            "ServiceName".into(),
+            "resource.attributes['service.name']".into(),
+        )]));
+        assert_eq!(run_config(&v1), run_config(&v2));
+    }
+
+    #[test]
+    fn test_v1_v2_parity_scope_attribute() {
+        use super::super::config::SchemaConfigV1;
+        let v1 = make_v1_config(SchemaConfigV1 {
+            scope_mapping: HashMap::from([(
+                "otel.library.name".into(),
+                "InstrumentationLibrary".into(),
+            )]),
+            ..Default::default()
+        });
+        let v2 = make_v2_config(HashMap::from([(
+            "InstrumentationLibrary".into(),
+            "scope.attributes['otel.library.name']".into(),
+        )]));
+        assert_eq!(run_config(&v1), run_config(&v2));
+    }
+
+    #[test]
+    fn test_v1_v2_parity_log_record_fields() {
+        use super::super::config::SchemaConfigV1;
+        let v1 = make_v1_config(SchemaConfigV1 {
+            log_record_mapping: HashMap::from([
+                ("body".into(), json!("Message")),
+                ("severity_text".into(), json!("Severity")),
+                ("severity_number".into(), json!("SeverityNumber")),
+            ]),
+            ..Default::default()
+        });
+        let v2 = make_v2_config(HashMap::from([
+            ("Message".into(), "log_record.body".into()),
+            ("Severity".into(), "log_record.severity_text".into()),
+            ("SeverityNumber".into(), "log_record.severity_number".into()),
+        ]));
+        assert_eq!(run_config(&v1), run_config(&v2));
+    }
+
+    #[test]
+    fn test_v1_v2_parity_log_record_attributes() {
+        use super::super::config::SchemaConfigV1;
+        let v1 = make_v1_config(SchemaConfigV1 {
+            log_record_mapping: HashMap::from([(
+                "attributes".into(),
+                json!({"http.method": "HttpMethod"}),
+            )]),
+            ..Default::default()
+        });
+        let v2 = make_v2_config(HashMap::from([(
+            "HttpMethod".into(),
+            "log_record.attributes['http.method']".into(),
+        )]));
+        assert_eq!(run_config(&v1), run_config(&v2));
+    }
+
+    /// Combined parity covering every v1-expressible capability at once.
+    #[test]
+    fn test_v1_v2_parity_full_v1_capabilities() {
+        use super::super::config::SchemaConfigV1;
+        let v1 = make_v1_config(SchemaConfigV1 {
+            resource_mapping: HashMap::from([("service.name".into(), "ServiceName".into())]),
+            scope_mapping: HashMap::from([(
+                "otel.library.name".into(),
+                "InstrumentationLibrary".into(),
+            )]),
+            log_record_mapping: HashMap::from([
+                ("body".into(), json!("Message")),
+                ("severity_text".into(), json!("Severity")),
+                ("severity_number".into(), json!("SeverityNumber")),
+                ("attributes".into(), json!({"http.method": "HttpMethod"})),
+            ]),
+        });
+        let v2 = make_v2_config(HashMap::from([
+            (
+                "ServiceName".into(),
+                "resource.attributes['service.name']".into(),
+            ),
+            (
+                "InstrumentationLibrary".into(),
+                "scope.attributes['otel.library.name']".into(),
+            ),
+            ("Message".into(), "log_record.body".into()),
+            ("Severity".into(), "log_record.severity_text".into()),
+            ("SeverityNumber".into(), "log_record.severity_number".into()),
+            (
+                "HttpMethod".into(),
+                "log_record.attributes['http.method']".into(),
+            ),
+        ]));
+        assert_eq!(run_config(&v1), run_config(&v2));
     }
 }

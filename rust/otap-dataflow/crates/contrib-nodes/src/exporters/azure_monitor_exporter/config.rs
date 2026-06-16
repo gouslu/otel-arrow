@@ -192,9 +192,66 @@ pub struct ApiConfig {
     pub user_agent: Option<String>,
 }
 
-/// Schema mapping configuration
+/// Schema mapping configuration.
+///
+/// Two formats are accepted, auto-detected by shape:
+///
+/// - **v1** (legacy, nested): `resource_mapping`, `scope_mapping`, and/or
+///   `log_record_mapping` sections with attribute names as keys and
+///   destination column names as values.
+/// - **v2** (column-centric): a flat map of destination column names to
+///   OTLP source expressions using bracket-notation paths
+///   (`resource.attributes['...']`, `scope.name`, `log_record.body`,
+///   `log_record.attributes['...']`, etc.).
+///
+/// An empty/absent schema deserializes as v1 with all sections empty.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum SchemaConfig {
+    /// Legacy nested format. See [`SchemaConfigV1`].
+    V1(SchemaConfigV1),
+    /// Column-centric format. See [`SchemaConfigV2`].
+    V2(SchemaConfigV2),
+}
+
+impl Default for SchemaConfig {
+    fn default() -> Self {
+        Self::V1(SchemaConfigV1::default())
+    }
+}
+
+impl SchemaConfig {
+    /// Returns the v1 inner config, or `None` if this is a v2 config.
+    #[must_use]
+    pub fn as_v1(&self) -> Option<&SchemaConfigV1> {
+        match self {
+            Self::V1(v1) => Some(v1),
+            Self::V2(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the v1 inner config, or `None` if this is v2.
+    pub fn as_v1_mut(&mut self) -> Option<&mut SchemaConfigV1> {
+        match self {
+            Self::V1(v1) => Some(v1),
+            Self::V2(_) => None,
+        }
+    }
+
+    /// Returns the v2 inner config, or `None` if this is a v1 config.
+    #[must_use]
+    pub fn as_v2(&self) -> Option<&SchemaConfigV2> {
+        match self {
+            Self::V2(v2) => Some(v2),
+            Self::V1(_) => None,
+        }
+    }
+}
+
+/// Legacy nested schema format.
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct SchemaConfig {
+#[serde(deny_unknown_fields)]
+pub struct SchemaConfigV1 {
     /// Resource attribute mappings
     #[serde(default)]
     pub resource_mapping: HashMap<String, String>,
@@ -207,6 +264,16 @@ pub struct SchemaConfig {
     #[serde(default)]
     pub log_record_mapping: HashMap<String, Value>,
 }
+
+/// Column-centric schema format. Maps destination column names to OTLP
+/// source expressions.
+///
+/// Source expressions use bracket-notation paths rooted at one of
+/// `resource`, `scope`, or `log_record`. Path parsing is performed by the
+/// transformer; the config layer validates only the root prefix.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(transparent)]
+pub struct SchemaConfigV2(pub HashMap<String, String>);
 
 impl Config {
     /// Validate the configuration
@@ -267,22 +334,29 @@ impl Config {
     }
 
     fn validate_schema_unique_columns(&self) -> Result<(), Error> {
+        match &self.api.schema {
+            SchemaConfig::V1(v1) => Self::validate_schema_v1(v1),
+            SchemaConfig::V2(v2) => Self::validate_schema_v2(v2),
+        }
+    }
+
+    fn validate_schema_v1(v1: &SchemaConfigV1) -> Result<(), Error> {
         let mut seen = HashSet::new();
         let mut duplicates = HashSet::new();
 
-        for value in self.api.schema.resource_mapping.values() {
+        for value in v1.resource_mapping.values() {
             if !seen.insert(value.clone()) {
                 _ = duplicates.insert(value.clone());
             }
         }
 
-        for value in self.api.schema.scope_mapping.values() {
+        for value in v1.scope_mapping.values() {
             if !seen.insert(value.clone()) {
                 _ = duplicates.insert(value.clone());
             }
         }
 
-        for (key, value) in &self.api.schema.log_record_mapping {
+        for (key, value) in &v1.log_record_mapping {
             match value {
                 Value::String(s) if !seen.insert(s.clone()) => {
                     _ = duplicates.insert(s.clone());
@@ -314,6 +388,28 @@ impl Config {
 
         Ok(())
     }
+
+    fn validate_schema_v2(v2: &SchemaConfigV2) -> Result<(), Error> {
+        for (column, source) in &v2.0 {
+            if column.is_empty() {
+                return Err(Error::Config(
+                    "Invalid configuration: schema column name must be non-empty".to_string(),
+                ));
+            }
+            validate_otlp_field(source).map_err(|reason| {
+                Error::Config(format!(
+                    "Invalid configuration: schema column '{column}' source '{source}': {reason}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Strict validator for a v2 source expression: delegates to the shared
+/// pest-based parser and discards the AST. Validation only.
+fn validate_otlp_field(source: &str) -> Result<(), String> {
+    super::otlp_field::parse_otlp_field(source).map(|_| ())
 }
 
 #[cfg(test)]
@@ -383,7 +479,7 @@ mod tests {
     fn test_schema_duplicate_columns() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([("service.name".into(), "Name".into())]),
                     scope_mapping: HashMap::from([("scope.name".into(), "Name".into())]),
                     log_record_mapping: HashMap::from([
@@ -391,7 +487,7 @@ mod tests {
                         ("severity_text".into(), json!("Body")),
                         ("attributes".into(), json!({"user.name": "Name"})),
                     ]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -412,7 +508,7 @@ mod tests {
     fn test_schema_duplicate_columns_in_nested_log_record_mapping() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([(
                         "service.name".into(),
                         "ServiceName".into(),
@@ -429,7 +525,7 @@ mod tests {
                             }),
                         ),
                     ]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -449,14 +545,14 @@ mod tests {
     fn test_schema_nested_object_only_allowed_for_attributes() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::new(),
                     scope_mapping: HashMap::new(),
                     log_record_mapping: HashMap::from([(
                         "body".into(),
                         json!({"nested": "NotAllowed"}),
                     )]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -479,11 +575,11 @@ mod tests {
     fn test_resource_scope_overlap_rejected() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([("service.name".into(), "Name".into())]),
                     scope_mapping: HashMap::from([("scope.name".into(), "Name".into())]),
                     log_record_mapping: HashMap::new(),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -503,14 +599,14 @@ mod tests {
     fn test_resource_log_record_field_overlap_rejected() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([("host.name".into(), "TimeGenerated".into())]),
                     scope_mapping: HashMap::new(),
                     log_record_mapping: HashMap::from([(
                         "time_unix_nano".into(),
                         json!("TimeGenerated"),
                     )]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -530,14 +626,14 @@ mod tests {
     fn test_resource_log_record_attribute_overlap_rejected() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([("service.name".into(), "Source".into())]),
                     scope_mapping: HashMap::new(),
                     log_record_mapping: HashMap::from([(
                         "attributes".into(),
                         json!({"log.source": "Source"}),
                     )]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -557,14 +653,14 @@ mod tests {
     fn test_scope_log_record_attribute_overlap_rejected() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::new(),
                     scope_mapping: HashMap::from([("scope.version".into(), "Version".into())]),
                     log_record_mapping: HashMap::from([(
                         "attributes".into(),
                         json!({"app.version": "Version"}),
                     )]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -584,7 +680,7 @@ mod tests {
     fn test_non_overlapping_mappings_accepted() {
         let config = Config {
             api: ApiConfig {
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::from([
                         ("service.name".into(), "ServiceName".into()),
                         ("host.name".into(), "HostName".into()),
@@ -602,7 +698,7 @@ mod tests {
                             json!({"env": "Environment", "request.id": "RequestId"}),
                         ),
                     ]),
-                },
+                }),
                 ..test_api_config()
             },
             ..test_config()
@@ -908,5 +1004,244 @@ mod tests {
         // frequency still gets its default
         assert_eq!(config.heartbeat.frequency, Duration::from_secs(60));
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_schema_v1_yaml_still_parses_as_v1() {
+        let yaml = r#"
+            api:
+                dcr_endpoint: "https://example.com"
+                stream_name: "mystream"
+                dcr: "mydcr"
+                schema:
+                    resource_mapping:
+                        "service.name": "ServiceName"
+                    log_record_mapping:
+                        "body": "Message"
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let v1 = config.api.schema.as_v1().expect("expected v1");
+        assert_eq!(
+            v1.resource_mapping.get("service.name").map(String::as_str),
+            Some("ServiceName")
+        );
+        assert_eq!(v1.log_record_mapping.get("body"), Some(&json!("Message")));
+        assert!(config.api.schema.as_v2().is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_schema_v2_yaml_parses_as_v2() {
+        let yaml = r#"
+            api:
+                dcr_endpoint: "https://example.com"
+                stream_name: "mystream"
+                dcr: "mydcr"
+                schema:
+                    ServiceName: "resource.attributes['service.name']"
+                    ScopeName: "scope.name"
+                    Message: "log_record.body"
+                    HttpMethod: "log_record.attributes['http.method']"
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let v2 = config.api.schema.as_v2().expect("expected v2");
+        assert_eq!(v2.0.len(), 4);
+        assert_eq!(
+            v2.0.get("ServiceName").map(String::as_str),
+            Some("resource.attributes['service.name']")
+        );
+        assert!(config.api.schema.as_v1().is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_schema_empty_defaults_to_v1() {
+        let yaml = r#"
+            api:
+                dcr_endpoint: "https://example.com"
+                stream_name: "mystream"
+                dcr: "mydcr"
+                schema: {}
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.api.schema.as_v1().is_some());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_schema_v2_invalid_root_prefix_rejected() {
+        let yaml = r#"
+            api:
+                dcr_endpoint: "https://example.com"
+                stream_name: "mystream"
+                dcr: "mydcr"
+                schema:
+                    BadColumn: "not_a_real_root.foo"
+        "#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = config
+            .validate()
+            .expect_err("v2 with invalid root should fail");
+        assert!(err.to_string().contains("BadColumn"));
+    }
+
+    #[test]
+    fn test_schema_v2_strict_validation_rejects_bad_sources() {
+        for bad in [
+            "garbage",
+            "resource",
+            "resource.bogus_field",
+            "scope.nope",
+            "log_record.not_a_field",
+            "resource.attributes[unquoted]",
+            "resource.attributes['unterminated",
+            "resource.attributes",
+            "resource.attributes.service_name",
+            "log_record.attributes['x'].extra",
+        ] {
+            let yaml = format!(
+                r#"
+                api:
+                    dcr_endpoint: "https://example.com"
+                    stream_name: "mystream"
+                    dcr: "mydcr"
+                    schema:
+                        BadColumn: "{bad}"
+                "#
+            );
+            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(
+                config.validate().is_err(),
+                "expected validation error for source {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_v2_accepts_spec_escape_sequences() {
+        for good in [
+            r"resource.attributes['it\'s']",
+            r#"resource.attributes["say \"hi\""]"#,
+            r"log_record.attributes['line\nbreak']",
+            r"log_record.attributes['tab\there']",
+            r"log_record.attributes['back\\slash']",
+            r"log_record.attributes['slash\/here']",
+            r"log_record.attributes['\u00e9']",
+            r"log_record.attributes['\b\f\r']",
+        ] {
+            let mut map = HashMap::new();
+            _ = map.insert("Col".to_string(), good.to_string());
+            let config = Config {
+                api: ApiConfig {
+                    dcr_endpoint: "https://example.com".into(),
+                    stream_name: "s".into(),
+                    dcr: "d".into(),
+                    schema: SchemaConfig::V2(SchemaConfigV2(map)),
+                    azure_monitor_source_resourceid: None,
+                    gzip_compression_level: 6,
+                    user_agent: None,
+                },
+                auth: AuthConfig::default(),
+                heartbeat: HeartbeatConfig::default(),
+            };
+            assert!(
+                config.validate().is_ok(),
+                "expected source {good:?} to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_v2_rejects_bad_escape_sequences() {
+        for bad in [
+            r"resource.attributes['bad\z']",
+            r"resource.attributes['short\u00']",
+            r"resource.attributes['short\u00gz']",
+            r"resource.attributes['dangling\']",
+            r"resource.attributes['\uD800']",
+            r"resource.attributes['\uDFFF']",
+            r"resource.attributes['\uD83D']",
+        ] {
+            let mut map = HashMap::new();
+            _ = map.insert("Col".to_string(), bad.to_string());
+            let config = Config {
+                api: ApiConfig {
+                    dcr_endpoint: "https://example.com".into(),
+                    stream_name: "s".into(),
+                    dcr: "d".into(),
+                    schema: SchemaConfig::V2(SchemaConfigV2(map)),
+                    azure_monitor_source_resourceid: None,
+                    gzip_compression_level: 6,
+                    user_agent: None,
+                },
+                auth: AuthConfig::default(),
+                heartbeat: HeartbeatConfig::default(),
+            };
+            assert!(
+                config.validate().is_err(),
+                "expected source {bad:?} to fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_v2_accepts_all_spec_sources() {
+        let good_sources = [
+            "resource.dropped_attributes_count",
+            "resource.attributes['service.name']",
+            "resource.attributes[\"service.name\"]",
+            "scope.name",
+            "scope.version",
+            "scope.dropped_attributes_count",
+            "scope.attributes['otel.library.name']",
+            "log_record.body",
+            "log_record.severity_text",
+            "log_record.severity_number",
+            "log_record.time_unix_nano",
+            "log_record.observed_time_unix_nano",
+            "log_record.trace_id",
+            "log_record.span_id",
+            "log_record.flags",
+            "log_record.event_name",
+            "log_record.dropped_attributes_count",
+            "log_record.attributes['http.method']",
+        ];
+        for good in good_sources {
+            let mut map = HashMap::new();
+            _ = map.insert("Col".to_string(), good.to_string());
+            let config = Config {
+                api: ApiConfig {
+                    dcr_endpoint: "https://example.com".into(),
+                    stream_name: "s".into(),
+                    dcr: "d".into(),
+                    schema: SchemaConfig::V2(SchemaConfigV2(map)),
+                    azure_monitor_source_resourceid: None,
+                    gzip_compression_level: 6,
+                    user_agent: None,
+                },
+                auth: AuthConfig::default(),
+                heartbeat: HeartbeatConfig::default(),
+            };
+            assert!(
+                config.validate().is_ok(),
+                "expected source {good:?} to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_v1_with_extra_key_is_rejected() {
+        let yaml = r#"
+            api:
+                dcr_endpoint: "https://example.com"
+                stream_name: "mystream"
+                dcr: "mydcr"
+                schema:
+                    resource_mapping:
+                        "service.name": "ServiceName"
+                    UnknownTopLevel: "log_record.body"
+        "#;
+        let res: Result<Config, _> = serde_yaml::from_str(yaml);
+        assert!(res.is_err(), "mixed v1/v2 shape must not deserialize");
     }
 }

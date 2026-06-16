@@ -54,6 +54,8 @@ ryu = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, features = ["rustls-no-provider"] }
 sysinfo = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
+pest = { workspace = true, optional = true }
+pest_derive = { workspace = true, optional = true }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 one_collect = { workspace = true, optional = true }
@@ -100,6 +102,8 @@ azure-monitor-exporter = [
     "dep:rand",
     "dep:ryu",
     "dep:urlencoding",
+    "dep:pest",
+    "dep:pest_derive",
 ]
 
 contrib-processors = [

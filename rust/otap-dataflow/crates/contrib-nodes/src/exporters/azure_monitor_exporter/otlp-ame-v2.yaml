@@ -1,0 +1,88 @@
+# Azure Monitor Exporter Configuration — v2 schema mapping
+#
+# v2 maps destination column names directly to OTLP source expressions using
+# bracket-notation paths (`resource.attributes['...']`, `scope.name`,
+# `log_record.body`, `log_record.attributes['...']`, etc.). Each column maps
+# to exactly one source. The legacy nested format (resource_mapping /
+# scope_mapping / log_record_mapping) remains supported and is auto-detected
+# by shape.
+
+version: otel_dataflow/v1
+
+policies:
+  channel_capacity:
+    control:
+      node: 100
+      pipeline: 100
+    pdata: 128
+
+engine: {}
+
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          otlp-receiver:
+            type: "urn:otel:receiver:otlp"
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "0.0.0.0:4317"
+
+          azure-monitor-exporter:
+            type: "urn:microsoft:exporter:azure_monitor"
+            config:
+              api:
+                dcr_endpoint: "https://my-workspace.eastus-1.ingest.monitor.azure.com"
+                stream_name: "Custom-MyTable_CL"
+                dcr: "dcr-abc123"
+                schema:
+                  # Resource fields
+                  ResourceDroppedAttributesCount: "resource.dropped_attributes_count"
+                  ServiceName: "resource.attributes['service.name']"
+                  ServiceVersion: "resource.attributes['service.version']"
+                  PodName: "resource.attributes['k8s.pod.name']"
+                  Namespace: "resource.attributes['k8s.namespace.name']"
+                  Deployment: "resource.attributes['k8s.deployment.name']"
+                  NodeName: "resource.attributes['k8s.node.name']"
+
+                  # Scope fields
+                  ScopeName: "scope.name"
+                  ScopeVersion: "scope.version"
+                  ScopeDroppedAttributesCount: "scope.dropped_attributes_count"
+                  InstrumentationLibrary: "scope.attributes['otel.library.name']"
+                  InstrumentationVersion: "scope.attributes['otel.library.version']"
+
+                  # Log record fields
+                  Message: "log_record.body"
+                  SeverityText: "log_record.severity_text"
+                  SeverityNumber: "log_record.severity_number"
+                  TimeGenerated: "log_record.time_unix_nano"
+                  ObservedTime: "log_record.observed_time_unix_nano"
+                  TraceId: "log_record.trace_id"
+                  SpanId: "log_record.span_id"
+                  Flags: "log_record.flags"
+                  EventName: "log_record.event_name"
+                  LogDroppedAttributesCount: "log_record.dropped_attributes_count"
+
+                  # Log record attributes
+                  HttpMethod: "log_record.attributes['http.method']"
+                  HttpStatusCode: "log_record.attributes['http.status_code']"
+                  HttpUrl: "log_record.attributes['http.url']"
+                  ExceptionType: "log_record.attributes['exception.type']"
+                  ExceptionMessage: "log_record.attributes['exception.message']"
+                  UserId: "log_record.attributes['user.id']"
+
+              auth:
+                method: "managedidentity"
+                client_id: "YOUR-USER-ASSIGNED-IDENTITY-CLIENT-ID"
+                scope: "https://monitor.azure.com/.default"
+
+              heartbeat:
+                enabled: true
+                frequency: 1m
+
+        connections:
+          - from: otlp-receiver
+            to: azure-monitor-exporter

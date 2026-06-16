@@ -1,0 +1,14 @@
+change_type: enhancement
+
+component: pipeline
+
+note: Add v2 schema mapping format to the Azure Monitor exporter — a flat column-to-source-path map auto-detected alongside the existing nested format.
+
+issues: [3143]
+
+subtext: |
+  v2 uses destination column names as keys and bracket-notation OTLP paths
+  as values (e.g. `ServiceName: "resource.attributes['service.name']"`,
+  `Message: "log_record.body"`). The legacy nested format
+  (`resource_mapping` / `scope_mapping` / `log_record_mapping`) remains
+  fully supported; deserialization picks the variant by YAML shape.

@@ -650,7 +650,9 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig};
+    use super::super::config::{
+        ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV1,
+    };
     use super::*;
     use azure_core::time::OffsetDateTime;
     use bytes::Bytes;
@@ -681,11 +683,11 @@ mod tests {
                 dcr_endpoint: "https://example.com".to_string(),
                 stream_name: "stream".to_string(),
                 dcr: "dcr-id".to_string(),
-                schema: SchemaConfig {
+                schema: SchemaConfig::V1(SchemaConfigV1 {
                     resource_mapping: HashMap::new(),
                     scope_mapping: HashMap::new(),
                     log_record_mapping: HashMap::new(),
-                },
+                }),
                 azure_monitor_source_resourceid: None,
                 gzip_compression_level: 6,
                 user_agent: None,

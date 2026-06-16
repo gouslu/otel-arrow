@@ -29,6 +29,7 @@ mod heartbeat;
 mod in_flight_exports;
 /// Metrics types for the Azure Monitor Exporter.
 pub mod metrics;
+mod otlp_field;
 mod state;
 mod transformer;
 

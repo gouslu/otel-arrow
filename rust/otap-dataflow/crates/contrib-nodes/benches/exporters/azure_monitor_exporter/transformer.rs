@@ -27,7 +27,7 @@ use otap_df_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceR
 
 fn create_config() -> Config {
     use otap_df_contrib_nodes::exporters::azure_monitor_exporter::config::{
-        ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig,
+        ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV1,
     };
 
     Config {
@@ -35,7 +35,7 @@ fn create_config() -> Config {
             dcr_endpoint: "https://test.ingest.monitor.azure.com".into(),
             stream_name: "Custom-TestTable".into(),
             dcr: "dcr-test-rule-id".into(),
-            schema: SchemaConfig {
+            schema: SchemaConfig::V1(SchemaConfigV1 {
                 resource_mapping: HashMap::from([
                     ("service.name".into(), "ServiceName".into()),
                     ("service.version".into(), "ServiceVersion".into()),
@@ -61,7 +61,7 @@ fn create_config() -> Config {
                         }),
                     ),
                 ]),
-            },
+            }),
             azure_monitor_source_resourceid: None,
             gzip_compression_level: 6,
             user_agent: None,
@@ -176,70 +176,135 @@ fn make_request(
     request.encode_to_vec()
 }
 
+fn create_config_v2() -> Config {
+    use otap_df_contrib_nodes::exporters::azure_monitor_exporter::config::{
+        ApiConfig, AuthConfig, HeartbeatConfig, SchemaConfig, SchemaConfigV2,
+    };
+
+    let mut schema = HashMap::new();
+    _ = schema.insert(
+        "ServiceName".to_string(),
+        "resource.attributes['service.name']".to_string(),
+    );
+    _ = schema.insert(
+        "ServiceVersion".to_string(),
+        "resource.attributes['service.version']".to_string(),
+    );
+    _ = schema.insert(
+        "HostName".to_string(),
+        "resource.attributes['host.name']".to_string(),
+    );
+    _ = schema.insert(
+        "ScopeName".to_string(),
+        "scope.attributes['scope.name']".to_string(),
+    );
+    _ = schema.insert(
+        "ScopeVersion".to_string(),
+        "scope.attributes['scope.version']".to_string(),
+    );
+    _ = schema.insert(
+        "TimeGenerated".to_string(),
+        "log_record.time_unix_nano".to_string(),
+    );
+    _ = schema.insert(
+        "SeverityText".to_string(),
+        "log_record.severity_text".to_string(),
+    );
+    _ = schema.insert(
+        "SeverityNumber".to_string(),
+        "log_record.severity_number".to_string(),
+    );
+    _ = schema.insert("Body".to_string(), "log_record.body".to_string());
+    _ = schema.insert("TraceId".to_string(), "log_record.trace_id".to_string());
+    _ = schema.insert("SpanId".to_string(), "log_record.span_id".to_string());
+    _ = schema.insert(
+        "Environment".to_string(),
+        "log_record.attributes['env']".to_string(),
+    );
+    _ = schema.insert(
+        "RequestId".to_string(),
+        "log_record.attributes['request.id']".to_string(),
+    );
+    _ = schema.insert(
+        "UserId".to_string(),
+        "log_record.attributes['user.id']".to_string(),
+    );
+
+    Config {
+        api: ApiConfig {
+            dcr_endpoint: "https://test.ingest.monitor.azure.com".into(),
+            stream_name: "Custom-TestTable".into(),
+            dcr: "dcr-test-rule-id".into(),
+            schema: SchemaConfig::V2(SchemaConfigV2(schema)),
+            azure_monitor_source_resourceid: None,
+            gzip_compression_level: 6,
+            user_agent: None,
+        },
+        auth: AuthConfig::default(),
+        heartbeat: HeartbeatConfig::default(),
+    }
+}
+
 fn bench_transform(c: &mut Criterion) {
-    let mut group = c.benchmark_group("transformer");
+    for (label, transformer) in [
+        ("v1", Transformer::new(&create_config())),
+        ("v2", Transformer::new(&create_config_v2())),
+    ] {
+        let mut group = c.benchmark_group(format!("transformer_{label}"));
 
-    let config = create_config();
-    let transformer = Transformer::new(&config);
+        for num_records in [10, 100, 1000] {
+            let bytes = make_request(1, 1, num_records);
+            let total_records = num_records;
+            group.throughput(criterion::Throughput::Elements(total_records as u64));
+            group.bench_with_input(
+                BenchmarkId::new("1r_1s", total_records),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| {
+                        let view = RawLogsData::new(bytes);
+                        let result = transformer.convert_to_log_analytics(&view);
+                        assert_eq!(result.len(), total_records);
+                    });
+                },
+            );
+        }
 
-    // Varying record counts: 1 ResourceLogs, 1 ScopeLogs, N records
-    for num_records in [10, 100, 1000] {
-        let bytes = make_request(1, 1, num_records);
-        let total_records = num_records;
+        {
+            let bytes = make_request(1, 10, 100);
+            let total_records = 1000;
+            group.throughput(criterion::Throughput::Elements(total_records as u64));
+            group.bench_with_input(
+                BenchmarkId::new("1r_10s", total_records),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| {
+                        let view = RawLogsData::new(bytes);
+                        let result = transformer.convert_to_log_analytics(&view);
+                        assert_eq!(result.len(), total_records);
+                    });
+                },
+            );
+        }
 
-        group.throughput(criterion::Throughput::Elements(total_records as u64));
-        group.bench_with_input(
-            BenchmarkId::new("1r_1s", total_records),
-            &bytes,
-            |b, bytes| {
-                b.iter(|| {
-                    let view = RawLogsData::new(bytes);
-                    let result = transformer.convert_to_log_analytics(&view);
-                    assert_eq!(result.len(), total_records);
-                });
-            },
-        );
+        {
+            let bytes = make_request(10, 1, 100);
+            let total_records = 1000;
+            group.throughput(criterion::Throughput::Elements(total_records as u64));
+            group.bench_with_input(
+                BenchmarkId::new("10r_1s", total_records),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| {
+                        let view = RawLogsData::new(bytes);
+                        let result = transformer.convert_to_log_analytics(&view);
+                        assert_eq!(result.len(), total_records);
+                    });
+                },
+            );
+        }
+
+        group.finish();
     }
-
-    // Many scopes: 1 ResourceLogs, 10 ScopeLogs, 100 records each
-    {
-        let bytes = make_request(1, 10, 100);
-        let total_records = 1000;
-
-        group.throughput(criterion::Throughput::Elements(total_records as u64));
-        group.bench_with_input(
-            BenchmarkId::new("1r_10s", total_records),
-            &bytes,
-            |b, bytes| {
-                b.iter(|| {
-                    let view = RawLogsData::new(bytes);
-                    let result = transformer.convert_to_log_analytics(&view);
-                    assert_eq!(result.len(), total_records);
-                });
-            },
-        );
-    }
-
-    // Many resources: 10 ResourceLogs, 1 ScopeLogs, 100 records each
-    {
-        let bytes = make_request(10, 1, 100);
-        let total_records = 1000;
-
-        group.throughput(criterion::Throughput::Elements(total_records as u64));
-        group.bench_with_input(
-            BenchmarkId::new("10r_1s", total_records),
-            &bytes,
-            |b, bytes| {
-                b.iter(|| {
-                    let view = RawLogsData::new(bytes);
-                    let result = transformer.convert_to_log_analytics(&view);
-                    assert_eq!(result.len(), total_records);
-                });
-            },
-        );
-    }
-
-    group.finish();
 }
 
 criterion_group!(benches, bench_transform);
