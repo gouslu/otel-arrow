@@ -630,7 +630,6 @@ mod tests {
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use otap_df_telemetry::reporter::MetricsReporter;
     use std::collections::HashMap;
-    use std::pin::Pin;
     use std::time::{Duration, Instant};
 
     /// Minimal stand-in for an extension-backed `BearerTokenProvider`. Returns a
@@ -650,16 +649,7 @@ mod tests {
             ))
         }
 
-        fn token_stream(
-            &self,
-        ) -> Pin<
-            Box<
-                dyn futures::Stream<
-                        Item = Result<BearerToken, otap_df_engine::capability::CapabilityError>,
-                    > + Send
-                    + 'static,
-            >,
-        > {
+        fn token_stream(&self) -> otap_df_engine::capability::bearer_token_provider::TokenStream {
             Box::pin(stream::once(async {
                 Ok(BearerToken::new(
                     "stub",

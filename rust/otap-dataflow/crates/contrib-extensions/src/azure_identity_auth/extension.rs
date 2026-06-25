@@ -15,7 +15,6 @@
 //! extension freely — every clone observes the same token state.
 
 use async_trait::async_trait;
-use futures::Stream;
 use futures::StreamExt;
 use otap_df_engine::capability::bearer_token_provider::{
     BearerToken, BearerTokenProvider, shared::BearerTokenProvider as SharedBearerTokenProvider,
@@ -27,7 +26,6 @@ use otap_df_engine::extension::EffectHandler;
 use otap_df_engine::shared::extension::{ControlChannel, Extension as SharedExtension};
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_telemetry::{otel_error, otel_info};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -118,9 +116,7 @@ impl SharedBearerTokenProvider for AzureIdentityAuthExtension {
             .map_err(|e| self.inner.cap_err.wrap(e))
     }
 
-    fn token_stream(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<BearerToken, CapabilityError>> + Send + 'static>> {
+    fn token_stream(&self) -> otap_df_engine::capability::bearer_token_provider::TokenStream {
         // Active impl: subscribe to the internal `watch` channel that the
         // refresh task feeds. `WatchStream` yields the current value first
         // (possibly `None` if no refresh has completed yet) and then every

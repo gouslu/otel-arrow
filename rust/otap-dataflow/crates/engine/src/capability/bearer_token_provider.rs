@@ -123,6 +123,17 @@ impl BearerToken {
 
 // ── Capability ──────────────────────────────────────────────────────────────
 
+/// Per-subscriber stream of token-acquisition outcomes returned by
+/// [`BearerTokenProvider::token_stream`].
+///
+/// Deliberately **not** `Send`: the stream is polled on the thread that
+/// created it (the consuming node's `LocalSet`) and never moved across
+/// threads, so requiring `Send` would only restrict `!Send` providers for
+/// no benefit. A `Send` provider may still return this — `Send`-ness of the
+/// provider does not require its returned values to be `Send`, and a `Send`
+/// stream coerces into this `!Send`-bounded box.
+pub type TokenStream = Pin<Box<dyn Stream<Item = Result<BearerToken, CapabilityError>> + 'static>>;
+
 /// Provides bearer tokens for authenticated requests.
 ///
 /// Two entry points. Both are implementable by any extension shape — active
@@ -187,7 +198,7 @@ pub trait BearerTokenProvider {
     /// - **Passive** impls back this with a self-clone + polling loop:
     ///
     /// ```ignore
-    /// fn token_stream(&self) -> Pin<Box<dyn Stream<...> + Send + 'static>> {
+    /// fn token_stream(&self) -> TokenStream {
     ///     let me = self.clone(); // self is an Arc-backed handle
     ///     Box::pin(futures::stream::unfold(
     ///         (me, None::<tokio::time::Instant>),
@@ -203,9 +214,7 @@ pub trait BearerTokenProvider {
     ///
     /// Both shapes give the caller identical observable behavior: a stream
     /// of tokens that arrives at refresh boundaries.
-    fn token_stream(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<BearerToken, CapabilityError>> + Send + 'static>>;
+    fn token_stream(&self) -> TokenStream;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -220,8 +229,8 @@ pub trait BearerTokenProvider {
 
 #[cfg(test)]
 mod passive_provider_tests {
-    use super::*;
     use super::shared::BearerTokenProvider as _;
+    use super::*;
     use async_trait::async_trait;
     use futures::StreamExt;
     use std::sync::Arc;
@@ -276,10 +285,7 @@ mod passive_provider_tests {
             self.fetch().await
         }
 
-        fn token_stream(
-            &self,
-        ) -> Pin<Box<dyn Stream<Item = Result<BearerToken, CapabilityError>> + Send + 'static>>
-        {
+        fn token_stream(&self) -> TokenStream {
             // Passive: clone `self` into an unfold loop. The struct is a
             // thin `Arc<PassiveInner>` wrapper, so the clone is one
             // atomic refcount bump — no spawn, no watch channel, no
