@@ -17,6 +17,8 @@ use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use crate::pdata::{Context, OtapPdata};
 use crate::socket_options;
 use otap_df_engine::admission::{AdmissionContext, AdmissionDecision, SharedAdmissionGate};
+use otap_df_engine::capability::auth::{AuthzDecision, BearerToken, DenyReason};
+use otap_df_engine::shared::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer;
 
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
@@ -319,6 +321,66 @@ fn service_unavailable() -> Response<Full<Bytes>> {
     rpc_status_response(StatusCode::SERVICE_UNAVAILABLE, 14, "service unavailable")
 }
 
+fn unauthenticated() -> Response<Full<Bytes>> {
+    let mut response = rpc_status_response(StatusCode::UNAUTHORIZED, 16, "unauthenticated");
+    _ = response.headers_mut().insert(
+        http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    response
+}
+
+async fn authorize_request(
+    authorizer: &dyn BearerTokenAuthorizer,
+    headers: &http::HeaderMap,
+    configured_timeout: Option<Duration>,
+) -> Result<(), Response<Full<Bytes>>> {
+    let Some(header) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(unauthenticated());
+    };
+
+    let credential = BearerToken::from_header_value(header);
+    if credential.expose_token().is_empty() {
+        return Err(unauthenticated());
+    }
+
+    let timeout = configured_timeout.map_or(Duration::from_secs(5), |configured| {
+        configured.min(Duration::from_secs(5))
+    });
+    match tokio::time::timeout(timeout, authorizer.authorize(&credential)).await {
+        Ok(Ok(AuthzDecision::Allow { .. })) => Ok(()),
+        Ok(Ok(AuthzDecision::Deny { reason, .. })) => Err(match reason {
+            DenyReason::MissingCredential | DenyReason::InvalidCredential => unauthenticated(),
+            DenyReason::NotPermitted => {
+                rpc_status_response(StatusCode::FORBIDDEN, 7, "permission denied")
+            }
+            _ => rpc_status_response(StatusCode::FORBIDDEN, 7, "permission denied"),
+        }),
+        Ok(Err(error)) => {
+            otap_df_telemetry::otel_warn!("receiver.authz.undetermined", error = error.to_string());
+            Err(rpc_status_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                14,
+                "authorization unavailable",
+            ))
+        }
+        Err(_) => {
+            otap_df_telemetry::otel_warn!(
+                "receiver.authz.timeout",
+                timeout_ms = timeout.as_millis() as u64
+            );
+            Err(rpc_status_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                14,
+                "authorization unavailable",
+            ))
+        }
+    }
+}
+
 fn resource_exhausted_with_retry_after(
     message: &'static str,
     retry_after_secs: u32,
@@ -566,6 +628,9 @@ struct HttpHandler {
     /// to every `OtapPdata` produced from the connection so downstream
     /// processors can read it via `OtapPdata::peer_addr()`.
     peer_addr: SocketAddr,
+    /// Present only when the receiver bound the `bearer_token_authorizer`
+    /// capability; `None` leaves the request path completely untouched.
+    authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
 }
 
 impl HttpHandler {
@@ -604,6 +669,18 @@ impl HttpHandler {
         let permit_timeout = self.settings.timeout.unwrap_or(Duration::from_secs(5));
 
         let fut = async move {
+            // Authorize before spending any admission, concurrency, or body-read
+            // budget on the request.
+            if let Some(authorizer) = self.authorizer.clone() {
+                if let Err(response) =
+                    authorize_request(authorizer.as_ref(), req.headers(), self.settings.timeout)
+                        .await
+                {
+                    self.record_rejection(ReceiverRejectionErrorType::Authorization);
+                    return Err(response);
+                }
+            }
+
             if self.admission_state.should_shed_ingress() {
                 self.record_rejection(ReceiverRejectionErrorType::MemoryPressure);
                 return Err(memory_pressure_unavailable(
@@ -946,6 +1023,7 @@ pub async fn serve(
     admission_state: SharedReceiverAdmissionState,
     rate_limiter: Option<SharedAdmissionGate>,
     global_semaphore: Option<Arc<Semaphore>>,
+    authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     let listener = effect_handler
@@ -1004,6 +1082,7 @@ pub async fn serve(
                     global_semaphore: global_semaphore.clone(),
                     local_semaphore: local_semaphore.clone(),
                     peer_addr,
+                    authorizer: authorizer.clone(),
                 };
 
                 if let Some(acceptor) = maybe_tls_acceptor.clone() {
@@ -1088,10 +1167,71 @@ mod tests {
     use super::*;
 
     use otap_df_engine::admission::{AdmissionBinder, AdmissionDimension};
+    use otap_df_engine::capability::CapabilityError;
     use otap_df_engine::memory_limiter::{MemoryPressureLevel, MemoryPressureState};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    struct TestAuthorizer;
+
+    #[async_trait::async_trait]
+    impl BearerTokenAuthorizer for TestAuthorizer {
+        async fn authorize(
+            &self,
+            credential: &BearerToken,
+        ) -> Result<AuthzDecision, CapabilityError> {
+            Ok(match credential.expose_token() {
+                "allowed" => AuthzDecision::allow_anonymous(),
+                "invalid" => AuthzDecision::deny(DenyReason::InvalidCredential),
+                _ => AuthzDecision::deny(DenyReason::NotPermitted),
+            })
+        }
+    }
+
+    /// Scenario: HTTP authorization sees a missing, allowed, invalid, and
+    /// policy-denied bearer credential.
+    /// Guarantees: direct capability outcomes map to 401, success, and 403,
+    /// including the bearer challenge on authentication failures.
+    #[tokio::test]
+    async fn maps_authorization_outcomes() {
+        let authorizer = TestAuthorizer;
+        let mut headers = http::HeaderMap::new();
+
+        let response = authorize_request(&authorizer, &headers, Some(Duration::from_secs(1)))
+            .await
+            .expect_err("missing credential must be rejected");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[http::header::WWW_AUTHENTICATE], "Bearer");
+
+        _ = headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer allowed"),
+        );
+        assert!(
+            authorize_request(&authorizer, &headers, Some(Duration::from_secs(1)))
+                .await
+                .is_ok()
+        );
+
+        _ = headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid"),
+        );
+        let response = authorize_request(&authorizer, &headers, Some(Duration::from_secs(1)))
+            .await
+            .expect_err("invalid credential must be rejected");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        _ = headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer denied"),
+        );
+        let response = authorize_request(&authorizer, &headers, Some(Duration::from_secs(1)))
+            .await
+            .expect_err("policy-denied credential must be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     fn shared_rate_gate(
         policy: otap_df_config::policy::RateLimiterPolicy,
@@ -1162,6 +1302,7 @@ mod tests {
             ack_registry.clone(),
             metrics,
             SharedReceiverAdmissionState::default(),
+            None,
             None,
             None,
             shutdown.clone(),
@@ -1293,6 +1434,7 @@ mod tests {
             AckRegistry::new(Some(AckSlot::new(0)), None, None),
             metrics.clone(),
             SharedReceiverAdmissionState::default(),
+            None,
             None,
             None,
             shutdown.clone(),
@@ -1427,6 +1569,7 @@ mod tests {
             admission_state.clone(),
             None,
             Some(gate.clone()),
+            None,
             shutdown.clone(),
         ));
 
@@ -1574,6 +1717,7 @@ mod tests {
             admission_state.clone(),
             None,
             Some(local_semaphore),
+            None,
             shutdown.clone(),
         ));
 
@@ -1741,6 +1885,7 @@ mod tests {
             admission_state,
             Some(rate_limiter),
             None,
+            None,
             shutdown.clone(),
         ));
 
@@ -1905,6 +2050,7 @@ mod tests {
             admission_state,
             Some(rate_limiter),
             Some(global_semaphore),
+            None,
             shutdown.clone(),
         ));
 

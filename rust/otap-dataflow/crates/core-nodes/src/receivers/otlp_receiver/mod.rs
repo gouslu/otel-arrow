@@ -31,6 +31,7 @@ use linkme::distributed_slice;
 use otap_df_config::node::NodeUserConfig;
 use otap_df_engine::ReceiverFactory;
 use otap_df_engine::admission::{AdmissionDimension, SharedAdmissionGate};
+use otap_df_engine::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer as BearerTokenAuthorizerCap;
 use otap_df_engine::clock;
 use otap_df_engine::config::ReceiverConfig;
 use otap_df_engine::context::PipelineContext;
@@ -39,6 +40,7 @@ use otap_df_engine::error::{Error, ReceiverErrorKind, format_error_sources};
 use otap_df_engine::memory_limiter::SharedReceiverAdmissionState;
 use otap_df_engine::node::NodeId;
 use otap_df_engine::receiver::ReceiverWrapper;
+use otap_df_engine::shared::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer;
 use otap_df_engine::shared::receiver as shared;
 use otap_df_engine::terminal_state::TerminalState;
 use otap_df_otap::memory_pressure_layer::MemoryPressureLayer;
@@ -191,6 +193,9 @@ pub struct OTLPReceiver {
     // Global concurrency cap derived from downstream capacity. When both gRPC and HTTP are
     // enabled, this prevents combined ingress from exceeding what the pipeline can absorb.
     global_max_concurrent_requests: Option<usize>,
+    // Bound `bearer_token_authorizer` capability, when the node declares one.
+    // Taken in `start` and converted into the clonable handle used by transports.
+    authorizer: Option<Box<dyn BearerTokenAuthorizer>>,
 }
 
 /// Declares the OTLP receiver as a shared receiver factory.
@@ -203,9 +208,16 @@ pub static OTLP_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactory {
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              receiver_config: &ReceiverConfig,
-             _capabilities: &otap_df_engine::capability::registry::Capabilities| {
+             capabilities: &otap_df_engine::capability::registry::Capabilities| {
         let admission = pipeline.admission().clone();
         let mut receiver = OTLPReceiver::from_config(pipeline, &node_config.config)?;
+        // Authorization is opt-in: the receiver only enforces it when the node
+        // declares a binding for the `bearer_token_authorizer` capability.
+        receiver.authorizer = capabilities
+            .optional_shared::<BearerTokenAuthorizerCap>()
+            .map_err(|error| otap_df_config::error::Error::InvalidUserConfig {
+                error: error.to_string(),
+            })?;
         receiver.rate_limiter = admission
             .bind_shared(AdmissionDimension::Bytes, receiver.admission_state.clone())
             .map_err(|error| otap_df_config::error::Error::InvalidUserConfig {
@@ -279,6 +291,7 @@ impl OTLPReceiver {
             ),
             rate_limiter: None,
             global_max_concurrent_requests: None,
+            authorizer: None,
         })
     }
 
@@ -307,6 +320,7 @@ impl OTLPReceiver {
         effect_handler: &shared::EffectHandler<OtapPdata>,
         grpc_settings: Option<&OtlpServerSettings>,
         max_concurrent_requests: usize,
+        authorizer: Option<&Arc<dyn BearerTokenAuthorizer>>,
     ) -> (
         Option<LogsServiceServer>,
         Option<MetricsServiceServer>,
@@ -321,6 +335,15 @@ impl OTLPReceiver {
             .is_some_and(|http| http.wait_for_result);
         let grpc_wait = grpc_settings.is_some_and(|s| s.wait_for_result);
         let wait_for_result_any = grpc_wait || http_wait;
+        let authorization_timeout = self
+            .config
+            .protocols
+            .grpc
+            .as_ref()
+            .and_then(|grpc| grpc.timeout)
+            .map_or(Duration::from_secs(5), |timeout| {
+                timeout.min(Duration::from_secs(5))
+            });
 
         // This capacity bounds concurrent wait-for-result subscriptions across all enabled
         // protocols.
@@ -349,6 +372,8 @@ impl OTLPReceiver {
                     self.metrics.clone(),
                     self.rate_limiter.clone(),
                     grpc_wait.then(|| logs_slot.clone()).flatten(),
+                    authorizer.cloned(),
+                    authorization_timeout,
                 )),
                 Some(MetricsServiceServer::new(
                     effect_handler.clone(),
@@ -356,6 +381,8 @@ impl OTLPReceiver {
                     self.metrics.clone(),
                     self.rate_limiter.clone(),
                     grpc_wait.then(|| metrics_slot.clone()).flatten(),
+                    authorizer.cloned(),
+                    authorization_timeout,
                 )),
                 Some(TraceServiceServer::new(
                     effect_handler.clone(),
@@ -363,6 +390,8 @@ impl OTLPReceiver {
                     self.metrics.clone(),
                     self.rate_limiter.clone(),
                     grpc_wait.then(|| traces_slot.clone()).flatten(),
+                    authorizer.cloned(),
+                    authorization_timeout,
                 )),
             )
         } else {
@@ -506,18 +535,23 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
             .as_ref()
             .map(|config| config.build_settings());
 
+        let request_concurrency = if both_enabled {
+            global_max
+        } else if grpc_enabled {
+            grpc_max
+        } else {
+            http_max
+        };
+
+        let authorizer = self.authorizer.take().map(Arc::from);
+
         // Build signal services (gRPC servers are only built if gRPC is enabled).
         let (logs_server, metrics_server, traces_server, ack_registry) = self
             .build_signal_services(
                 &effect_handler,
                 grpc_settings.as_ref(),
-                if both_enabled {
-                    global_max
-                } else if grpc_enabled {
-                    grpc_max
-                } else {
-                    http_max
-                },
+                request_concurrency,
+                authorizer.as_ref(),
             );
 
         // Optional receiver-wide semaphore used to cap combined gRPC + HTTP load.
@@ -636,6 +670,7 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                     self.admission_state.clone(),
                     self.rate_limiter.clone(),
                     global_semaphore.clone(),
+                    authorizer.clone(),
                     http_shutdown.clone(),
                 )))
             } else {
@@ -653,9 +688,9 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                 http_task,
                 http_shutdown,
             )
-            .await?;
+            .await;
 
-        Ok(terminal_state)
+        Ok(terminal_state?)
     }
 }
 
@@ -928,6 +963,21 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpStream;
 
+    // Builds a receiver with the same defaults `from_config` produces, so a test
+    // only spells out the fields it actually exercises.
+    fn test_receiver(config: Config, pipeline_ctx: &PipelineContext) -> OTLPReceiver {
+        OTLPReceiver {
+            config,
+            metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(pipeline_ctx))),
+            admission_state: SharedReceiverAdmissionState::from_process_state(
+                &pipeline_ctx.memory_pressure_state(),
+            ),
+            rate_limiter: None,
+            global_max_concurrent_requests: None,
+            authorizer: None,
+        }
+    }
+
     fn test_config(addr: SocketAddr) -> Config {
         let grpc = GrpcServerSettings {
             listening_addr: addr,
@@ -1114,15 +1164,7 @@ mod tests {
             let pipeline_ctx =
                 controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
-            let mut receiver = OTLPReceiver {
-                config: test_config_http_only(listen_addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-            };
+            let mut receiver = test_receiver(test_config_http_only(listen_addr), &pipeline_ctx);
             receiver.tune_max_concurrent_requests(16);
 
             let (runtime_ctrl_tx, mut runtime_ctrl_rx) = runtime_ctrl_msg_channel(16);
@@ -1931,15 +1973,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config(addr), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -1978,15 +2012,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2070,15 +2096,7 @@ mod tests {
         let config = test_config_http_only(http_listen);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2169,15 +2187,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2234,15 +2244,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2308,15 +2310,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2398,15 +2392,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2465,15 +2451,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2531,15 +2509,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2631,15 +2601,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(grpc_listen),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-            },
+            test_receiver(test_config(grpc_listen), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2714,15 +2676,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config_http_only(http_listen),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-            },
+            test_receiver(test_config_http_only(http_listen), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2812,15 +2766,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2892,15 +2838,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -2959,15 +2897,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3027,15 +2957,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config(addr), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3148,6 +3070,7 @@ mod tests {
                 metrics,
                 rate_limiter: Some(rate_limiter),
                 global_max_concurrent_requests: None,
+                authorizer: None,
                 admission_state,
             },
             test_node(test_runtime.config().name.clone()),
@@ -3265,6 +3188,7 @@ mod tests {
                 metrics,
                 rate_limiter: Some(rate_limiter),
                 global_max_concurrent_requests: None,
+                authorizer: None,
                 admission_state,
             },
             test_node(test_runtime.config().name.clone()),
@@ -3409,6 +3333,7 @@ mod tests {
                 metrics,
                 rate_limiter: Some(rate_limiter),
                 global_max_concurrent_requests: None,
+                authorizer: None,
                 admission_state,
             },
             test_node(test_runtime.config().name.clone()),
@@ -3539,6 +3464,7 @@ mod tests {
                 metrics,
                 rate_limiter: Some(rate_limiter),
                 global_max_concurrent_requests: None,
+                authorizer: None,
                 admission_state,
             },
             test_node(test_runtime.config().name.clone()),
@@ -3619,15 +3545,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3720,15 +3638,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3802,15 +3712,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3892,15 +3794,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -3951,15 +3845,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4015,15 +3901,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4137,13 +4015,8 @@ mod tests {
 
         let receiver = ReceiverWrapper::shared(
             OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
                 global_max_concurrent_requests: Some(1),
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
+                ..test_receiver(config, &pipeline_ctx)
             },
             test_node(test_runtime.config().name.clone()),
             node_config,
@@ -4298,15 +4171,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config(addr), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4411,15 +4276,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config(addr), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4527,15 +4384,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config(addr),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config(addr), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4633,15 +4482,7 @@ mod tests {
         });
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config,
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(config, &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),
@@ -4727,15 +4568,7 @@ mod tests {
             controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
 
         let receiver = ReceiverWrapper::shared(
-            OTLPReceiver {
-                config: test_config_http_only(http_listen),
-                metrics: Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx))),
-                rate_limiter: None,
-                global_max_concurrent_requests: None,
-                admission_state: SharedReceiverAdmissionState::from_process_state(
-                    &pipeline_ctx.memory_pressure_state(),
-                ),
-            },
+            test_receiver(test_config_http_only(http_listen), &pipeline_ctx),
             test_node(test_runtime.config().name.clone()),
             node_config,
             test_runtime.config(),

@@ -51,6 +51,8 @@ pub enum ReceiverRejectionErrorType {
     PayloadTooLarge,
     /// The request is malformed or otherwise invalid.
     InvalidRequest,
+    /// The bound authorizer refused the request, or could not reach a verdict.
+    Authorization,
     /// Receiver state or an internal channel failed unexpectedly.
     Internal,
 }

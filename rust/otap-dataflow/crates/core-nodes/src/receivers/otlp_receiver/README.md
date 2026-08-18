@@ -102,6 +102,53 @@ pressure, `observe_only` reports `would_throttle` without rejecting, while
 `enforce` rejects over-limit requests. V1 creates one bucket per receiver
 instance; it does not implement tenant or group-wide fairness.
 
+### Bearer token authorization
+
+Authorization is opt-in. Bind an extension that provides the
+`bearer_token_authorizer` capability to the receiver node and every inbound
+gRPC and HTTP request must then present an `Authorization` header that the
+authorizer admits. With no binding the request path is unchanged.
+
+```yaml
+otlp:
+  type: receiver:otlp
+  capabilities:
+    bearer_token_authorizer: k8s_sa_auth
+  config:
+    protocols:
+      grpc:
+        listening_addr: "127.0.0.1:4317"
+      http:
+        listening_addr: "127.0.0.1:4318"
+```
+
+Requests are checked before any admission, concurrency, or body-read budget is
+spent, and authorization **fails closed**: a request is refused whenever the
+credential is absent or rejected, and also when the authorizer cannot reach a
+verdict (for example its token-review backend is unreachable).
+
+| Outcome | HTTP | gRPC |
+| --- | --- | --- |
+| Credential missing or not valid | `401` (with `WWW-Authenticate: Bearer`) | `UNAUTHENTICATED` |
+| Credential valid but not permitted | `403` | `PERMISSION_DENIED` |
+| No verdict reachable | `503` | `UNAVAILABLE` |
+
+A credential that is absent, empty, or whitespace only is refused by the
+receiver itself, without consulting the authorizer. A value carrying only the
+`Bearer` scheme word is *not* treated as blank: it is forwarded verbatim, so the
+receiver never mangles a token or second-guesses the authorizer's policy.
+
+Each authorization is capped by the smaller of the configured protocol `timeout`
+and 5 seconds; exceeding it is treated as no verdict being reachable.
+
+Every refusal increments `receiver.otlp.rejections.requests` with
+`error.type=authorization`. Only the allow/deny verdict is used; the
+authenticated identity is not attached to pipeline data.
+
+Decision caching is the authorizer's concern, so a receiver does not add its
+own cache. Authorization calls run concurrently, letting an implementation
+coalesce and cache backend round trips as it sees fit.
+
 ## Telemetry
 
 These tables list telemetry emitted directly by this node. Common engine
@@ -145,7 +192,8 @@ never measurement attributes. Protocol-specific enforced rejections remain in
 Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
 `protocol` is `grpc` or `http`; `outcome` is `success`, `failure`, or
 `refused`; and `error.type` is `memory_pressure`, `concurrency_limit`,
-`rate_limit`, `payload_too_large`, `invalid_request`, or `internal`.
+`rate_limit`, `payload_too_large`, `invalid_request`, `authorization`, or
+`internal`.
 
 ### Events
 

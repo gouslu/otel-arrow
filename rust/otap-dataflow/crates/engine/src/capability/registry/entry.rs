@@ -96,7 +96,7 @@ impl LocalCapabilityEntry {
     }
 }
 
-/// A type-erased shared (Send) capability entry.
+/// A type-erased shared (Send + Sync) capability entry.
 ///
 /// Two closures/fn pointers, both minted by the
 /// `#[capability]`-generated `shared_entry::<E>` caster:

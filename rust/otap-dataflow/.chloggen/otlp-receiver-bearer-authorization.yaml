@@ -1,0 +1,14 @@
+change_type: enhancement
+
+component: pipeline
+
+note: OTLP receiver can now require a bearer token on inbound gRPC and HTTP requests
+
+issues: [3581]
+
+subtext: |
+  Bind an extension providing the `bearer_token_authorizer` capability to the
+  OTLP receiver node to enable it; without a binding the request path is
+  unchanged. Refused requests return 401/403/503 (UNAUTHENTICATED,
+  PERMISSION_DENIED, UNAVAILABLE) and are counted with
+  `error.type=authorization`.

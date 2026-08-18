@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
 use crate::accessory::slots::{Key as SlotKey, State as SlotsState};
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
@@ -27,7 +28,9 @@ use http::{Request, Response};
 use otap_df_config::SignalType;
 use otap_df_config::transport_headers::TransportHeaders;
 use otap_df_engine::admission::{AdmissionContext, AdmissionDecision, SharedAdmissionGate};
+use otap_df_engine::capability::auth::{AuthzDecision, BearerToken, DenyReason};
 use otap_df_engine::control::{CallData, NackMsg};
+use otap_df_engine::shared::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer;
 use otap_df_engine::shared::receiver::EffectHandler;
 use otap_df_engine::{
     Interests, MessageSourceSharedEffectHandlerExtension, ProducerEffectHandlerExtension,
@@ -562,6 +565,63 @@ fn unimplemented_resp() -> Response<Body> {
     response
 }
 
+/// Runs the bound authorizer, if any, against the inbound request headers.
+///
+/// Returns `None` when no authorizer is bound or the request is allowed, and
+/// the error response to send back otherwise.
+async fn authorization_failure(
+    authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+    metrics: &Arc<Mutex<OtlpReceiverMetrics>>,
+    headers: &http::HeaderMap,
+    timeout: Duration,
+) -> Option<Response<Body>> {
+    let authorizer = authorizer?;
+    let status = match headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        None => Status::new(Code::Unauthenticated, "unauthenticated"),
+        Some(header) => {
+            let credential = BearerToken::from_header_value(header);
+            if credential.expose_token().is_empty() {
+                Status::new(Code::Unauthenticated, "unauthenticated")
+            } else {
+                match tokio::time::timeout(timeout, authorizer.authorize(&credential)).await {
+                    Ok(Ok(AuthzDecision::Allow { .. })) => return None,
+                    Ok(Ok(AuthzDecision::Deny { reason, .. })) => match reason {
+                        DenyReason::MissingCredential | DenyReason::InvalidCredential => {
+                            Status::new(Code::Unauthenticated, "unauthenticated")
+                        }
+                        DenyReason::NotPermitted => {
+                            Status::new(Code::PermissionDenied, "permission denied")
+                        }
+                        _ => Status::new(Code::PermissionDenied, "permission denied"),
+                    },
+                    Ok(Err(error)) => {
+                        otap_df_telemetry::otel_warn!(
+                            "receiver.authz.undetermined",
+                            error = error.to_string()
+                        );
+                        Status::new(Code::Unavailable, "authorization unavailable")
+                    }
+                    Err(_) => {
+                        otap_df_telemetry::otel_warn!(
+                            "receiver.authz.timeout",
+                            timeout_ms = timeout.as_millis() as u64
+                        );
+                        Status::new(Code::Unavailable, "authorization unavailable")
+                    }
+                }
+            }
+        }
+    };
+    metrics.lock().record_rejection(
+        OtlpProtocol::Grpc,
+        ReceiverRejectionErrorType::Authorization,
+    );
+    Some(status.into_http())
+}
+
 /// common server functionality
 #[derive(Clone)]
 pub struct ServerCommon {
@@ -570,6 +630,10 @@ pub struct ServerCommon {
     settings: OtlpServerSettings,
     metrics: Arc<Mutex<OtlpReceiverMetrics>>,
     rate_limiter: Option<SharedAdmissionGate>,
+    /// Present only when the receiver bound the `bearer_token_authorizer`
+    /// capability; `None` leaves the request path completely untouched.
+    authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+    authorization_timeout: Duration,
 }
 
 impl ServerCommon {
@@ -585,6 +649,8 @@ impl ServerCommon {
         metrics: Arc<Mutex<OtlpReceiverMetrics>>,
         rate_limiter: Option<SharedAdmissionGate>,
         state: Option<AckSlot>,
+        authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+        authorization_timeout: Duration,
     ) -> Self {
         Self {
             effect_handler,
@@ -592,6 +658,8 @@ impl ServerCommon {
             settings: settings.clone(),
             metrics,
             rate_limiter,
+            authorizer,
+            authorization_timeout,
         }
     }
 
@@ -633,9 +701,19 @@ impl LogsServiceServer {
         metrics: Arc<Mutex<OtlpReceiverMetrics>>,
         rate_limiter: Option<SharedAdmissionGate>,
         state: Option<AckSlot>,
+        authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+        authorization_timeout: Duration,
     ) -> Self {
         Self {
-            common: ServerCommon::new(effect_handler, settings, metrics, rate_limiter, state),
+            common: ServerCommon::new(
+                effect_handler,
+                settings,
+                metrics,
+                rate_limiter,
+                state,
+                authorizer,
+                authorization_timeout,
+            ),
         }
     }
 }
@@ -661,6 +739,9 @@ impl tower_service::Service<Request<Body>> for LogsServiceServer {
                 }
                 let mut grpc = new_grpc(SignalType::Logs, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
+                let authorizer = common.authorizer.clone();
+                let authz_metrics = common.metrics.clone();
+                let authz_timeout = common.authorization_timeout;
                 let service = OtapBatchService::new(
                     common.effect_handler,
                     common.state,
@@ -668,7 +749,21 @@ impl tower_service::Service<Request<Body>> for LogsServiceServer {
                     SignalType::Logs,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move {
+                    // Authorize before decoding or forwarding so an unauthorized
+                    // caller never reaches the pipeline.
+                    if let Some(response) = authorization_failure(
+                        authorizer,
+                        &authz_metrics,
+                        req.headers(),
+                        authz_timeout,
+                    )
+                    .await
+                    {
+                        return Ok(response);
+                    }
+                    Ok(grpc.unary(service, req).await)
+                })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -695,9 +790,19 @@ impl MetricsServiceServer {
         metrics: Arc<Mutex<OtlpReceiverMetrics>>,
         rate_limiter: Option<SharedAdmissionGate>,
         state: Option<AckSlot>,
+        authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+        authorization_timeout: Duration,
     ) -> Self {
         Self {
-            common: ServerCommon::new(effect_handler, settings, metrics, rate_limiter, state),
+            common: ServerCommon::new(
+                effect_handler,
+                settings,
+                metrics,
+                rate_limiter,
+                state,
+                authorizer,
+                authorization_timeout,
+            ),
         }
     }
 }
@@ -720,6 +825,9 @@ impl tower_service::Service<Request<Body>> for MetricsServiceServer {
                 }
                 let mut grpc = new_grpc(SignalType::Metrics, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
+                let authorizer = common.authorizer.clone();
+                let authz_metrics = common.metrics.clone();
+                let authz_timeout = common.authorization_timeout;
                 let service = OtapBatchService::new(
                     common.effect_handler,
                     common.state,
@@ -727,7 +835,21 @@ impl tower_service::Service<Request<Body>> for MetricsServiceServer {
                     SignalType::Metrics,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move {
+                    // Authorize before decoding or forwarding so an unauthorized
+                    // caller never reaches the pipeline.
+                    if let Some(response) = authorization_failure(
+                        authorizer,
+                        &authz_metrics,
+                        req.headers(),
+                        authz_timeout,
+                    )
+                    .await
+                    {
+                        return Ok(response);
+                    }
+                    Ok(grpc.unary(service, req).await)
+                })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -754,9 +876,19 @@ impl TraceServiceServer {
         metrics: Arc<Mutex<OtlpReceiverMetrics>>,
         rate_limiter: Option<SharedAdmissionGate>,
         state: Option<AckSlot>,
+        authorizer: Option<Arc<dyn BearerTokenAuthorizer>>,
+        authorization_timeout: Duration,
     ) -> Self {
         Self {
-            common: ServerCommon::new(effect_handler, settings, metrics, rate_limiter, state),
+            common: ServerCommon::new(
+                effect_handler,
+                settings,
+                metrics,
+                rate_limiter,
+                state,
+                authorizer,
+                authorization_timeout,
+            ),
         }
     }
 }
@@ -779,6 +911,9 @@ impl tower_service::Service<Request<Body>> for TraceServiceServer {
                 }
                 let mut grpc = new_grpc(SignalType::Traces, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
+                let authorizer = common.authorizer.clone();
+                let authz_metrics = common.metrics.clone();
+                let authz_timeout = common.authorization_timeout;
                 let service = OtapBatchService::new(
                     common.effect_handler,
                     common.state,
@@ -786,7 +921,21 @@ impl tower_service::Service<Request<Body>> for TraceServiceServer {
                     SignalType::Traces,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move {
+                    // Authorize before decoding or forwarding so an unauthorized
+                    // caller never reaches the pipeline.
+                    if let Some(response) = authorization_failure(
+                        authorizer,
+                        &authz_metrics,
+                        req.headers(),
+                        authz_timeout,
+                    )
+                    .await
+                    {
+                        return Ok(response);
+                    }
+                    Ok(grpc.unary(service, req).await)
+                })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -800,6 +949,7 @@ impl NamedService for TraceServiceServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otap_df_engine::capability::CapabilityError;
     use otap_df_engine::control::runtime_ctrl_msg_channel;
     use otap_df_engine::shared::message::SharedSender;
     use otap_df_engine::testing::test_node;
@@ -809,6 +959,68 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::mpsc as tokio_mpsc;
     use tonic::Code;
+
+    struct TestAuthorizer;
+
+    #[async_trait::async_trait]
+    impl BearerTokenAuthorizer for TestAuthorizer {
+        async fn authorize(
+            &self,
+            credential: &BearerToken,
+        ) -> Result<AuthzDecision, CapabilityError> {
+            Ok(match credential.expose_token() {
+                "allowed" => AuthzDecision::allow_anonymous(),
+                "invalid" => AuthzDecision::deny(DenyReason::InvalidCredential),
+                _ => AuthzDecision::deny(DenyReason::NotPermitted),
+            })
+        }
+    }
+
+    /// Scenario: gRPC authorization sees a missing, allowed, and invalid bearer
+    /// credential.
+    /// Guarantees: the capability is called directly and outcomes map to gRPC
+    /// status without a worker or request-authorizer abstraction.
+    #[tokio::test]
+    async fn maps_authorization_outcomes() {
+        let authorizer: Arc<dyn BearerTokenAuthorizer> = Arc::new(TestAuthorizer);
+        let metrics = new_test_metrics();
+        let mut headers = http::HeaderMap::new();
+
+        let response = authorization_failure(
+            Some(authorizer.clone()),
+            &metrics,
+            &headers,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("missing credential must be rejected");
+        assert_eq!(response.headers()["grpc-status"], "16");
+
+        _ = headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer allowed"),
+        );
+        assert!(
+            authorization_failure(
+                Some(authorizer.clone()),
+                &metrics,
+                &headers,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_none()
+        );
+
+        _ = headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer invalid"),
+        );
+        let response =
+            authorization_failure(Some(authorizer), &metrics, &headers, Duration::from_secs(1))
+                .await
+                .expect("invalid credential must be rejected");
+        assert_eq!(response.headers()["grpc-status"], "16");
+    }
 
     fn new_test_metrics() -> Arc<Mutex<OtlpReceiverMetrics>> {
         let registry = TelemetryRegistryHandle::new();
