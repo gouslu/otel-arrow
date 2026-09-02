@@ -4,6 +4,7 @@
 //! Pipeline configuration specification.
 pub mod telemetry;
 
+use crate::dependency_graph::DependencyGraph;
 use crate::error::{Context, Error, HyperEdgeSpecDetails};
 use crate::extension::ExtensionUserConfig;
 use crate::node::{NodeKind, NodeUserConfig};
@@ -842,14 +843,19 @@ impl PipelineConfig {
         }
     }
 
-    /// Validates that every capability binding references an extension that
-    /// exists in the `extensions:` section, and that extensions themselves
-    /// do not declare capability bindings (they provide capabilities, not
-    /// consume them).
+    /// Validates that every node or extension capability binding references an
+    /// extension in this pipeline and that extension dependencies are acyclic.
     fn validate_capability_bindings(&self, errors: &mut Vec<Error>) {
-        // Check that capability bindings on nodes reference valid extensions
-        for (node_id, node_config) in self.nodes.iter() {
-            for (capability_name, extension_name) in &node_config.capabilities {
+        let mut nodes: Vec<_> = self.nodes.iter().collect();
+        nodes.sort_unstable_by(|(left, _), (right, _)| {
+            AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+        });
+        for (node_id, node_config) in nodes {
+            let mut bindings: Vec<_> = node_config.capabilities.iter().collect();
+            bindings.sort_unstable_by(|(left, _), (right, _)| {
+                AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+            });
+            for (capability_name, extension_name) in bindings {
                 if !self.extensions.contains_key(extension_name.as_ref()) {
                     errors.push(Error::InvalidUserConfig {
                         error: format!(
@@ -863,6 +869,51 @@ impl PipelineConfig {
                 }
             }
         }
+
+        let mut dependency_graph = DependencyGraph::new();
+        let mut extensions: Vec<_> = self.extensions.iter().collect();
+        extensions.sort_unstable_by(|(left, _), (right, _)| {
+            AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+        });
+        for (extension, _) in &extensions {
+            dependency_graph.add_node((*extension).clone());
+        }
+        for (consumer, extension_config) in extensions {
+            let mut bindings: Vec<_> = extension_config.capabilities.iter().collect();
+            bindings.sort_unstable_by(|(left, _), (right, _)| {
+                AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+            });
+            for (capability_name, provider) in bindings {
+                if !self.extensions.contains_key(provider.as_ref()) {
+                    errors.push(Error::InvalidUserConfig {
+                        error: format!(
+                            "Extension '{}' binds capability '{}' to extension '{}', \
+                             but no extension with that name exists in the `extensions` section.",
+                            consumer.as_ref(),
+                            capability_name,
+                            provider,
+                        ),
+                    });
+                    continue;
+                }
+                dependency_graph.add_dependency(consumer.clone(), provider.clone());
+            }
+        }
+
+        let cycle_members = dependency_graph.cycle_members();
+        if !cycle_members.is_empty() {
+            errors.push(Error::InvalidUserConfig {
+                error: format!(
+                    "Extension capability dependencies contain a cycle involving: {}.",
+                    cycle_members
+                        .iter()
+                        .map(AsRef::<str>::as_ref)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+
         // Extension URN format validation happens at parse time via ExtensionUrn::parse(),
         // so no runtime kind check is needed here.
     }
@@ -1228,6 +1279,7 @@ impl PipelineConfigBuilder {
                     r#type: ext_type,
                     description: None,
                     config: config.unwrap_or(Value::Null),
+                    capabilities: HashMap::new(),
                 },
             );
         }
@@ -3069,6 +3121,50 @@ connections:
         }
     }
 
+    /// Scenario: Multiple consumers have multiple bindings to missing extensions.
+    /// Guarantees: Validation reports missing providers in consumer and capability name order.
+    #[test]
+    fn missing_capability_providers_are_reported_deterministically() {
+        let yaml = r#"
+nodes:
+  zeta:
+    type: "urn:test:receiver:example"
+    capabilities:
+      middle_capability: missing-zeta
+  alpha:
+    type: "urn:test:exporter:example"
+    capabilities:
+      zeta_capability: missing-alpha-zeta
+      alpha_capability: missing-alpha-alpha
+connections:
+  - from: zeta
+    to: alpha
+"#;
+
+        let Err(Error::InvalidConfiguration { errors }) =
+            super::PipelineConfig::from_yaml("g".into(), "p".into(), yaml)
+        else {
+            panic!("missing capability providers must fail validation");
+        };
+        let messages: Vec<_> = errors
+            .iter()
+            .filter_map(|error| match error {
+                Error::InvalidUserConfig { error } if error.contains("binds capability") => {
+                    Some(error.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(messages.len(), 3, "{errors:?}");
+        assert!(messages[0].contains("Node 'alpha'"));
+        assert!(messages[0].contains("'alpha_capability'"));
+        assert!(messages[1].contains("Node 'alpha'"));
+        assert!(messages[1].contains("'zeta_capability'"));
+        assert!(messages[2].contains("Node 'zeta'"));
+        assert!(messages[2].contains("'middle_capability'"));
+    }
+
     #[test]
     fn test_capability_binding_to_existing_extension_passes() {
         let yaml = r#"
@@ -3097,11 +3193,10 @@ connections:
         );
     }
 
+    /// Scenario: A pipeline extension declares a capability dependency.
+    /// Guarantees: Pipeline parsing preserves the provider binding for engine validation.
     #[test]
-    fn test_capabilities_on_extension_rejected() {
-        // ExtensionUserConfig uses #[serde(deny_unknown_fields)], so
-        // `capabilities` on an extension is caught at deserialization time
-        // (extensions don't consume capabilities -- they provide them).
+    fn test_capabilities_on_extension_preserved() {
         let yaml = r#"
 nodes:
   receiver:
@@ -3114,22 +3209,67 @@ extensions:
     type: "urn:test:extension:auth"
     capabilities:
       some_capability: "other_ext"
+  other_ext:
+    type: "urn:test:extension:provider"
 
 connections:
   - from: receiver
     to: exporter
 "#;
+        let config = super::PipelineConfig::from_yaml("g".into(), "p".into(), yaml)
+            .expect("extension capability dependencies are valid configuration");
+        assert_eq!(
+            config
+                .extensions()
+                .get("auth")
+                .expect("auth extension exists")
+                .capabilities
+                .get("some_capability")
+                .map(AsRef::as_ref),
+            Some("other_ext")
+        );
+    }
+
+    /// Scenario: Two extensions form a cycle and a third extension depends on that cycle.
+    /// Guarantees: Validation reports only the strongly connected cycle members.
+    #[test]
+    fn extension_dependency_cycle_excludes_blocked_consumer() {
+        let yaml = r#"
+nodes:
+  receiver:
+    type: "urn:test:receiver:example"
+  exporter:
+    type: "urn:test:exporter:example"
+extensions:
+  a:
+    type: "urn:test:extension:a"
+    capabilities:
+      cap_b: b
+  b:
+    type: "urn:test:extension:b"
+    capabilities:
+      cap_a: a
+  c:
+    type: "urn:test:extension:c"
+    capabilities:
+      cap_a: a
+connections:
+  - from: receiver
+    to: exporter
+"#;
+
         let result = super::PipelineConfig::from_yaml("g".into(), "p".into(), yaml);
-        assert!(
-            result.is_err(),
-            "extensions with `capabilities` should be rejected"
-        );
-        let err = result.unwrap_err();
-        let err_str = format!("{err:?}");
-        assert!(
-            err_str.contains("capabilities"),
-            "error should mention `capabilities`, got: {err_str}"
-        );
+        let Err(Error::InvalidConfiguration { errors }) = result else {
+            panic!("expected cyclic extension dependencies to fail validation");
+        };
+        assert!(errors.iter().any(|error| {
+            matches!(
+                error,
+                Error::InvalidUserConfig { error }
+                    if error
+                        == "Extension capability dependencies contain a cycle involving: a, b."
+            )
+        }));
     }
 
     #[test]

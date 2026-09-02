@@ -7,15 +7,16 @@
 //! have no output ports, no wiring contracts, and no header policies.
 
 pub use crate::extension_urn::ExtensionUrn;
+use crate::{CapabilityId, ExtensionId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// User configuration for an extension instance.
 ///
 /// Unlike [`NodeUserConfig`](crate::node::NodeUserConfig), extensions have no
-/// output ports, wiring contracts, or transport header policies -- they only
-/// need a type URN and extension-specific configuration.
+/// output ports, wiring contracts, or transport header policies.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionUserConfig {
@@ -30,6 +31,18 @@ pub struct ExtensionUserConfig {
     #[serde(default)]
     #[schemars(extend("x-kubernetes-preserve-unknown-fields" = true))]
     pub config: Value,
+
+    /// Capability dependencies mapping capability names to provider extensions.
+    ///
+    /// The engine constructs and starts providers before this extension. An
+    /// extension factory claims each dependency through the same typed,
+    /// one-shot capabilities API used by node factories.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "crate::deserialize_capability_bindings"
+    )]
+    pub capabilities: HashMap<CapabilityId, ExtensionId>,
 }
 
 impl ExtensionUserConfig {
@@ -40,6 +53,7 @@ impl ExtensionUserConfig {
             r#type,
             description: None,
             config,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -51,6 +65,7 @@ impl ExtensionUserConfig {
             r#type: r#type.into(),
             description: None,
             config: Value::Null,
+            capabilities: HashMap::new(),
         }
     }
 
@@ -88,15 +103,35 @@ config:
         assert_eq!(config.config["capacity"], 100);
     }
 
+    /// Scenario: An extension declares a capability dependency in YAML.
+    /// Guarantees: The provider extension ID is retained for dependency resolution.
     #[test]
-    fn test_extension_user_config_rejects_capabilities() {
+    fn test_extension_user_config_deserializes_capabilities() {
         let yaml = r#"
 type: "urn:otap:extension:auth"
 capabilities:
-  some_cap: "ext"
+  some_cap: "provider"
 "#;
-        let result: Result<ExtensionUserConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
+        let config: ExtensionUserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.capabilities.get("some_cap").map(AsRef::as_ref),
+            Some("provider")
+        );
+    }
+
+    /// Scenario: An extension repeats a capability dependency key in YAML.
+    /// Guarantees: Configuration loading rejects the ambiguous dependency.
+    #[test]
+    fn extension_capabilities_reject_duplicate_keys() {
+        let yaml = r#"
+type: "urn:otap:extension:auth"
+capabilities:
+  some_cap: "provider_a"
+  some_cap: "provider_b"
+"#;
+        let error = serde_yaml::from_str::<ExtensionUserConfig>(yaml)
+            .expect_err("duplicate capability keys must be rejected");
+        assert!(error.to_string().contains("duplicate capability key"));
     }
 
     #[test]

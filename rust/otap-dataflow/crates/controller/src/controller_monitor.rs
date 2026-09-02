@@ -328,6 +328,7 @@ mod tests {
             r#type: CONTROLLER_MONITOR_EXTENSION_URN.into(),
             description: None,
             config,
+            capabilities: HashMap::new(),
         }
     }
 

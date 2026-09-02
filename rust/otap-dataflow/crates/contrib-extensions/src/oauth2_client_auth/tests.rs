@@ -508,7 +508,13 @@ fn create_bundle(config: serde_json::Value) -> Result<ExtensionBundle, ConfigErr
         config,
     ));
     let extension_config = ExtensionConfig::new(name.clone());
-    create(&ext_ctx, name, user_config, &extension_config)
+    create(
+        &ext_ctx,
+        name,
+        user_config,
+        &extension_config,
+        &otel_arrow_dfe_engine::extension::ExtensionDependencies::empty(),
+    )
 }
 
 // Scenario: The factory's `create` hook runs against a valid client-credentials config.

@@ -196,6 +196,45 @@ Optional contrib nodes are listed in the
 [contrib-node catalog](../crates/contrib-nodes/README.md). They are registered
 only when the corresponding crate features are enabled in the binary you run.
 
+## Extensions and Capabilities
+
+Extensions provide typed capabilities to nodes or other extensions. They are
+declared beside `nodes`, and each consumer binds a capability name to a
+pipeline-local extension id:
+
+```yaml
+extensions:
+    credentials:
+        type: urn:otel:extension:credentials
+    client:
+        type: urn:otel:extension:client
+        capabilities:
+            bearer_token_provider: credentials
+
+nodes:
+    exporter:
+        type: exporter:otlp_grpc
+        capabilities:
+            client: client
+```
+
+Extension-to-extension bindings form a DAG. The engine rejects missing
+providers, unknown capability names, provider metadata mismatches, and cycles
+before construction. It constructs providers before consumers and waits for
+each dependency layer's readiness probes before starting the next layer. All
+layers share one absolute startup deadline, and a shutdown request interrupts
+the readiness wait before any data-path node starts.
+
+An extension factory receives separate local and shared dependency scopes.
+Each physical implementation independently claims the execution model it
+needs during construction. After all extension and node factories finish, the
+engine keeps only provider variants reachable from node consumers or
+background extension variants. Configured bindings that no factory claims do
+not keep an otherwise-unused provider alive. Shutdown follows this surviving
+physical graph: terminal consumers and unrelated roots stop first, providers
+stop only after their consumers, and each wave receives a share of the
+remaining global shutdown budget.
+
 ## Pipeline Groups and Pipelines
 
 The engine is designed to run and manage many pipelines in parallel inside one

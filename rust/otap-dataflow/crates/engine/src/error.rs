@@ -345,6 +345,46 @@ pub enum Error {
         plugin_urn: String,
     },
 
+    /// An extension references a provider that is not configured.
+    #[error(
+        "Extension `{extension}` depends on extension `{dependency}`, but `{dependency}` is not \
+         defined in this pipeline"
+    )]
+    ExtensionDependencyNotFound {
+        /// The extension declaring the dependency.
+        extension: ExtensionId,
+        /// The missing provider extension.
+        dependency: ExtensionId,
+    },
+
+    /// Extension capability dependencies contain a cycle.
+    #[error("Extension capability dependency cycle detected among {extensions:?}")]
+    ExtensionDependencyCycle {
+        /// The extensions participating in or blocked by the cycle.
+        extensions: Vec<ExtensionId>,
+    },
+
+    /// Capability resolution failed while constructing an extension.
+    #[error("Failed to resolve capability dependencies for extension `{extension}`: {message}")]
+    ExtensionCapabilityResolutionFailed {
+        /// The extension whose dependencies could not be resolved.
+        extension: ExtensionId,
+        /// Underlying capability resolution error.
+        message: String,
+    },
+
+    /// An extension consumed dependencies for a variant it did not construct.
+    #[error(
+        "Extension `{extension}` consumed dependencies for its {variant} implementation, but its \
+         factory returned no {variant} variant"
+    )]
+    ExtensionDependencyVariantMissing {
+        /// The extension whose factory returned an inconsistent bundle.
+        extension: ExtensionId,
+        /// The missing physical variant.
+        variant: &'static str,
+    },
+
     /// Capability registration failed for an extension.
     #[error("Failed to register capabilities for extension `{extension}`: {message}")]
     CapabilityRegistrationFailed {
@@ -450,6 +490,20 @@ pub enum Error {
         extension: String,
         /// Variant (`"local"` or `"shared"`).
         variant: String,
+    },
+
+    /// The complete extension startup sequence exceeded its absolute deadline.
+    #[error("Extension startup did not complete within the absolute {timeout:?} budget")]
+    ExtensionStartupTimeout {
+        /// Absolute budget shared by all extension dependency layers.
+        timeout: std::time::Duration,
+    },
+
+    /// A node-only runtime control message arrived before nodes were started.
+    #[error("Runtime control message received before data-path startup: {message}")]
+    RuntimeControlMessageBeforeStartup {
+        /// Debug representation of the unexpected message.
+        message: String,
     },
 
     /// An extension requested a readiness-probe timeout of zero.
@@ -616,6 +670,10 @@ impl Error {
             Error::ExtensionReadinessSignallerDropped { .. } => {
                 "ExtensionReadinessSignallerDropped"
             }
+            Error::ExtensionStartupTimeout { .. } => "ExtensionStartupTimeout",
+            Error::RuntimeControlMessageBeforeStartup { .. } => {
+                "RuntimeControlMessageBeforeStartup"
+            }
             Error::ExtensionReadinessZeroTimeout { .. } => "ExtensionReadinessZeroTimeout",
             Error::NoDefaultOutputPort { .. } => "NoDefaultOutputPort",
             Error::NodeControlMsgSendError { .. } => "NodeControlMsgSendError",
@@ -633,6 +691,12 @@ impl Error {
             Error::UnknownExporter { .. } => "UnknownExporter",
             Error::ExtensionAlreadyExists { .. } => "ExtensionAlreadyExists",
             Error::UnknownExtension { .. } => "UnknownExtension",
+            Error::ExtensionDependencyNotFound { .. } => "ExtensionDependencyNotFound",
+            Error::ExtensionDependencyCycle { .. } => "ExtensionDependencyCycle",
+            Error::ExtensionCapabilityResolutionFailed { .. } => {
+                "ExtensionCapabilityResolutionFailed"
+            }
+            Error::ExtensionDependencyVariantMissing { .. } => "ExtensionDependencyVariantMissing",
             Error::CapabilityRegistrationFailed { .. } => "CapabilityRegistrationFailed",
             Error::CapabilityResolutionFailed { .. } => "CapabilityResolutionFailed",
             Error::UnknownNode { .. } => "UnknownNode",

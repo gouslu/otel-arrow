@@ -18,46 +18,6 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-/// Deserializes a `HashMap<String, String>` while rejecting duplicate keys.
-///
-/// Standard serde deserialization into `HashMap` silently overwrites earlier
-/// entries when keys are duplicated in the source. This function detects that
-/// and returns an error so the user gets immediate feedback.
-fn deserialize_no_dup_keys<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<CapabilityId, ExtensionId>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{MapAccess, Visitor};
-    use std::fmt;
-
-    struct NoDupVisitor;
-
-    impl<'de> Visitor<'de> for NoDupVisitor {
-        type Value = HashMap<CapabilityId, ExtensionId>;
-
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a map with no duplicate keys")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut result = HashMap::new();
-            while let Some((key, value)) = map.next_entry::<String, String>()? {
-                if result.contains_key(key.as_str()) {
-                    return Err(serde::de::Error::custom(format!(
-                        "duplicate capability key '{key}'"
-                    )));
-                }
-                let _ = result.insert(CapabilityId::from(key), ExtensionId::from(value));
-            }
-            Ok(result)
-        }
-    }
-
-    deserializer.deserialize_map(NoDupVisitor)
-}
-
 /// User configuration for a node in the pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +73,7 @@ pub struct NodeUserConfig {
     #[serde(
         default,
         skip_serializing_if = "HashMap::is_empty",
-        deserialize_with = "deserialize_no_dup_keys"
+        deserialize_with = "crate::deserialize_capability_bindings"
     )]
     pub capabilities: HashMap<CapabilityId, ExtensionId>,
 

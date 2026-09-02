@@ -368,8 +368,14 @@ fn factory_create_builds_both_variants_without_a_cluster() {
     ));
     let extension_config = ExtensionConfig::new("k8s-authz");
 
-    let bundle = create(&ctx, "k8s-authz".into(), user_config, &extension_config)
-        .expect("a valid config must build an extension bundle");
+    let bundle = create(
+        &ctx,
+        "k8s-authz".into(),
+        user_config,
+        &extension_config,
+        &otel_arrow_dfe_engine::extension::ExtensionDependencies::empty(),
+    )
+    .expect("a valid config must build an extension bundle");
 
     let shared = bundle.shared().expect("shared variant must be present");
     let local = bundle.local().expect("local variant must be present");
@@ -394,7 +400,14 @@ fn factory_create_rejects_an_invalid_config() {
     let extension_config = ExtensionConfig::new("k8s-authz");
 
     assert!(
-        create(&ctx, "k8s-authz".into(), user_config, &extension_config).is_err(),
+        create(
+            &ctx,
+            "k8s-authz".into(),
+            user_config,
+            &extension_config,
+            &otel_arrow_dfe_engine::extension::ExtensionDependencies::empty(),
+        )
+        .is_err(),
         "a config without audiences must be rejected at build time"
     );
 }

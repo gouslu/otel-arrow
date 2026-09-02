@@ -75,6 +75,7 @@ fn create(
     name: otel_arrow_dfe_config::ExtensionId,
     ext_config: Arc<ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &otel_arrow_dfe_engine::extension::ExtensionDependencies,
 ) -> Result<ExtensionBundle, ConfigError> {
     // Validate config now so a bad config fails fast at wiring time.
     let config = parse_config(&ext_config.config)?;

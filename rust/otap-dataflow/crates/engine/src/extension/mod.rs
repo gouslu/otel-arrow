@@ -17,6 +17,8 @@
 //! [`shared::extension`](crate::shared::extension).
 
 pub mod builder;
+mod dependencies;
+pub(crate) mod dependency;
 pub mod readiness;
 pub mod wrapper;
 
@@ -29,6 +31,10 @@ pub use builder::{
     PassiveClonedLocalStage, PassiveClonedSharedStage, PassiveClonedStage,
     PassiveConstructedCompleteStage, PassiveConstructedLocalStage, PassiveConstructedSharedStage,
     PassiveConstructedStage, PassiveStage, SharedDecomposed,
+};
+pub use dependencies::{
+    ExtensionDependencies, LocalDependencies, LocalExtensionDependency, SharedDependencies,
+    SharedExtensionDependency,
 };
 // TODO: reduce public visibility of the readiness types.
 // `ReadinessSignaller`, `ReadinessProbe`, and `ReadinessProbeError` have no

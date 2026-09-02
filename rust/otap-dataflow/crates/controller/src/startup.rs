@@ -186,6 +186,8 @@ pub fn validate_pipeline_components<PData: 'static + Clone + Debug>(
         }
     }
 
+    factory.validate_capability_bindings(pipeline_cfg)?;
+
     Ok(())
 }
 
@@ -381,14 +383,22 @@ Example configuration files can be found in the configs/ directory.{}",
 mod tests {
     use super::*;
     use otel_arrow_dfe_config::policy::{CoreRange, Policies};
-    use otel_arrow_dfe_config::{PipelineGroupId, PipelineId, node::NodeUserConfig};
+    use otel_arrow_dfe_config::{
+        ExtensionId, PipelineGroupId, PipelineId, extension::ExtensionUserConfig,
+        node::NodeUserConfig,
+    };
+    use otel_arrow_dfe_engine::capability::ExtensionCapabilities;
+    use otel_arrow_dfe_engine::config::ExtensionConfig;
     use otel_arrow_dfe_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
-    use otel_arrow_dfe_engine::context::PipelineContext;
+    use otel_arrow_dfe_engine::context::{ExtensionContext, PipelineContext};
     use otel_arrow_dfe_engine::exporter::ExporterWrapper;
+    use otel_arrow_dfe_engine::extension::{ExtensionBundle, ExtensionDependencies};
     use otel_arrow_dfe_engine::processor::ProcessorWrapper;
     use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
     use otel_arrow_dfe_engine::wiring_contract::WiringContract;
-    use otel_arrow_dfe_engine::{ExporterFactory, ProcessorFactory, ReceiverFactory};
+    use otel_arrow_dfe_engine::{
+        ExporterFactory, ExtensionFactory, ProcessorFactory, ReceiverFactory,
+    };
     use std::sync::Arc;
 
     fn test_receiver_create(
@@ -421,7 +431,38 @@ mod tests {
         panic!("test processor factory should not be constructed")
     }
 
-    fn test_factory() -> PipelineFactory<()> {
+    fn test_extension_create(
+        _extension_context: &ExtensionContext,
+        _extension_id: ExtensionId,
+        _extension_user_config: Arc<ExtensionUserConfig>,
+        _extension_config: &ExtensionConfig,
+        _dependencies: &ExtensionDependencies,
+    ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
+        panic!("static validation must not construct extensions")
+    }
+
+    fn test_extension_factory(
+        name: &'static str,
+        shared_capabilities: &'static [&'static str],
+    ) -> ExtensionFactory {
+        ExtensionFactory {
+            name,
+            description: "test extension",
+            documentation_url: "",
+            capabilities: Some(ExtensionCapabilities {
+                shared: shared_capabilities,
+                local: &[],
+                register_shared: |_, _, _| Ok(()),
+                register_local: |_, _, _| Ok(()),
+            }),
+            create: test_extension_create,
+            validate_config: otel_arrow_dfe_config::validation::no_config,
+        }
+    }
+
+    fn test_factory_with_extensions(
+        extension_factories: &'static [ExtensionFactory],
+    ) -> PipelineFactory<()> {
         let receiver_factories = Box::leak(Box::new([
             ReceiverFactory {
                 name: "urn:test:receiver:example",
@@ -466,8 +507,12 @@ mod tests {
             receiver_factories,
             processor_factories,
             exporter_factories,
-            &[],
+            extension_factories,
         )
+    }
+
+    fn test_factory() -> PipelineFactory<()> {
+        test_factory_with_extensions(&[])
     }
 
     fn minimal_engine_yaml() -> &'static str {
@@ -600,6 +645,89 @@ extensions:
             "unexpected error: {msg}"
         );
         assert!(msg.contains("not-registered"), "unexpected error: {msg}");
+    }
+
+    /// Scenario: A node binds a known capability to an extension whose factory omits it.
+    /// Guarantees: Validate-only mode rejects provider metadata drift without construction.
+    #[test]
+    fn validate_pipeline_components_checks_node_capability_metadata() {
+        let yaml = r#"
+nodes:
+  receiver:
+    type: "urn:test:receiver:example"
+  exporter:
+    type: "urn:test:exporter:example"
+    capabilities:
+      bearer_token_provider: auth
+extensions:
+  auth:
+    type: "urn:test:extension:no-capabilities"
+connections:
+  - from: receiver
+    to: exporter
+"#;
+        let pipeline_cfg =
+            PipelineConfig::from_yaml("g".into(), "p".into(), yaml).expect("yaml parses");
+        let extension_factories = Box::leak(Box::new([test_extension_factory(
+            "urn:test:extension:no-capabilities",
+            &[],
+        )]));
+        let factory = test_factory_with_extensions(extension_factories);
+
+        let error = validate_pipeline_components(
+            &PipelineGroupId::from("g"),
+            &PipelineId::from("p"),
+            &pipeline_cfg,
+            &factory,
+        )
+        .expect_err("unadvertised node capability must fail static validation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("extension 'auth' does not provide it"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Scenario: An extension dependency names a capability absent from the linked registry.
+    /// Guarantees: Validate-only mode applies semantic checks to extension consumers too.
+    #[test]
+    fn validate_pipeline_components_checks_extension_capability_names() {
+        let yaml = r#"
+extensions:
+  provider:
+    type: "urn:test:extension:provider"
+  consumer:
+    type: "urn:test:extension:consumer"
+    capabilities:
+      capability_that_is_not_linked: provider
+"#;
+        let pipeline_cfg =
+            PipelineConfig::from_yaml("g".into(), "p".into(), yaml).expect("yaml parses");
+        let extension_factories = Box::leak(Box::new([
+            test_extension_factory("urn:test:extension:provider", &[]),
+            test_extension_factory("urn:test:extension:consumer", &[]),
+        ]));
+        let factory = test_factory_with_extensions(extension_factories);
+
+        let error = validate_pipeline_components(
+            &PipelineGroupId::from("g"),
+            &PipelineId::from("p"),
+            &pipeline_cfg,
+            &factory,
+        )
+        .expect_err("unknown extension dependency capability must fail static validation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("extension `consumer`"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("unknown capability 'capability_that_is_not_linked'"),
+            "unexpected error: {message}"
+        );
     }
 
     /// Scenario: a custom receiver is registered while a rate limiter is configured.

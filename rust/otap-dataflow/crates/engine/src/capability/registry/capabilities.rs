@@ -1,18 +1,19 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Capabilities`] -- the per-node consumer API for resolved capability
+//! [`Capabilities`] -- the per-consumer API for resolved capability
 //! bindings, with `require_*` and `optional_*` accessors.
 
 use super::{Error, ResolvedLocalEntry, ResolvedSharedEntry};
 use std::any::TypeId;
 use std::collections::HashMap;
-/// Per-node capability bindings resolved from the
+/// Per-consumer capability bindings resolved from the
 /// [`CapabilityRegistry`](super::CapabilityRegistry).
 ///
-/// Passed to node factories as `&Capabilities`. Provides type-safe
-/// access to extension capabilities via the [`ExtensionCapability`]
-/// sealed trait.
+/// Passed directly to node factories and wrapped in variant-scoped
+/// [`ExtensionDependencies`](crate::extension::ExtensionDependencies) for
+/// extension factories. Provides type-safe access to extension capabilities
+/// via the [`ExtensionCapability`] sealed trait.
 ///
 /// [`ExtensionCapability`]: crate::capability::ExtensionCapability
 pub struct Capabilities {
@@ -86,15 +87,15 @@ impl Capabilities {
     ///
     /// # One-shot contract
     ///
-    /// Each resolved entry is one-shot per node: a `require_local`
+    /// Each resolved entry is one-shot per consumer: a `require_local`
     /// claim consumes the local entry, and a `require_shared` claim
     /// consumes the shared entry. Node factories are expected to
     /// call each accessor at most once at construction and store the
-    /// returned handle (wrapping it in `Rc<...>` themselves if they need
-    /// to fan out within the node).
+    /// returned handle (wrapping it in `Rc<...>` or `Arc<...>` themselves if
+    /// they need to retain or fan it out).
     ///
     /// The contract is **per-binding**, not per-execution-model: a
-    /// node claims a binding at most once, regardless of which
+    /// consumer claims a binding at most once, regardless of which
     /// accessor (`require_local`, `require_shared`, `optional_local`,
     /// `optional_shared`) is used. Claiming one execution model
     /// invalidates the other on the same node, so a subsequent call
@@ -116,7 +117,7 @@ impl Capabilities {
     ///
     /// - [`Error::CapabilityNotBound`] if no extension is bound to this
     ///   capability for this node. Either add the binding to the
-    ///   node's capability declaration or switch to
+    ///   consumer's capability declaration or switch to
     ///   [`Self::optional_local`].
     /// - [`Error::CapabilityAlreadyConsumed`] if the capability was
     ///   already claimed on this node.
@@ -207,7 +208,7 @@ impl Capabilities {
     ///
     /// - [`Error::CapabilityNotBound`] if no extension is bound to this
     ///   capability for this node. Either add the binding to the
-    ///   node's capability declaration or switch to
+    ///   consumer's capability declaration or switch to
     ///   [`Self::optional_shared`].
     /// - [`Error::CapabilityAlreadyConsumed`] if the capability was
     ///   already claimed on this node.

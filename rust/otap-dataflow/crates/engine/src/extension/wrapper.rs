@@ -180,7 +180,7 @@ impl EffectHandler {
 
 /// Identifies a physical extension variant within an [`ExtensionBundle`].
 /// A single `ExtensionId` may register both `Local` and `Shared` variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExtensionVariant {
     /// `!Send` variant scheduled onto the host `LocalSet`.
     Local,
@@ -584,6 +584,30 @@ impl ExtensionWrapper {
             _ => return None,
         };
         probe_slot.take()
+    }
+
+    /// Returns the configured readiness timeout without consuming the probe.
+    #[must_use]
+    pub(crate) fn readiness_timeout(&self) -> Option<std::time::Duration> {
+        match self {
+            ExtensionWrapper::Local {
+                lifecycle:
+                    ExtensionLifecycle::Active {
+                        readiness_probe, ..
+                    },
+                ..
+            }
+            | ExtensionWrapper::Shared {
+                lifecycle:
+                    ExtensionLifecycle::Active {
+                        readiness_probe, ..
+                    },
+                ..
+            } => readiness_probe
+                .as_ref()
+                .map(super::readiness::ReadinessProbe::timeout),
+            _ => None,
+        }
     }
 
     /// Returns `true` if a readiness signaller is attached to this

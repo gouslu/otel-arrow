@@ -280,6 +280,16 @@ impl ExtensionMetricsMonitor {
         }
     }
 
+    /// Marks selected non-terminal extensions as timed out.
+    pub(crate) fn mark_as_timeout<'a>(&mut self, keys: impl IntoIterator<Item = &'a ExtensionKey>) {
+        if self.interval.is_none() {
+            return;
+        }
+        for key in keys {
+            self.on_completed(key, ExtensionOutcome::ShutdownTimeout);
+        }
+    }
+
     /// Awaits the next monitor tick. Never resolves when disabled.
     pub(crate) async fn next_tick(&mut self) -> Instant {
         match self.interval.as_mut() {

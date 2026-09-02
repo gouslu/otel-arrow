@@ -1,0 +1,6 @@
+change_type: enhancement
+component: engine
+note: "Allow extensions to consume capabilities from other extensions with dependency-ordered startup, readiness, and shutdown."
+issues: [3039]
+subtext:
+  "Validation checks linked capability metadata before construction. Startup is cancellable and bounded by one deadline; shutdown uses live consumer-first waves with provider-preserving budgets."

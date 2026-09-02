@@ -47,7 +47,9 @@ use otel_arrow_dfe_engine::control::{
 };
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
-use otel_arrow_dfe_engine::extension::{EffectHandler, ExtensionBundle, ExtensionWrapper};
+use otel_arrow_dfe_engine::extension::{
+    EffectHandler, ExtensionBundle, ExtensionDependencies, ExtensionWrapper,
+};
 use otel_arrow_dfe_engine::local::exporter as local_exp;
 use otel_arrow_dfe_engine::local::processor as local_proc;
 use otel_arrow_dfe_engine::local::receiver as local_recv;
@@ -218,6 +220,7 @@ const ACTIVE_EXTENSION_URN: &str = "urn:test:extension:active_extension";
 const FAILING_EXTENSION_URN: &str = "urn:test:extension:failing_extension";
 const IMMEDIATE_OK_EXTENSION_URN: &str = "urn:test:extension:immediate_ok_extension";
 const SHUTDOWN_RECORDING_EXTENSION_URN: &str = "urn:test:extension:shutdown_recording_extension";
+static EXTENSION_CREATE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------
 // Probe receiver -- exercises Capabilities API in create()
@@ -571,6 +574,7 @@ fn passive_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
         .passive()
@@ -604,6 +608,7 @@ fn dual_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
         .passive()
@@ -635,6 +640,7 @@ struct ActiveExtImpl {
     started: Arc<AtomicBool>,
     start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    dependency: Option<Arc<dyn SharedNoOpStateless>>,
 }
 
 #[async_trait]
@@ -660,6 +666,9 @@ impl otel_arrow_dfe_engine::shared::extension::Extension for ActiveExtImpl {
         mut ctrl: otel_arrow_dfe_engine::shared::extension::ControlChannel,
         _eh: EffectHandler,
     ) -> Result<TerminalState, EngineError> {
+        if let Some(dependency) = &self.dependency {
+            let _ = dependency.name();
+        }
         self.started.store(true, Ordering::SeqCst);
         *self.start_at.lock() = Some(Instant::now());
         loop {
@@ -707,11 +716,22 @@ fn lookup_active_ext_probe(key: &str) -> ActiveExtProbe {
         .unwrap_or_else(|| panic!("no ActiveExtProbe registered for key '{key}'"))
 }
 
+fn make_active_ext_probe(key: &str) -> ActiveExtProbe {
+    let probe = ActiveExtProbe {
+        started: Arc::new(AtomicBool::new(false)),
+        start_at: Arc::new(parking_lot::Mutex::new(None)),
+        shutdown_at: Arc::new(parking_lot::Mutex::new(None)),
+    };
+    register_active_ext_probe(key, probe.clone());
+    probe
+}
+
 fn active_extension_create(
     _ctx: &ExtensionContext,
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -723,6 +743,7 @@ fn active_extension_create(
         started: Arc::clone(&probe.started),
         start_at: Arc::clone(&probe.start_at),
         shutdown_at: Arc::clone(&probe.shutdown_at),
+        dependency: None,
     };
     let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
         .active()
@@ -808,6 +829,7 @@ fn active_shared_counter_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -884,6 +906,7 @@ fn failing_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
         .active()
@@ -945,6 +968,7 @@ fn immediate_ok_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
         .active()
@@ -1047,6 +1071,7 @@ fn shutdown_recording_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -1092,6 +1117,7 @@ struct ActiveLocalExtImpl {
     started: Arc<AtomicBool>,
     start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    dependency: Option<Rc<dyn LocalNoOpStateless>>,
 }
 
 #[async_trait(?Send)]
@@ -1117,6 +1143,9 @@ impl otel_arrow_dfe_engine::local::extension::Extension for ActiveLocalExtImpl {
         mut ctrl: otel_arrow_dfe_engine::local::extension::ControlChannel,
         _eh: EffectHandler,
     ) -> Result<TerminalState, EngineError> {
+        if let Some(dependency) = &self.dependency {
+            let _ = dependency.name();
+        }
         self.started.store(true, Ordering::SeqCst);
         *self.start_at.lock() = Some(Instant::now());
         loop {
@@ -1139,6 +1168,7 @@ fn dual_active_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let local_key = user_config
         .config
@@ -1150,26 +1180,54 @@ fn dual_active_extension_create(
         .get("shared_probe_key")
         .and_then(|v| v.as_str())
         .expect("shared_probe_key present in dual_active extension config");
+    let omit_local = user_config
+        .config
+        .get("omit_local")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let local_probe = lookup_active_ext_probe(local_key);
     let shared_probe = lookup_active_ext_probe(shared_key);
+    let invalid_dependency =
+        |error: EngineError| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: error.to_string(),
+        };
+    let local_impl = dependencies
+        .bind_local(|dependencies| {
+            let dependency = dependencies.optional::<NoOpStateless>()?.map(Rc::from);
+            Ok(Rc::new(ActiveLocalExtImpl {
+                started: Arc::clone(&local_probe.started),
+                start_at: Arc::clone(&local_probe.start_at),
+                shutdown_at: Arc::clone(&local_probe.shutdown_at),
+                dependency,
+            }))
+        })
+        .map_err(invalid_dependency)?;
+    let shared_impl = dependencies
+        .bind_shared(|dependencies| {
+            let dependency = dependencies.optional::<NoOpStateless>()?.map(Arc::from);
+            Ok(ActiveExtImpl {
+                started: Arc::clone(&shared_probe.started),
+                start_at: Arc::clone(&shared_probe.start_at),
+                shutdown_at: Arc::clone(&shared_probe.shutdown_at),
+                dependency,
+            })
+        })
+        .map_err(invalid_dependency)?;
 
-    let local_impl = ActiveLocalExtImpl {
-        started: Arc::clone(&local_probe.started),
-        start_at: Arc::clone(&local_probe.start_at),
-        shutdown_at: Arc::clone(&local_probe.shutdown_at),
+    let bundle = if omit_local {
+        ExtensionWrapper::builder(name, user_config, extension_config)
+            .active()
+            .shared_with_dependencies(shared_impl)
+            .build()
+            .expect("shared-only test extension bundle builds")
+    } else {
+        ExtensionWrapper::builder(name, user_config, extension_config)
+            .active()
+            .shared_with_dependencies(shared_impl)
+            .local_with_dependencies(local_impl)
+            .build()
+            .expect("dual-active extension bundle builds")
     };
-    let shared_impl = ActiveExtImpl {
-        started: Arc::clone(&shared_probe.started),
-        start_at: Arc::clone(&shared_probe.start_at),
-        shutdown_at: Arc::clone(&shared_probe.shutdown_at),
-    };
-
-    let bundle = ExtensionWrapper::builder(name, user_config, extension_config)
-        .active()
-        .shared::<ActiveExtImpl>(shared_impl)
-        .local::<ActiveLocalExtImpl>(Rc::new(local_impl))
-        .build()
-        .expect("dual-active extension bundle builds");
     Ok(bundle)
 }
 
@@ -1253,6 +1311,7 @@ fn background_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -1373,6 +1432,7 @@ fn shared_counter_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -1422,6 +1482,7 @@ fn shared_counter_shared_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -1516,6 +1577,7 @@ fn constructed_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -1593,6 +1655,7 @@ fn rc_counter_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     // The prototype owns one `Rc<RefCell<u64>>`; `.passive().cloned()`
     // hands each consumer a shallow `Clone` of the prototype, and
@@ -1852,6 +1915,7 @@ const EXTENSION_FACTORIES: &[ExtensionFactory] = &[
     SHARED_COUNTER_SHARED_EXTENSION_FACTORY,
     CONSTRUCTED_EXTENSION_FACTORY,
     RC_COUNTER_EXTENSION_FACTORY,
+    DEPENDENT_EXTENSION_FACTORY,
 ];
 
 static TEST_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
@@ -4129,8 +4193,10 @@ const READY_GATE_EXTENSION_URN: &str = "urn:test:extension:ready_gate_extension"
 struct ReadyGateExtImpl {
     ready_after: Option<Duration>,
     fail_before_ready: bool,
+    ignore_shutdown: bool,
     ready_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 #[async_trait]
@@ -4176,7 +4242,13 @@ impl otel_arrow_dfe_engine::shared::extension::Extension for ReadyGateExtImpl {
 
         loop {
             match ctrl.recv().await {
-                Ok(ExtensionControlMsg::Shutdown { .. }) | Err(_) => break,
+                Ok(ExtensionControlMsg::Shutdown { .. }) | Err(_) => {
+                    *self.shutdown_at.lock() = Some(Instant::now());
+                    if self.ignore_shutdown {
+                        std::future::pending::<()>().await;
+                    }
+                    break;
+                }
                 Ok(_) => {}
             }
         }
@@ -4188,8 +4260,10 @@ impl otel_arrow_dfe_engine::shared::extension::Extension for ReadyGateExtImpl {
 struct ReadyGateProbe {
     ready_after: Option<Duration>,
     fail_before_ready: bool,
+    create_order: Arc<AtomicUsize>,
     ready_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 static READY_GATE_PROBES: std::sync::OnceLock<
@@ -4225,8 +4299,10 @@ fn make_ready_gate_probe(
     let probe = ReadyGateProbe {
         ready_after,
         fail_before_ready,
+        create_order: Arc::new(AtomicUsize::new(0)),
         ready_at: Arc::new(parking_lot::Mutex::new(None)),
         start_at: Arc::new(parking_lot::Mutex::new(None)),
+        shutdown_at: Arc::new(parking_lot::Mutex::new(None)),
     };
     register_ready_gate_probe(key, probe.clone());
     probe
@@ -4237,6 +4313,7 @@ fn ready_gate_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -4244,6 +4321,10 @@ fn ready_gate_extension_create(
         .and_then(|v| v.as_str())
         .expect("probe_key present in ready_gate extension config");
     let probe = lookup_ready_gate_probe(key);
+    probe.create_order.store(
+        EXTENSION_CREATE_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1,
+        Ordering::SeqCst,
+    );
 
     let readiness_timeout = user_config
         .config
@@ -4254,8 +4335,14 @@ fn ready_gate_extension_create(
     let impl_ = ReadyGateExtImpl {
         ready_after: probe.ready_after,
         fail_before_ready: probe.fail_before_ready,
+        ignore_shutdown: user_config
+            .config
+            .get("ignore_shutdown")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         ready_at: Arc::clone(&probe.ready_at),
         start_at: Arc::clone(&probe.start_at),
+        shutdown_at: Arc::clone(&probe.shutdown_at),
     };
 
     let builder = ExtensionWrapper::builder(name, user_config, extension_config).active();
@@ -4281,6 +4368,259 @@ const READY_GATE_EXTENSION_FACTORY: ExtensionFactory = ExtensionFactory {
     validate_config: otel_arrow_dfe_config::validation::no_config,
 };
 
+#[derive(Clone)]
+enum DependencyHandle {
+    Stateless(Arc<dyn SharedNoOpStateless>),
+    Stateful(Arc<dyn SharedNoOpStateful>),
+}
+
+impl DependencyHandle {
+    fn touch(&self) {
+        match self {
+            Self::Stateless(capability) => {
+                let _ = capability.name();
+            }
+            Self::Stateful(capability) => {
+                let _ = capability.count();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DependentExtImpl {
+    dependency: DependencyHandle,
+    counter: Arc<AtomicU64>,
+    ready_after: Option<Duration>,
+    dependency_used_at_start: Arc<AtomicBool>,
+    start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    ready_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_complete_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_delay: Duration,
+}
+
+#[async_trait]
+impl SharedNoOpStateless for DependentExtImpl {
+    fn name(&self) -> &str {
+        "dependent"
+    }
+
+    fn echo(&self, value: u64) -> u64 {
+        value
+    }
+
+    async fn ping(&self) -> u64 {
+        0
+    }
+
+    async fn echo_async(&self, value: String) -> String {
+        value
+    }
+}
+
+#[async_trait]
+impl SharedNoOpStateful for DependentExtImpl {
+    fn count(&self) -> u64 {
+        self.counter.load(Ordering::SeqCst)
+    }
+
+    fn increment(&mut self) -> u64 {
+        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn reset(&mut self) {
+        self.counter.store(0, Ordering::SeqCst);
+    }
+
+    async fn record(&mut self, value: u64) -> u64 {
+        self.counter.fetch_add(value, Ordering::SeqCst) + value
+    }
+
+    fn last_recorded(&self) -> Option<u64> {
+        Some(self.counter.load(Ordering::SeqCst))
+    }
+}
+
+#[async_trait]
+impl otel_arrow_dfe_engine::shared::extension::Extension for DependentExtImpl {
+    async fn start(
+        self: Box<Self>,
+        mut ctrl: otel_arrow_dfe_engine::shared::extension::ControlChannel,
+        eh: EffectHandler,
+    ) -> Result<TerminalState, EngineError> {
+        self.dependency.touch();
+        self.dependency_used_at_start.store(true, Ordering::SeqCst);
+        *self.start_at.lock() = Some(Instant::now());
+        if let Some(ready_after) = self.ready_after {
+            tokio::time::sleep(ready_after).await;
+            eh.signal_ready();
+            *self.ready_at.lock() = Some(Instant::now());
+        }
+
+        loop {
+            match ctrl.recv().await {
+                Ok(ExtensionControlMsg::Shutdown { .. }) | Err(_) => {
+                    *self.shutdown_at.lock() = Some(Instant::now());
+                    if !self.shutdown_delay.is_zero() {
+                        tokio::time::sleep(self.shutdown_delay).await;
+                    }
+                    *self.shutdown_complete_at.lock() = Some(Instant::now());
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(TerminalState::default())
+    }
+}
+
+#[derive(Clone)]
+struct DependentExtProbe {
+    create_order: Arc<AtomicUsize>,
+    dependency_resolved: Arc<AtomicBool>,
+    dependency_used_at_start: Arc<AtomicBool>,
+    start_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    ready_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_complete_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    shutdown_delay: Duration,
+}
+
+static DEPENDENT_EXT_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, DependentExtProbe>>,
+> = std::sync::OnceLock::new();
+
+fn dependent_ext_probes()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, DependentExtProbe>> {
+    DEPENDENT_EXT_PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_dependent_ext_probe(key: &str, shutdown_delay: Duration) -> DependentExtProbe {
+    let probe = DependentExtProbe {
+        create_order: Arc::new(AtomicUsize::new(0)),
+        dependency_resolved: Arc::new(AtomicBool::new(false)),
+        dependency_used_at_start: Arc::new(AtomicBool::new(false)),
+        start_at: Arc::new(parking_lot::Mutex::new(None)),
+        ready_at: Arc::new(parking_lot::Mutex::new(None)),
+        shutdown_at: Arc::new(parking_lot::Mutex::new(None)),
+        shutdown_complete_at: Arc::new(parking_lot::Mutex::new(None)),
+        shutdown_delay,
+    };
+    let _ = dependent_ext_probes()
+        .lock()
+        .expect("dependent extension probes mutex poisoned")
+        .insert(key.to_owned(), probe.clone());
+    probe
+}
+
+fn lookup_dependent_ext_probe(key: &str) -> DependentExtProbe {
+    dependent_ext_probes()
+        .lock()
+        .expect("dependent extension probes mutex poisoned")
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| panic!("no DependentExtProbe registered for key '{key}'"))
+}
+
+const DEPENDENT_EXTENSION_URN: &str = "urn:test:extension:dependent_extension";
+
+fn dependent_extension_create(
+    _ctx: &ExtensionContext,
+    name: otel_arrow_dfe_config::ExtensionId,
+    user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
+    extension_config: &ExtensionConfig,
+    dependencies: &ExtensionDependencies,
+) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
+    let key = user_config
+        .config
+        .get("probe_key")
+        .and_then(|value| value.as_str())
+        .expect("probe_key present in dependent extension config");
+    let probe = lookup_dependent_ext_probe(key);
+    probe.create_order.store(
+        EXTENSION_CREATE_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1,
+        Ordering::SeqCst,
+    );
+
+    let invalid_dependency =
+        |error: EngineError| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: error.to_string(),
+        };
+    let required_capability = user_config
+        .config
+        .get("requires")
+        .and_then(|value| value.as_str())
+        .unwrap_or("no_op_stateless");
+    if !matches!(required_capability, "no_op_stateless" | "no_op_stateful") {
+        return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: format!("unsupported synthetic dependency '{required_capability}'"),
+        });
+    }
+    let impl_ = dependencies
+        .bind_shared(|dependencies| {
+            let dependency = match required_capability {
+                "no_op_stateless" => {
+                    DependencyHandle::Stateless(Arc::from(dependencies.require::<NoOpStateless>()?))
+                }
+                "no_op_stateful" => {
+                    DependencyHandle::Stateful(Arc::from(dependencies.require::<NoOpStateful>()?))
+                }
+                _ => unreachable!("required capability was validated above"),
+            };
+            probe.dependency_resolved.store(true, Ordering::SeqCst);
+            Ok(DependentExtImpl {
+                dependency,
+                counter: Arc::new(AtomicU64::new(0)),
+                ready_after: (!user_config
+                    .config
+                    .get("never_ready")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false))
+                .then(|| {
+                    user_config
+                        .config
+                        .get("ready_after_ms")
+                        .and_then(|value| value.as_u64())
+                        .map_or(Duration::ZERO, Duration::from_millis)
+                }),
+                dependency_used_at_start: Arc::clone(&probe.dependency_used_at_start),
+                start_at: Arc::clone(&probe.start_at),
+                ready_at: Arc::clone(&probe.ready_at),
+                shutdown_at: Arc::clone(&probe.shutdown_at),
+                shutdown_complete_at: Arc::clone(&probe.shutdown_complete_at),
+                shutdown_delay: probe.shutdown_delay,
+            })
+        })
+        .map_err(invalid_dependency)?;
+    let readiness_timeout = user_config
+        .config
+        .get("readiness_timeout_ms")
+        .and_then(|value| value.as_u64())
+        .map(Duration::from_millis);
+    let builder = ExtensionWrapper::builder(name, user_config, extension_config).active();
+    let builder = match readiness_timeout {
+        Some(timeout) => builder.with_readiness_probe_timeout_override(timeout),
+        None => builder.with_readiness_probe(),
+    };
+    let bundle = builder
+        .shared_with_dependencies(impl_)
+        .build()
+        .expect("dependent extension bundle builds");
+    Ok(bundle)
+}
+
+const DEPENDENT_EXTENSION_FACTORY: ExtensionFactory = ExtensionFactory {
+    name: DEPENDENT_EXTENSION_URN,
+    description: "active extension that consumes and provides test capabilities",
+    documentation_url: "",
+    capabilities: Some(extension_capabilities!(
+        shared: DependentExtImpl => [NoOpStateless, NoOpStateful]
+    )),
+    create: dependent_extension_create,
+    validate_config: otel_arrow_dfe_config::validation::no_config,
+};
+
 const READY_GATE_BG_EXTENSION_URN: &str = "urn:test:extension:ready_gate_extension_bg";
 
 fn ready_gate_bg_extension_create(
@@ -4288,6 +4628,7 @@ fn ready_gate_bg_extension_create(
     name: otel_arrow_dfe_config::ExtensionId,
     user_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
     extension_config: &ExtensionConfig,
+    _dependencies: &ExtensionDependencies,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
     let key = user_config
         .config
@@ -4295,6 +4636,10 @@ fn ready_gate_bg_extension_create(
         .and_then(|v| v.as_str())
         .expect("probe_key present in ready_gate background extension config");
     let probe = lookup_ready_gate_probe(key);
+    probe.create_order.store(
+        EXTENSION_CREATE_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1,
+        Ordering::SeqCst,
+    );
 
     let readiness_timeout = user_config
         .config
@@ -4305,8 +4650,10 @@ fn ready_gate_bg_extension_create(
     let impl_ = ReadyGateExtImpl {
         ready_after: probe.ready_after,
         fail_before_ready: probe.fail_before_ready,
+        ignore_shutdown: false,
         ready_at: Arc::clone(&probe.ready_at),
         start_at: Arc::clone(&probe.start_at),
+        shutdown_at: Arc::clone(&probe.shutdown_at),
     };
 
     let builder = ExtensionWrapper::builder(name, user_config, extension_config).background();
@@ -4330,6 +4677,32 @@ const READY_GATE_BG_EXTENSION_FACTORY: ExtensionFactory = ExtensionFactory {
     validate_config: otel_arrow_dfe_config::validation::no_config,
 };
 
+const EXT_FACTORIES_PLUS_GATE: &[ExtensionFactory] = &[
+    PASSIVE_EXTENSION_FACTORY,
+    DUAL_EXTENSION_FACTORY,
+    ACTIVE_EXTENSION_FACTORY,
+    ACTIVE_SHARED_COUNTER_EXTENSION_FACTORY,
+    FAILING_EXTENSION_FACTORY,
+    IMMEDIATE_OK_EXTENSION_FACTORY,
+    SHUTDOWN_RECORDING_EXTENSION_FACTORY,
+    DUAL_ACTIVE_EXTENSION_FACTORY,
+    BACKGROUND_EXTENSION_FACTORY,
+    SHARED_COUNTER_EXTENSION_FACTORY,
+    SHARED_COUNTER_SHARED_EXTENSION_FACTORY,
+    CONSTRUCTED_EXTENSION_FACTORY,
+    RC_COUNTER_EXTENSION_FACTORY,
+    READY_GATE_EXTENSION_FACTORY,
+    READY_GATE_BG_EXTENSION_FACTORY,
+    DEPENDENT_EXTENSION_FACTORY,
+];
+
+static READY_GATE_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
+    RECEIVER_FACTORIES,
+    PROCESSOR_FACTORIES,
+    EXPORTER_FACTORIES,
+    EXT_FACTORIES_PLUS_GATE,
+);
+
 fn build_runtime_pipeline_with_ready_gate(
     yaml: &str,
 ) -> (
@@ -4338,34 +4711,10 @@ fn build_runtime_pipeline_with_ready_gate(
     otel_arrow_dfe_telemetry::registry::EntityKey,
     InternalTelemetrySystem,
 ) {
-    const EXT_FACTORIES_PLUS_GATE: &[ExtensionFactory] = &[
-        PASSIVE_EXTENSION_FACTORY,
-        DUAL_EXTENSION_FACTORY,
-        ACTIVE_EXTENSION_FACTORY,
-        ACTIVE_SHARED_COUNTER_EXTENSION_FACTORY,
-        FAILING_EXTENSION_FACTORY,
-        IMMEDIATE_OK_EXTENSION_FACTORY,
-        SHUTDOWN_RECORDING_EXTENSION_FACTORY,
-        DUAL_ACTIVE_EXTENSION_FACTORY,
-        BACKGROUND_EXTENSION_FACTORY,
-        SHARED_COUNTER_EXTENSION_FACTORY,
-        SHARED_COUNTER_SHARED_EXTENSION_FACTORY,
-        CONSTRUCTED_EXTENSION_FACTORY,
-        RC_COUNTER_EXTENSION_FACTORY,
-        READY_GATE_EXTENSION_FACTORY,
-        READY_GATE_BG_EXTENSION_FACTORY,
-    ];
-    static PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
-        RECEIVER_FACTORIES,
-        PROCESSOR_FACTORIES,
-        EXPORTER_FACTORIES,
-        EXT_FACTORIES_PLUS_GATE,
-    );
-
     let config = PipelineConfig::from_yaml("test-group".into(), "test-pipeline".into(), yaml)
         .expect("yaml config parses + validates");
     let (pipeline_ctx, telemetry_system, entity_key) = fresh_pipeline_env();
-    let runtime_pipeline = PIPELINE_FACTORY
+    let runtime_pipeline = READY_GATE_PIPELINE_FACTORY
         .build(
             pipeline_ctx.clone(),
             config,
@@ -4378,6 +4727,24 @@ fn build_runtime_pipeline_with_ready_gate(
         )
         .expect("pipeline builds");
     (runtime_pipeline, pipeline_ctx, entity_key, telemetry_system)
+}
+
+fn try_build_runtime_pipeline_with_ready_gate(
+    yaml: &str,
+) -> Result<otel_arrow_dfe_engine::runtime_pipeline::RuntimePipeline<()>, EngineError> {
+    let config = PipelineConfig::from_yaml("test-group".into(), "test-pipeline".into(), yaml)
+        .map_err(|error| EngineError::ConfigError(Box::new(error)))?;
+    let (pipeline_ctx, _telemetry_system, _entity_key) = fresh_pipeline_env();
+    READY_GATE_PIPELINE_FACTORY.build(
+        pipeline_ctx,
+        config,
+        ChannelCapacityPolicy::default(),
+        TelemetryPolicy::default(),
+        None,
+        std::collections::BTreeMap::new(),
+        None,
+        None,
+    )
 }
 
 #[test]
@@ -4863,4 +5230,917 @@ connections:
         lower.contains("timeout") || lower.contains("readiness"),
         "{msg}"
     );
+}
+
+/// Scenario: Shutdown with a short deadline arrives while an uncooperative readiness probe is pending.
+/// Guarantees: Startup cleanup honors that deadline and data-path nodes never start.
+#[test]
+fn shutdown_during_extension_startup_honors_caller_deadline() {
+    let receiver_key = "ready-cancel-recv";
+    let extension_key = "ready-cancel-ext";
+    let lifecycle_key = "ready-cancel-lifecycle";
+
+    let _receiver_probe = make_probe(receiver_key, CallSequence::Local);
+    register_node_lifecycle_probe(lifecycle_key, NodeLifecycleProbe::default());
+    let extension_probe = make_ready_gate_probe(extension_key, None, false);
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: "{receiver_key}"
+      lifecycle_key: "{lifecycle_key}"
+    capabilities:
+      no_op_stateless: "{extension_key}"
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+extensions:
+  {extension_key}:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: "{extension_key}"
+      readiness_timeout_ms: 30000
+      ignore_shutdown: true
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    let started_at = Instant::now();
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(100),
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "startup cleanup must preserve the caller's shutdown deadline"
+    );
+    assert!(extension_probe.shutdown_at.lock().is_some());
+    assert!(
+        lookup_node_lifecycle_probe(lifecycle_key)
+            .receiver_start_at
+            .lock()
+            .is_none(),
+        "data-path receiver must not start after startup cancellation"
+    );
+}
+
+/// Scenario: Two dependency layers each have the same readiness timeout.
+/// Guarantees: The second layer receives only the remainder of one absolute startup budget.
+#[test]
+fn extension_readiness_layers_share_one_absolute_deadline() {
+    let receiver_key = "ready-absolute-recv";
+    let lifecycle_key = "ready-absolute-lifecycle";
+    let provider_key = "ready-absolute-provider";
+    let consumer_key = "ready-absolute-consumer";
+    let timeout_ms = 300_u64;
+
+    let _receiver_probe = make_probe(receiver_key, CallSequence::SharedStatefulIncrement);
+    register_node_lifecycle_probe(lifecycle_key, NodeLifecycleProbe::default());
+    let _provider_probe =
+        make_ready_gate_probe(provider_key, Some(Duration::from_millis(120)), false);
+    let consumer_probe = register_dependent_ext_probe(consumer_key, Duration::ZERO);
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: "{receiver_key}"
+      lifecycle_key: "{lifecycle_key}"
+    capabilities:
+      no_op_stateful: "{consumer_key}"
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+extensions:
+  {provider_key}:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: "{provider_key}"
+      readiness_timeout_ms: {timeout_ms}
+  {consumer_key}:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: "{consumer_key}"
+      requires: no_op_stateless
+      never_ready: true
+      readiness_timeout_ms: {timeout_ms}
+    capabilities:
+      no_op_stateless: "{provider_key}"
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    let started_at = Instant::now();
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_secs(2),
+    );
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        matches!(result, Err(EngineError::ExtensionStartupTimeout { .. })),
+        "{result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "layers restarted the readiness budget: elapsed={elapsed:?}"
+    );
+    assert!(
+        consumer_probe.start_at.lock().is_some(),
+        "consumer layer must start before the absolute deadline expires"
+    );
+    assert!(
+        lookup_node_lifecycle_probe(lifecycle_key)
+            .receiver_start_at
+            .lock()
+            .is_none()
+    );
+}
+
+/// Scenario: A node consumes a capability through a three-extension dependency chain.
+/// Guarantees: Construction, readiness, node startup, and shutdown all follow DAG order.
+#[test]
+fn extension_dependency_chain_obeys_full_lifecycle_order() {
+    let receiver_key = "dependency-chain-receiver";
+    let lifecycle_key = "dependency-chain-node-lifecycle";
+    let root_key = "dependency-chain-root";
+    let middle_key = "dependency-chain-middle";
+    let leaf_key = "dependency-chain-leaf";
+
+    let receiver_probe = make_probe(receiver_key, CallSequence::SharedStatefulIncrement);
+    register_node_lifecycle_probe(lifecycle_key, NodeLifecycleProbe::default());
+    let root_probe = make_ready_gate_probe(root_key, Some(Duration::from_millis(75)), false);
+    let middle_probe = register_dependent_ext_probe(middle_key, Duration::from_millis(75));
+    let leaf_probe = register_dependent_ext_probe(leaf_key, Duration::from_millis(75));
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: "{receiver_key}"
+      lifecycle_key: "{lifecycle_key}"
+    capabilities:
+      no_op_stateful: "{leaf_key}"
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  {leaf_key}:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: "{leaf_key}"
+      requires: no_op_stateful
+    capabilities:
+      no_op_stateful: "{middle_key}"
+  {root_key}:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: "{root_key}"
+      readiness_timeout_ms: 5000
+  {middle_key}:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: "{middle_key}"
+      requires: no_op_stateless
+    capabilities:
+      no_op_stateless: "{root_key}"
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    assert!(
+        root_probe.create_order.load(Ordering::SeqCst)
+            < middle_probe.create_order.load(Ordering::SeqCst)
+    );
+    assert!(
+        middle_probe.create_order.load(Ordering::SeqCst)
+            < leaf_probe.create_order.load(Ordering::SeqCst)
+    );
+    assert!(middle_probe.dependency_resolved.load(Ordering::SeqCst));
+    assert!(leaf_probe.dependency_resolved.load(Ordering::SeqCst));
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1,
+        "the leaf capability must be available to the node factory"
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(300),
+    );
+    assert!(result.is_ok(), "{result:?}");
+
+    let root_ready_at = root_probe
+        .ready_at
+        .lock()
+        .expect("root signalled readiness");
+    let middle_start_at = middle_probe.start_at.lock().expect("middle started");
+    let middle_ready_at = middle_probe.ready_at.lock().expect("middle became ready");
+    let leaf_start_at = leaf_probe.start_at.lock().expect("leaf started");
+    let leaf_ready_at = leaf_probe.ready_at.lock().expect("leaf became ready");
+    let node_start_at = lookup_node_lifecycle_probe(lifecycle_key)
+        .receiver_start_at
+        .lock()
+        .expect("receiver started");
+    assert!(root_ready_at <= middle_start_at);
+    assert!(middle_ready_at <= leaf_start_at);
+    assert!(leaf_ready_at <= node_start_at);
+    assert!(middle_probe.dependency_used_at_start.load(Ordering::SeqCst));
+    assert!(leaf_probe.dependency_used_at_start.load(Ordering::SeqCst));
+
+    let leaf_shutdown_complete_at = leaf_probe
+        .shutdown_complete_at
+        .lock()
+        .expect("leaf completed shutdown");
+    let middle_shutdown_at = middle_probe
+        .shutdown_at
+        .lock()
+        .expect("middle received shutdown");
+    let middle_shutdown_complete_at = middle_probe
+        .shutdown_complete_at
+        .lock()
+        .expect("middle completed shutdown");
+    let root_shutdown_at = root_probe
+        .shutdown_at
+        .lock()
+        .expect("root received shutdown");
+    assert!(leaf_shutdown_complete_at <= middle_shutdown_at);
+    assert!(middle_shutdown_complete_at <= root_shutdown_at);
+}
+
+/// Scenario: A provider fails before its readiness probe fires.
+/// Guarantees: No dependent layer or data-path node starts after the failed gate.
+#[test]
+fn provider_failure_prevents_dependent_layer_startup() {
+    let receiver_key = "dependency-failure-receiver";
+    let lifecycle_key = "dependency-failure-node-lifecycle";
+    let provider_key = "dependency-failure-provider";
+    let consumer_key = "dependency-failure-consumer";
+
+    let _receiver_probe = make_probe(receiver_key, CallSequence::SharedStatefulIncrement);
+    register_node_lifecycle_probe(lifecycle_key, NodeLifecycleProbe::default());
+    let _provider_probe = make_ready_gate_probe(provider_key, None, true);
+    let consumer_probe = register_dependent_ext_probe(consumer_key, Duration::from_millis(0));
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: "{receiver_key}"
+      lifecycle_key: "{lifecycle_key}"
+    capabilities:
+      no_op_stateful: "{consumer_key}"
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  {provider_key}:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: "{provider_key}"
+      readiness_timeout_ms: 5000
+  {consumer_key}:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: "{consumer_key}"
+      requires: no_op_stateless
+    capabilities:
+      no_op_stateless: "{provider_key}"
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_secs(30),
+    );
+    assert!(result.is_err());
+    assert!(consumer_probe.start_at.lock().is_none());
+    assert!(
+        lookup_node_lifecycle_probe(lifecycle_key)
+            .receiver_start_at
+            .lock()
+            .is_none()
+    );
+}
+
+/// Scenario: Multiple node consumers bind multiple unknown capability names.
+/// Guarantees: Static validation fails on the lexically first consumer and capability.
+#[test]
+fn static_capability_validation_is_deterministic_across_consumers() {
+    let result = try_build_runtime_pipeline_with_ready_gate(&format!(
+        r#"
+nodes:
+  zeta:
+    type: "{PROBE_RECEIVER_URN}"
+    capabilities:
+      middle_unknown: provider
+  alpha:
+    type: "{NOOP_EXPORTER_URN}"
+    capabilities:
+      zeta_unknown: provider
+      alpha_unknown: provider
+extensions:
+  provider:
+    type: "{READY_GATE_EXTENSION_URN}"
+connections:
+  - from: zeta
+    to: alpha
+"#
+    ));
+
+    assert!(matches!(
+        result,
+        Err(EngineError::CapabilityResolutionFailed { node, message })
+            if node == "alpha" && message.contains("unknown capability 'alpha_unknown'")
+    ));
+}
+
+/// Scenario: An extension capability binding names an extension that is not configured.
+/// Guarantees: Pipeline construction rejects the missing provider before any factory runs.
+#[test]
+fn extension_dependency_rejects_missing_provider() {
+    let result = try_build_runtime_pipeline_with_ready_gate(&format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config: {{ probe_key: unused-missing-provider }}
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  consumer:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: unused-missing-consumer
+    capabilities:
+      no_op_stateless: missing
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    ));
+
+    let error = result.err().expect("missing provider must fail");
+    let message = error.to_string();
+    assert!(message.contains("consumer"), "{message}");
+    assert!(message.contains("missing"), "{message}");
+}
+
+/// Scenario: Two extensions bind capabilities to each other.
+/// Guarantees: Pipeline construction rejects the cycle deterministically.
+#[test]
+fn extension_dependency_rejects_cycle() {
+    let result = try_build_runtime_pipeline_with_ready_gate(&format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config: {{ probe_key: unused-cycle }}
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  a:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: unused-cycle-a
+    capabilities:
+      no_op_stateless: b
+  b:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: unused-cycle-b
+    capabilities:
+      no_op_stateless: a
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    ));
+
+    let error = result.err().expect("dependency cycle must fail");
+    let message = error.to_string();
+    assert!(message.contains("cycle"), "{message}");
+    assert!(message.contains("a, b"), "{message}");
+}
+
+/// Scenario: An extension binds a known capability to a provider of another type.
+/// Guarantees: Resolution fails with the consumer extension and capability in the error.
+#[test]
+fn extension_dependency_rejects_provider_capability_mismatch() {
+    let _consumer_probe =
+        register_dependent_ext_probe("mismatched-consumer", Duration::from_millis(0));
+    register_shared_counter_probe(
+        "alternate-stateful-provider",
+        SharedCounterProbe {
+            counter: Arc::new(AtomicU64::new(0)),
+        },
+    );
+    let result = try_build_runtime_pipeline_with_ready_gate(&format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config: {{ probe_key: unused-mismatch }}
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  alternate:
+    type: "{SHARED_COUNTER_SHARED_EXTENSION_URN}"
+    config:
+      probe_key: alternate-stateful-provider
+  provider:
+    type: "{PASSIVE_EXTENSION_URN}"
+  consumer:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: mismatched-consumer
+      requires: no_op_stateful
+    capabilities:
+      no_op_stateful: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    ));
+
+    let error = result.err().expect("capability mismatch must fail");
+    assert!(
+        matches!(
+            &error,
+            EngineError::ExtensionCapabilityResolutionFailed {
+                extension,
+                message,
+            } if extension == "consumer"
+                && message.contains("no_op_stateful")
+                && message.contains("provider")
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+/// Scenario: A provider is consumed only by an extension with no live node consumer.
+/// Guarantees: The dead dependency chain is pruned and neither active extension starts.
+#[test]
+fn unused_extension_dependency_chain_is_pruned() {
+    let receiver_key = "pruned-dependency-receiver";
+    let provider_key = "pruned-dependency-provider";
+    let consumer_key = "pruned-dependency-consumer";
+
+    let _receiver_probe = make_probe(receiver_key, CallSequence::None);
+    let provider_probe =
+        make_ready_gate_probe(provider_key, Some(Duration::from_millis(10)), false);
+    let consumer_probe = register_dependent_ext_probe(consumer_key, Duration::from_millis(0));
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: "{receiver_key}"
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  {provider_key}:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: "{provider_key}"
+      readiness_timeout_ms: 5000
+  {consumer_key}:
+    type: "{DEPENDENT_EXTENSION_URN}"
+    config:
+      probe_key: "{consumer_key}"
+      requires: no_op_stateless
+    capabilities:
+      no_op_stateless: "{provider_key}"
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    assert!(consumer_probe.dependency_resolved.load(Ordering::SeqCst));
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(100),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(provider_probe.start_at.lock().is_none());
+    assert!(consumer_probe.start_at.lock().is_none());
+}
+
+/// Scenario: A dual extension's local and shared implementations claim the same binding.
+/// Guarantees: Independent dependency scopes let both claims succeed and retain both provider variants.
+#[test]
+fn dual_extension_variants_resolve_dependencies_independently() {
+    let receiver_probe = make_probe("dual-deps-shared-node", CallSequence::Shared);
+    let exporter_probe = make_probe("dual-deps-local-node", CallSequence::Local);
+    let provider_local = make_active_ext_probe("dual-deps-provider-local");
+    let provider_shared = make_active_ext_probe("dual-deps-provider-shared");
+    let consumer_local = make_active_ext_probe("dual-deps-consumer-local");
+    let consumer_shared = make_active_ext_probe("dual-deps-consumer-shared");
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: dual-deps-shared-node
+    capabilities:
+      no_op_stateless: consumer
+  exporter:
+    type: "{PROBE_EXPORTER_URN}"
+    config:
+      probe_key: dual-deps-local-node
+    capabilities:
+      no_op_stateless: consumer
+
+extensions:
+  provider:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: dual-deps-provider-local
+      shared_probe_key: dual-deps-provider-shared
+  consumer:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: dual-deps-consumer-local
+      shared_probe_key: dual-deps-consumer-shared
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        exporter_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(150),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(provider_local.started.load(Ordering::SeqCst));
+    assert!(provider_shared.started.load(Ordering::SeqCst));
+    assert!(consumer_local.started.load(Ordering::SeqCst));
+    assert!(consumer_shared.started.load(Ordering::SeqCst));
+}
+
+/// Scenario: Only the local variant of a dual dependency consumer is rooted by a node.
+/// Guarantees: Its local provider branch starts while both corresponding shared variants are pruned.
+#[test]
+fn local_consumer_variant_retains_only_local_dependency_branch() {
+    let receiver_probe = make_probe("local-branch-node", CallSequence::Local);
+    let provider_local = make_active_ext_probe("local-branch-provider-local");
+    let provider_shared = make_active_ext_probe("local-branch-provider-shared");
+    let consumer_local = make_active_ext_probe("local-branch-consumer-local");
+    let consumer_shared = make_active_ext_probe("local-branch-consumer-shared");
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: local-branch-node
+    capabilities:
+      no_op_stateless: consumer
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  provider:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: local-branch-provider-local
+      shared_probe_key: local-branch-provider-shared
+  consumer:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: local-branch-consumer-local
+      shared_probe_key: local-branch-consumer-shared
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(150),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(provider_local.started.load(Ordering::SeqCst));
+    assert!(!provider_shared.started.load(Ordering::SeqCst));
+    assert!(consumer_local.started.load(Ordering::SeqCst));
+    assert!(!consumer_shared.started.load(Ordering::SeqCst));
+}
+
+/// Scenario: Only the shared variant of a dual dependency consumer is rooted by a node.
+/// Guarantees: Its shared provider branch starts while both corresponding local variants are pruned.
+#[test]
+fn shared_consumer_variant_retains_only_shared_dependency_branch() {
+    let receiver_probe = make_probe("shared-branch-node", CallSequence::Shared);
+    let provider_local = make_active_ext_probe("shared-branch-provider-local");
+    let provider_shared = make_active_ext_probe("shared-branch-provider-shared");
+    let consumer_local = make_active_ext_probe("shared-branch-consumer-local");
+    let consumer_shared = make_active_ext_probe("shared-branch-consumer-shared");
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: shared-branch-node
+    capabilities:
+      no_op_stateless: consumer
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  provider:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: shared-branch-provider-local
+      shared_probe_key: shared-branch-provider-shared
+  consumer:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: shared-branch-consumer-local
+      shared_probe_key: shared-branch-consumer-shared
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(150),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(!provider_local.started.load(Ordering::SeqCst));
+    assert!(provider_shared.started.load(Ordering::SeqCst));
+    assert!(!consumer_local.started.load(Ordering::SeqCst));
+    assert!(consumer_shared.started.load(Ordering::SeqCst));
+}
+
+/// Scenario: A live local extension variant claims a dependency from a shared-only provider.
+/// Guarantees: SharedAsLocal consumption retains the provider's shared variant, not a phantom local variant.
+#[test]
+fn local_consumer_variant_retains_shared_as_local_provider() {
+    let receiver_probe = make_probe("fallback-branch-node", CallSequence::Local);
+    let provider = make_ready_gate_probe(
+        "fallback-branch-provider",
+        Some(Duration::from_millis(10)),
+        false,
+    );
+    let consumer_local = make_active_ext_probe("fallback-branch-consumer-local");
+    let consumer_shared = make_active_ext_probe("fallback-branch-consumer-shared");
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: fallback-branch-node
+    capabilities:
+      no_op_stateless: consumer
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  provider:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: fallback-branch-provider
+      readiness_timeout_ms: 5000
+  consumer:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: fallback-branch-consumer-local
+      shared_probe_key: fallback-branch-consumer-shared
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(150),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(provider.start_at.lock().is_some());
+    assert!(consumer_local.started.load(Ordering::SeqCst));
+    assert!(!consumer_shared.started.load(Ordering::SeqCst));
+}
+
+/// Scenario: A live extension has a configured dependency binding that its factory ignores.
+/// Guarantees: An unclaimed binding does not retain or start the otherwise-unused provider.
+#[test]
+fn unused_dependency_scope_does_not_retain_provider() {
+    let receiver_probe = make_probe("ignored-binding-node", CallSequence::Local);
+    let provider = make_ready_gate_probe(
+        "ignored-binding-provider",
+        Some(Duration::from_millis(10)),
+        false,
+    );
+
+    let yaml = format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: ignored-binding-node
+    capabilities:
+      no_op_stateless: consumer
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  provider:
+    type: "{READY_GATE_EXTENSION_URN}"
+    config:
+      probe_key: ignored-binding-provider
+      readiness_timeout_ms: 5000
+  consumer:
+    type: "{DUAL_EXTENSION_URN}"
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    );
+    let (runtime_pipeline, ctx, entity_key, telemetry_system) =
+        build_runtime_pipeline_with_ready_gate(&yaml);
+    assert_eq!(
+        receiver_probe.first_call_succeeded.load(Ordering::SeqCst),
+        1
+    );
+
+    let result = run_pipeline_with_shutdown_after(
+        runtime_pipeline,
+        ctx,
+        entity_key,
+        telemetry_system,
+        Duration::from_millis(100),
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert!(provider.start_at.lock().is_none());
+}
+
+/// Scenario: An extension claims local dependencies but returns no local implementation.
+/// Guarantees: Pipeline construction rejects the inconsistent factory before registration or startup.
+#[test]
+fn dependency_claim_requires_matching_consumer_variant() {
+    let _provider_local = make_active_ext_probe("missing-variant-provider-local");
+    let _provider_shared = make_active_ext_probe("missing-variant-provider-shared");
+    let _consumer_local = make_active_ext_probe("missing-variant-consumer-local");
+    let _consumer_shared = make_active_ext_probe("missing-variant-consumer-shared");
+
+    let result = try_build_runtime_pipeline_with_ready_gate(&format!(
+        r#"
+nodes:
+  receiver:
+    type: "{PROBE_RECEIVER_URN}"
+    config:
+      probe_key: unused-missing-variant
+  exporter:
+    type: "{NOOP_EXPORTER_URN}"
+
+extensions:
+  provider:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: missing-variant-provider-local
+      shared_probe_key: missing-variant-provider-shared
+  consumer:
+    type: "{DUAL_ACTIVE_EXTENSION_URN}"
+    config:
+      local_probe_key: missing-variant-consumer-local
+      shared_probe_key: missing-variant-consumer-shared
+      omit_local: true
+    capabilities:
+      no_op_stateless: provider
+
+connections:
+  - from: receiver
+    to: exporter
+"#
+    ));
+
+    assert!(matches!(
+        result,
+        Err(EngineError::ExtensionDependencyVariantMissing {
+            extension,
+            variant: "local",
+        }) if extension == "consumer"
+    ));
 }

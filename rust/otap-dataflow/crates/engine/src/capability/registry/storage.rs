@@ -17,7 +17,7 @@ use std::collections::HashMap;
 /// struct (e.g., `TypeId::of::<BearerTokenProvider>()`).
 ///
 /// After all extensions have registered, call
-/// [`resolve_bindings`](super::resolve_bindings) to produce per-node
+/// [`resolve_bindings`](super::resolve_bindings) to produce per-consumer
 /// [`Capabilities`](super::Capabilities) structs.
 pub struct CapabilityRegistry {
     /// Local entries keyed by (capability TypeId, extension name).

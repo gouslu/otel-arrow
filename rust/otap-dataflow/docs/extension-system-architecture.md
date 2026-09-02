@@ -19,14 +19,14 @@ is addressed in the Phase 1 implementation:
 
 | Proposal Requirement | Phase 1 Approach |
 | --- | --- |
-| Capability-based access | `#[capability]` proc macro generates typed traits; consumers resolve via `require_local()` / `require_shared()` |
+| Capability-based access | `#[capability]` proc macro generates typed traits; nodes resolve via `require_local()` / `require_shared()`, while extension variants use dedicated local/shared dependency scopes |
 | Multiple implementations of same capability | `CapabilityRegistry` keyed by `(extension_name, TypeId)` -- different extensions can provide the same capability |
-| Multiple configured instances | `extensions:` section in YAML, each with a unique name; nodes bind by name in `capabilities:` |
+| Multiple configured instances | `extensions:` section in YAML, each with a unique name; consumers bind by name in `capabilities:` |
 | Existing config model integration | Extensions are siblings to `nodes` in the pipeline config hierarchy |
 | Preserve performance model (thread-per-core) | Local extensions use `Rc<RefCell<T>>` for shared state (no locks); shared extensions use `Clone + Send` with `Arc`-wrapped state. Both are still instantiated per pipeline instance (per core) at pipeline scope -- see *Pipeline-scoped extensions are per-core* below. |
 | Background tasks | Active extensions get their own event loop via `Extension::start()` |
-| Explicit capability binding | Nodes declare `capabilities: { name: extension_instance }` -- no implicit discovery |
-| No hot-path registry lookup | Capabilities resolved once at factory time; nodes hold typed handles for their lifetime |
+| Explicit capability binding | Nodes and extensions declare `capabilities: { name: extension_instance }` -- no implicit discovery |
+| No hot-path registry lookup | Capabilities resolved once at factory time; nodes and extension implementations hold typed handles for their lifetime |
 | Future hierarchical scopes | `CapabilityRegistry` and `resolve_bindings()` are scope-agnostic by design |
 
 Beyond the proposal's requirements, the design rests on
@@ -124,8 +124,8 @@ struct MyExtension {
 
 Extensions are standalone pipeline components that provide
 **shared, cross-cutting capabilities** -- such as
-authentication, storage etc. -- to
-data-path nodes (receivers, processors, exporters). They
+authentication, storage etc. -- to data-path nodes
+(receivers, processors, exporters) and other extensions. They
 are configured as siblings to `nodes`, not as nodes
 themselves, and they never touch pipeline data directly.
 
@@ -166,34 +166,44 @@ themselves, and they never touch pipeline data directly.
 
 ## Key Design Decisions
 
-1. **Extensions start first, shut down last.** Active
-   extensions are spawned before data-path nodes. At
-   shutdown, extensions terminate only after all data-path
-   nodes have drained. Passive extensions (no lifecycle)
-   skip spawning entirely.
+1. **Dependency-ordered lifecycle.** Extension capability
+   bindings form a directed acyclic graph. Provider
+   factories are constructed before consumer factories.
+   Active and background extensions start in topological
+   layers; each layer reaches its spawn barrier and all
+   opted-in readiness probes before the next layer starts.
+   All layers share one absolute startup deadline, and a
+   runtime shutdown request interrupts either barrier before
+   any data-path node starts. Data-path nodes start after the
+   final extension layer.
 
-   *Scope of the guarantee.* This orders **lifecycle
-   calls**, not init completion. `start()` is async, so
-   invoking it merely enqueues a future; the extension's
-   init body runs concurrently with the data path once
-   polling begins. Capability *construction* happens at
-   build time (before any spawn), so structural wiring is
-   always in place. However, if an extension performs
-   deferred async init in `start()` (opening a
-   connection, loading config, warming a cache),
-   capability consumers may observe the pre-init state
-   until that work completes. Today, extensions handle
-   this themselves -- e.g., produce final state at
-   capability construction time, or have the capability
-   surface a not-ready error/default until init has
-   progressed.
+   Each extension factory receives `ExtensionDependencies`
+   with independent `bind_local(...)` and
+   `bind_shared(...)` construction scopes. Each returns an
+   opaque implementation that only the matching
+   `local_with_dependencies(...)` or
+   `shared_with_dependencies(...)` builder method accepts.
+   This makes every claim belong to the physical variant
+   that stores its handle. After all
+   extension and node factories return, the engine traces
+   actual variant-to-variant claims from node and background
+   roots and drops every unreachable variant before startup.
+   Shutdown then uses sink waves from this surviving physical
+   graph: terminal consumers and independent roots stop first,
+   and a provider stops only after all live consumers have
+   stopped. Each active wave receives a share of the remaining
+   global shutdown budget. A wave that overruns is marked timed
+   out and aborted before the next provider wave is signaled.
+   Passive variants remain in the graph to preserve transitive
+   ordering but do not spawn a task or receive shutdown.
 
-   *Future consideration.* If an extension genuinely
-   needs an init-complete guarantee before the data path
-   runs, the framework can later add an opt-in readiness
-   probe so participating extensions can block data-path
-   spawn until they signal ready, while non-participating
-   extensions keep today's behavior unchanged.
+   Extensions without an opted-in readiness probe preserve
+   the existing spawn-barrier behavior. Extensions that
+   perform deferred async initialization can opt in with
+   `with_readiness_probe()` or a timeout override and call
+   `EffectHandler::signal_ready()` from `start()`. The absolute
+   startup budget is the largest readiness timeout among the
+   surviving variants, rather than a fresh budget per layer.
 
    *Runtime cost.* `start()` runs on the same per-core
    async runtime as the data path -- the runtime that
@@ -299,7 +309,7 @@ themselves, and they never touch pipeline data directly.
      -- no lifecycle; each consumer invokes the stored
      constructor closure.
 
-7. **Type-safe capability resolution.** Consumers call
+7. **Type-safe capability resolution.** Node consumers call
    `capabilities.require_local::<BearerTokenProvider>()`
    (returns `Box<dyn local::BearerTokenProvider>`) or
    `capabilities.require_shared::<KeyValueStore>()`
@@ -313,7 +323,36 @@ themselves, and they never touch pipeline data directly.
    (`require_*` / `optional_*`) is intended to be called
    **exactly once per capability per node** at node
    construction; a second call returns
-   `Error::CapabilityAlreadyConsumed`. Local fallback from
+   `Error::CapabilityAlreadyConsumed`.
+
+   Extension factories instead receive
+   `ExtensionDependencies`. They construct each physical
+   implementation inside its matching variant scope:
+
+   ```rust,ignore
+   let local = dependencies.bind_local(|caps| {
+       let auth = caps.require::<BearerTokenProvider>()?;
+       Ok(Rc::new(LocalImpl::new(auth)))
+   })?;
+   let shared = dependencies.bind_shared(|caps| {
+       let store = caps.require::<KeyValueStore>()?;
+       Ok(SharedImpl::new(store))
+   })?;
+
+   ExtensionWrapper::builder(name, user_config, runtime_config)
+       .active()
+       .local_with_dependencies(local)
+       .shared_with_dependencies(shared)
+       .build()
+   ```
+
+   These
+   scopes are independently one-shot, so both physical
+   implementations may claim the same configured binding
+   without weakening the node contract. A claim made by a
+   local scope is attributed to the provider variant actually
+   selected, including a shared variant used through local
+   fallback. Local fallback from
    shared extensions is materialized lazily at that call:
    on `require_local()`, the registered shared factory
    runs and its result is routed through the capability's
@@ -350,6 +389,8 @@ engine/src/
                               PassiveConstructedStage
     wrapper.rs              -> ExtensionWrapper variants,
                               ControlChannel, EffectHandler
+    dependencies.rs         -> Variant-scoped extension
+                              dependency access
     tests.rs                -> extension-level tests
 
   capability/

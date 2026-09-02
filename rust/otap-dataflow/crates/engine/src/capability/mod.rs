@@ -5,7 +5,10 @@
 //!
 //! This module defines the type-safe capability resolution infrastructure.
 //! Extensions register capabilities via [`ExtensionCapabilities`], and
-//! node factories consume them via [`registry::Capabilities`].
+//! node factories consume them via [`registry::Capabilities`]. Extension
+//! factories receive variant-scoped
+//! [`ExtensionDependencies`](crate::extension::ExtensionDependencies), which
+//! delegates to independent `Capabilities` instances.
 //!
 //! Capability traits are defined per-capability in submodules grouped by domain
 //! (e.g., `auth::bearer_token_provider`), with local (!Send) and shared

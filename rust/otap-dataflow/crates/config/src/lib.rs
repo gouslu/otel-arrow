@@ -20,6 +20,7 @@ pub mod byte_units;
 /// Config URI providers for resolving configuration from file:, env:, or bare paths.
 pub mod config_provider;
 pub mod conversion;
+pub mod dependency_graph;
 pub mod engine;
 /// Environment variable substitution for raw config text.
 pub mod env_substitution;
@@ -94,6 +95,42 @@ pub type ExtensionId = Cow<'static, str>;
 
 /// The id of a capability binding (e.g., "bearer_token_provider").
 pub type CapabilityId = Cow<'static, str>;
+
+/// Deserializes capability bindings while rejecting duplicate capability names.
+pub(crate) fn deserialize_capability_bindings<'de, D>(
+    deserializer: D,
+) -> Result<std::collections::HashMap<CapabilityId, ExtensionId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct NoDuplicateCapabilityVisitor;
+
+    impl<'de> Visitor<'de> for NoDuplicateCapabilityVisitor {
+        type Value = std::collections::HashMap<CapabilityId, ExtensionId>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of capability names to extension IDs with no duplicate keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut result = std::collections::HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if result.contains_key(key.as_str()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate capability key '{key}'"
+                    )));
+                }
+                let _ = result.insert(CapabilityId::from(key), ExtensionId::from(value));
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_map(NoDuplicateCapabilityVisitor)
+}
 
 /// The URN of a node type.
 pub use node_urn::NodeUrn;

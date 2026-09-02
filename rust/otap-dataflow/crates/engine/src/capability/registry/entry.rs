@@ -27,7 +27,7 @@ use std::rc::Rc;
 // `Box<dyn Fn>` is not `Clone`, so we thread cloning through an
 // object-safe `clone_box` method. One extension may provide multiple
 // capabilities; each capability needs its own produce closure, and
-// `resolve_bindings` hands per-node entries their own copy.
+// `resolve_bindings` hands per-consumer entries their own copy.
 
 /// Object-safe `Fn + Clone` producing an erased shared trait object.
 ///
@@ -142,7 +142,7 @@ impl SharedCapabilityEntry {
     }
 }
 
-// -- Resolved entries (per-node) ---------------------------------------------
+// -- Resolved entries (per-consumer) -----------------------------------------
 
 /// A resolved local capability entry for a specific node.
 ///

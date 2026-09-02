@@ -16,7 +16,7 @@ use crate::completion_emission_metrics::{
 use crate::context::PipelineContext;
 use crate::control::{
     ControlSenders, Controllable, NodeControlMsg, PipelineCompletionMsgReceiver,
-    PipelineCompletionMsgSender, RuntimeCtrlMsgReceiver, RuntimeCtrlMsgSender,
+    PipelineCompletionMsgSender, RuntimeControlMsg, RuntimeCtrlMsgReceiver, RuntimeCtrlMsgSender,
 };
 use crate::entity_context::{
     NodeTaskContext, NodeTelemetryGuard, NodeTelemetryHandle, instrument_with_node_context,
@@ -45,6 +45,7 @@ use otel_arrow_dfe_telemetry::reporter::{MetricsReporter, ReportOutcome};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -58,6 +59,43 @@ const EXTENSION_MONITOR_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Cadence at which the extension monitor fans `CollectTelemetry` out
 /// to active extensions so they can refresh their own metric sets.
 const EXTENSION_MONITOR_COLLECT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+enum ExtensionStartupOutcome {
+    Ready,
+    Shutdown {
+        deadline: std::time::Instant,
+        reason: String,
+    },
+}
+
+async fn await_extension_startup<PData: Debug>(
+    gate: impl Future<Output = Result<(), Error>>,
+    runtime_ctrl_msg_rx: &mut RuntimeCtrlMsgReceiver<PData>,
+    startup_deadline: tokio::time::Instant,
+    startup_timeout: Duration,
+) -> Result<ExtensionStartupOutcome, Error> {
+    tokio::select! {
+        biased;
+        message = runtime_ctrl_msg_rx.recv() => {
+            match message? {
+                RuntimeControlMsg::Shutdown { deadline, reason } => {
+                    Ok(ExtensionStartupOutcome::Shutdown { deadline, reason })
+                }
+                message => Err(Error::RuntimeControlMessageBeforeStartup {
+                    message: format!("{message:?}"),
+                }),
+            }
+        }
+        outcome = tokio::time::timeout_at(startup_deadline, gate) => {
+            match outcome {
+                Ok(result) => result.map(|()| ExtensionStartupOutcome::Ready),
+                Err(_) => Err(Error::ExtensionStartupTimeout {
+                    timeout: startup_timeout,
+                }),
+            }
+        }
+    }
+}
 
 /// Build produced-request metric sets indexed by sorted output port name,
 /// matching the `output_port_index` layout used in `RouteData`.
@@ -217,17 +255,20 @@ pub struct RuntimePipeline<PData: Debug> {
     processors: Vec<ProcessorWrapper<PData>>,
     /// A map node id to exporter runtime node.
     exporters: Vec<ExporterWrapper<PData>>,
-    /// Extension wrappers that survived the build-time consumed-tracker pruning,
-    /// each paired with the telemetry entity key registered for that variant.
-    /// One entry per surviving local-or-shared variant. Active extensions in
-    /// this list have their lifecycle tasks spawned by `run_forever` before
-    /// data-path nodes; passive extensions hold their instance factories so
-    /// `Capabilities::require_*` calls keep working at run time but are not
-    /// spawned themselves.
-    extensions: Vec<(
-        crate::extension::ExtensionWrapper,
-        otel_arrow_dfe_telemetry::registry::EntityKey,
-    )>,
+    /// Extension wrappers that survived build-time pruning, grouped in
+    /// provider-first dependency layers and paired with their telemetry entity
+    /// keys. Active and background wrappers are spawned layer by layer before
+    /// data-path nodes; passive wrappers are retained for their configured
+    /// lifetime but are not spawned.
+    extensions: Vec<
+        Vec<(
+            crate::extension::ExtensionWrapper,
+            otel_arrow_dfe_telemetry::registry::EntityKey,
+        )>,
+    >,
+    /// Consumer-first shutdown waves computed from the surviving physical
+    /// extension-variant graph.
+    extension_shutdown_waves: Vec<Vec<crate::extension_monitor::ExtensionKey>>,
 
     /// A precomputed map of all node IDs to their Node trait objects (? @@@) for efficient access
     /// Indexed by NodeIndex
@@ -257,19 +298,21 @@ async fn flush_metrics_reporter(
     }
 }
 
-/// Reports snapshots carried by a terminal state within its shutdown deadline.
+/// Reports snapshots carried by a terminal state within both its local
+/// shutdown deadline and the pipeline-wide deadline.
 pub(crate) async fn report_terminal_metrics(
     metrics_reporter: &MetricsReporter,
     terminal_state: TerminalState,
     terminal_metrics_deadline: &TerminalMetricsDeadline,
 ) {
-    let deadline = terminal_state.deadline();
-    terminal_metrics_deadline.record(deadline);
+    let deadline = terminal_state
+        .deadline()
+        .min(terminal_metrics_deadline.get());
     report_metric_snapshots(
         metrics_reporter,
         terminal_state.into_metrics(),
         "terminal",
-        terminal_metrics_deadline.get(),
+        deadline,
     )
     .await;
 }
@@ -363,10 +406,13 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
         receivers: Vec<ReceiverWrapper<PData>>,
         processors: Vec<ProcessorWrapper<PData>>,
         exporters: Vec<ExporterWrapper<PData>>,
-        extensions: Vec<(
-            crate::extension::ExtensionWrapper,
-            otel_arrow_dfe_telemetry::registry::EntityKey,
-        )>,
+        extensions: Vec<
+            Vec<(
+                crate::extension::ExtensionWrapper,
+                otel_arrow_dfe_telemetry::registry::EntityKey,
+            )>,
+        >,
+        extension_shutdown_waves: Vec<Vec<crate::extension_monitor::ExtensionKey>>,
         nodes: NodeDefs<PData, PipeNode>,
         telemetry_policy: TelemetryPolicy,
     ) -> Self {
@@ -376,6 +422,7 @@ impl<PData: 'static + Debug + Clone> RuntimePipeline<PData> {
             processors,
             exporters,
             extensions,
+            extension_shutdown_waves,
             nodes,
             channel_metrics: Default::default(),
             admission_metrics: Default::default(),
@@ -421,7 +468,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
         control_plane_metrics_flush_interval: Duration,
         memory_pressure_rx: watch::Receiver<MemoryPressureChanged>,
         runtime_ctrl_msg_tx: RuntimeCtrlMsgSender<PData>,
-        runtime_ctrl_msg_rx: RuntimeCtrlMsgReceiver<PData>,
+        mut runtime_ctrl_msg_rx: RuntimeCtrlMsgReceiver<PData>,
         pipeline_completion_msg_tx: PipelineCompletionMsgSender<PData>,
         pipeline_completion_msg_rx: PipelineCompletionMsgReceiver<PData>,
     ) -> Result<Vec<()>, Error> {
@@ -433,6 +480,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             processors,
             exporters,
             extensions,
+            extension_shutdown_waves,
             nodes: _nodes,
             channel_metrics,
             admission_metrics,
@@ -496,10 +544,11 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
             }
         };
 
-        // Lifecycle invariant: extensions start first, shut down last.
-        // `start()` is invoked on every active extension before any
-        // data-path node task is spawned, and `Shutdown` is delivered
-        // to extensions only after the data path has fully drained.
+        // Lifecycle invariant: extension dependency layers start first. Each
+        // layer reaches its spawn and readiness barriers before the next layer
+        // starts, with one absolute deadline and startup cancellation. Data-path
+        // nodes start only after the final extension layer is ready. Shutdown
+        // follows consumer-first waves from the surviving physical graph.
         //
         // Extensions that need to gate node startup on runtime readiness
         // opt in via `builder.active().with_readiness_probe()` (or
@@ -508,36 +557,71 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
         // awaits the registered probes via `wait_all_ready` before
         // spawning data-path tasks.
         let terminal_metrics_deadline = TerminalMetricsDeadline::default();
-        let mut extension_lifecycle = crate::extension_lifecycle::ExtensionLifecycle::spawn(
-            extensions,
-            &local_tasks,
-            metrics_reporter.clone(),
-            terminal_metrics_deadline.clone(),
-            &ext_ctx,
-            ext_monitor,
-        );
+        let mut extension_lifecycle =
+            crate::extension_lifecycle::ExtensionLifecycle::empty(ext_monitor);
+        extension_lifecycle.set_shutdown_waves(extension_shutdown_waves);
+        let extension_startup_timeout = extensions
+            .iter()
+            .flat_map(|layer| layer.iter())
+            .filter_map(|(wrapper, _)| wrapper.readiness_timeout())
+            .max()
+            .unwrap_or(crate::extension::DEFAULT_READINESS_TIMEOUT);
+        let extension_startup_deadline = tokio::time::Instant::now() + extension_startup_timeout;
 
-        if let Err(barrier_err) =
-            rt.block_on(local_tasks.run_until(extension_lifecycle.wait_all_spawned()))
-        {
-            extension_lifecycle.initiate_shutdown(Some("spawn barrier failed"));
-            rt.block_on(local_tasks.run_until(extension_lifecycle.drain_until_deadline()));
-            return Err(barrier_err);
-        }
+        for extension_layer in extensions {
+            extension_lifecycle.spawn_batch(
+                extension_layer,
+                &local_tasks,
+                metrics_reporter.clone(),
+                terminal_metrics_deadline.clone(),
+                &ext_ctx,
+            );
 
-        // TODO: make the readiness gate interruptible by an operator stop.
-        // `wait_all_ready` blocks here (bounded by each probe's timeout) before
-        // the runtime control-message manager is spawned, so a shutdown request
-        // that arrives during startup is only handled once the gate resolves or
-        // times out. With a long timeout override this can delay an operator
-        // stop. Plumbing the runtime control receiver into this wait is a
-        // follow-up; today the per-probe timeout bounds the worst-case wait.
-        if let Err(readiness_err) =
-            rt.block_on(local_tasks.run_until(extension_lifecycle.wait_all_ready()))
-        {
-            extension_lifecycle.initiate_shutdown(Some("extension readiness gate failed"));
-            rt.block_on(local_tasks.run_until(extension_lifecycle.drain_until_deadline()));
-            return Err(readiness_err);
+            let spawn_outcome = rt.block_on(local_tasks.run_until(await_extension_startup(
+                extension_lifecycle.wait_all_spawned(),
+                &mut runtime_ctrl_msg_rx,
+                extension_startup_deadline,
+                extension_startup_timeout,
+            )));
+            match spawn_outcome {
+                Ok(ExtensionStartupOutcome::Ready) => {}
+                Ok(ExtensionStartupOutcome::Shutdown { deadline, reason }) => {
+                    terminal_metrics_deadline.record(deadline);
+                    extension_lifecycle.initiate_shutdown_until(Some(&reason), deadline);
+                    rt.block_on(local_tasks.run_until(extension_lifecycle.drain_until_deadline()))?;
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    extension_lifecycle.initiate_shutdown(Some("spawn barrier failed"));
+                    let _ = rt.block_on(
+                        local_tasks.run_until(extension_lifecycle.drain_until_deadline()),
+                    );
+                    return Err(error);
+                }
+            }
+
+            let readiness_outcome = rt.block_on(local_tasks.run_until(await_extension_startup(
+                extension_lifecycle.wait_all_ready(),
+                &mut runtime_ctrl_msg_rx,
+                extension_startup_deadline,
+                extension_startup_timeout,
+            )));
+            match readiness_outcome {
+                Ok(ExtensionStartupOutcome::Ready) => {}
+                Ok(ExtensionStartupOutcome::Shutdown { deadline, reason }) => {
+                    terminal_metrics_deadline.record(deadline);
+                    extension_lifecycle.initiate_shutdown_until(Some(&reason), deadline);
+                    rt.block_on(local_tasks.run_until(extension_lifecycle.drain_until_deadline()))?;
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    extension_lifecycle.initiate_shutdown(Some("extension readiness gate failed"));
+                    let _ = rt.block_on(
+                        local_tasks.run_until(extension_lifecycle.drain_until_deadline()),
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         let mut control_senders = ControlSenders::default();
@@ -1009,7 +1093,8 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                     // idempotent (no-op on the happy path).
                     extension_lifecycle
                         .initiate_shutdown(Some("pipeline data-path drained"));
-                    extension_lifecycle.drain_until_deadline().await;
+                    let extension_shutdown_result =
+                        extension_lifecycle.drain_until_deadline().await;
                     // Final monitor flush so per-extension counters reflect
                     // any terminal `ShutdownTimeout` entries on the way out.
                     let mut final_monitor_reporter = metrics_reporter.clone();
@@ -1051,6 +1136,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                     .await;
 
                     let task_results = loop_result?;
+                    extension_shutdown_result?;
                     Ok(task_results)
                 })
                 .await
@@ -1225,8 +1311,8 @@ mod tests {
         assert_eq!(registry.metric_set_count(), 0);
     }
 
-    /// Scenario: a pipeline has pending terminal metrics when telemetry cleanup starts.
-    /// Guarantees: the final snapshot reaches the registry before entity handles are released.
+    /// Scenario: A pipeline has pending terminal metrics with an earlier component-local deadline.
+    /// Guarantees: The snapshot is reported without shortening the pipeline-wide deadline.
     #[tokio::test(flavor = "current_thread")]
     async fn terminal_snapshot_is_aggregated_before_telemetry_cleanup() {
         let registry = TelemetryRegistryHandle::new();
@@ -1258,12 +1344,20 @@ mod tests {
             .messages
             .inc();
 
+        let terminal_metrics_deadline = TerminalMetricsDeadline::default();
+        let pipeline_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        terminal_metrics_deadline.record(pipeline_deadline);
         report_terminal_metrics(
             &reporter,
             TerminalState::new(std::time::Instant::now(), metric_set.terminal_snapshots()),
-            &TerminalMetricsDeadline::default(),
+            &terminal_metrics_deadline,
         )
         .await;
+        assert_eq!(
+            terminal_metrics_deadline.get(),
+            pipeline_deadline,
+            "a component-local deadline must not shorten the pipeline deadline"
+        );
 
         let mut message_count = None;
         registry.visit_current_metrics(|_, _, metrics| {

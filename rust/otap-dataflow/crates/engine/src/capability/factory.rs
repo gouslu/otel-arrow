@@ -6,7 +6,7 @@
 //! These closures produce fresh instances of an extension's concrete type
 //! on demand. They are the bridge between the extension's instance policy
 //! (`Cloned` vs `Fresh`, chosen at the builder) and the capability
-//! registry, which consumes them to mint per-node capability entries.
+//! registry, which consumes them to mint per-consumer capability entries.
 //!
 //! Living in [`crate::capability`] rather than [`crate::extension`]
 //! breaks the module-level cycle between the two folders: the capability

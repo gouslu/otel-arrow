@@ -324,6 +324,29 @@ At node level:
 - `rate_limiters` (optional): select one named admission limiter with `[name]`;
   omit the field or use `[]` to leave the node unbound
 
+At extension level:
+
+- `type`: extension implementation URN
+- `description` (optional): human-readable description
+- `config` (optional): extension-specific payload
+- `capabilities` (optional): capability bindings to provider extensions
+
+An extension capability binding uses the same
+`capability_name: extension_id` shape as a node binding. These bindings form a
+dependency DAG. Providers are constructed and started before consumers, each
+provider readiness probe must pass before its consumer layer starts, and all
+layers share one absolute startup deadline. Shutdown requests interrupt startup
+before data-path nodes start. Missing providers, unknown capabilities, provider
+metadata mismatches, and exact cycle members are rejected during validation.
+
+Extension factories receive independent local and shared dependency scopes.
+Actual claims are tracked by physical consumer variant. Once all extensions and
+nodes have been constructed, provider variants not transitively reachable from
+a node claim or background extension variant are dropped before startup.
+Shutdown uses consumer-first waves from that surviving physical graph. Each
+wave receives a share of the remaining global budget so a stuck consumer is
+aborted without starving its providers.
+
 At connection level:
 
 - `from`: source node id, source selector, or source array (fan-in)

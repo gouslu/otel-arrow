@@ -45,16 +45,23 @@ pub(crate) enum LifecycleEvent {
     MonitorTick(Instant),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum LifecyclePhase {
     Running,
-    ShuttingDown { deadline: Instant },
+    ShuttingDown {
+        deadline: Instant,
+        wave_deadline: Option<Instant>,
+        reason: String,
+        in_flight: HashSet<ExtensionKey>,
+        delivered: HashSet<ExtensionKey>,
+    },
 }
 
 pub(crate) struct ExtensionLifecycle {
     futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>>,
     task_id_to_key: HashMap<task::Id, ExtensionKey>,
     shutdown_channels: Vec<(ExtensionKey, ExtensionShutdownChannel)>,
+    shutdown_layers: Vec<Vec<ExtensionKey>>,
     _passive: Vec<ExtensionWrapper>,
     phase: LifecyclePhase,
     monitor: ExtensionMetricsMonitor,
@@ -67,29 +74,69 @@ pub(crate) struct ExtensionLifecycle {
 }
 
 impl ExtensionLifecycle {
+    /// Creates an empty lifecycle. Dependency layers can then be added with
+    /// [`Self::spawn_batch`] and gated before the next layer is spawned.
+    pub fn empty(monitor: ExtensionMetricsMonitor) -> Self {
+        let (_started_tx, started_rx) = mpsc::unbounded_channel();
+        Self {
+            futures: FuturesUnordered::new(),
+            task_id_to_key: HashMap::new(),
+            shutdown_channels: Vec::new(),
+            shutdown_layers: Vec::new(),
+            _passive: Vec::new(),
+            phase: LifecyclePhase::Running,
+            monitor,
+            started_rx,
+            pending_starts: HashSet::new(),
+            extension_readiness_probes: Vec::new(),
+        }
+    }
+
     /// Spawn active+background extensions, stash passive ones, register each
     /// non-passive wrapper with `monitor`.
+    #[cfg(test)]
     pub fn spawn(
         extensions: Vec<(ExtensionWrapper, EntityKey)>,
         local_tasks: &LocalSet,
         metrics_reporter: MetricsReporter,
         terminal_metrics_deadline: TerminalMetricsDeadline,
         ext_ctx: &ExtensionContext,
-        mut monitor: ExtensionMetricsMonitor,
+        monitor: ExtensionMetricsMonitor,
     ) -> Self {
-        let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-            FuturesUnordered::new();
-        let mut task_id_to_key: HashMap<task::Id, ExtensionKey> = HashMap::new();
-        let mut shutdown_channels: Vec<(ExtensionKey, ExtensionShutdownChannel)> = Vec::new();
-        let mut passive = Vec::new();
-        let mut pending_starts: HashSet<ExtensionKey> = HashSet::new();
-        let mut extension_readiness_probes: Vec<(ExtensionKey, crate::extension::ReadinessProbe)> =
-            Vec::new();
+        let mut lifecycle = Self::empty(monitor);
+        lifecycle.spawn_batch(
+            extensions,
+            local_tasks,
+            metrics_reporter,
+            terminal_metrics_deadline,
+            ext_ctx,
+        );
+        lifecycle
+    }
+
+    /// Spawns one dependency layer.
+    ///
+    /// Callers must await [`Self::wait_all_spawned`] and
+    /// [`Self::wait_all_ready`] before adding the next layer.
+    pub fn spawn_batch(
+        &mut self,
+        extensions: Vec<(ExtensionWrapper, EntityKey)>,
+        local_tasks: &LocalSet,
+        metrics_reporter: MetricsReporter,
+        terminal_metrics_deadline: TerminalMetricsDeadline,
+        ext_ctx: &ExtensionContext,
+    ) {
+        debug_assert!(
+            self.pending_starts.is_empty(),
+            "a new extension dependency layer was spawned before the prior layer reached its spawn barrier"
+        );
         let (started_tx, started_rx) = mpsc::unbounded_channel::<ExtensionKey>();
+        self.started_rx = started_rx;
+        let mut shutdown_layer = Vec::new();
 
         for (mut ext_wrapper, entity_key) in extensions {
             if ext_wrapper.is_passive() {
-                passive.push(ext_wrapper);
+                self._passive.push(ext_wrapper);
                 continue;
             }
             let ext_id = ext_wrapper.name();
@@ -98,12 +145,14 @@ impl ExtensionLifecycle {
             let shutdown_channel = ext_wrapper.take_shutdown_sender();
             let readiness_probe = ext_wrapper.take_readiness_probe();
             let telemetry_guard = ext_wrapper.take_telemetry_guard();
-            monitor.register(ext_ctx, key.clone(), entity_key, control_sender.as_ref());
+            self.monitor
+                .register(ext_ctx, key.clone(), entity_key, control_sender.as_ref());
             if let Some(channel) = shutdown_channel {
-                shutdown_channels.push((key.clone(), channel));
+                self.shutdown_channels.push((key.clone(), channel));
+                shutdown_layer.push(key.clone());
             }
             if let Some(probe) = readiness_probe {
-                extension_readiness_probes.push((key.clone(), probe));
+                self.extension_readiness_probes.push((key.clone(), probe));
             }
             let ext_metrics_reporter = metrics_reporter.clone();
             let ext_terminal_metrics_deadline = terminal_metrics_deadline.clone();
@@ -145,24 +194,27 @@ impl ExtensionLifecycle {
                 (task_key, res)
             };
             let handle = local_tasks.spawn_local(fut);
-            let _ = task_id_to_key.insert(handle.id(), key.clone());
-            futures.push(handle);
-            let _ = pending_starts.insert(key);
+            let _ = self.task_id_to_key.insert(handle.id(), key.clone());
+            self.futures.push(handle);
+            let _ = self.pending_starts.insert(key);
         }
-        // Drop the seed so `started_rx.recv()` returns None once all clones drop.
+        // Drop the seed so `started_rx.recv()` returns None once this layer's
+        // task clones drop.
         drop(started_tx);
-
-        Self {
-            futures,
-            task_id_to_key,
-            shutdown_channels,
-            _passive: passive,
-            phase: LifecyclePhase::Running,
-            monitor,
-            started_rx,
-            pending_starts,
-            extension_readiness_probes,
+        let plan_contains_layer = shutdown_layer.iter().all(|key| {
+            self.shutdown_layers
+                .iter()
+                .flatten()
+                .any(|planned| planned == key)
+        });
+        if !shutdown_layer.is_empty() && !plan_contains_layer {
+            self.shutdown_layers.insert(0, shutdown_layer);
         }
+    }
+
+    /// Installs consumer-first shutdown waves for the live physical graph.
+    pub(crate) fn set_shutdown_waves(&mut self, shutdown_waves: Vec<Vec<ExtensionKey>>) {
+        self.shutdown_layers = shutdown_waves;
     }
 
     #[allow(dead_code)]
@@ -175,7 +227,6 @@ impl ExtensionLifecycle {
     /// power `wait_all_spawned`.
     pub async fn next_event(&mut self) -> LifecycleEvent {
         loop {
-            let shutdown_initiated = matches!(self.phase, LifecyclePhase::ShuttingDown { .. });
             let Self {
                 futures,
                 task_id_to_key,
@@ -183,6 +234,7 @@ impl ExtensionLifecycle {
                 monitor,
                 started_rx,
                 pending_starts,
+                phase,
                 ..
             } = self;
             if futures.is_empty() {
@@ -205,8 +257,22 @@ impl ExtensionLifecycle {
                     if let Some(k) = Self::pending_key_for(&joined, task_id_to_key) {
                         let _ = pending_starts.remove(&k);
                     }
+                    let shutdown_was_sent =
+                        Self::pending_key_for(&joined, task_id_to_key).is_some_and(|key| {
+                            matches!(
+                                phase,
+                                LifecyclePhase::ShuttingDown { delivered, .. }
+                                    if delivered.contains(&key)
+                            )
+                        });
                     return LifecycleEvent::Completion(
-                        Self::route_joined(monitor, task_id_to_key, shutdown_channels, shutdown_initiated, joined)
+                        Self::route_joined(
+                            monitor,
+                            task_id_to_key,
+                            shutdown_channels,
+                            shutdown_was_sent,
+                            joined,
+                        )
                     );
                 }
                 now = monitor.next_tick() => return LifecycleEvent::MonitorTick(now),
@@ -244,7 +310,7 @@ impl ExtensionLifecycle {
                 match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined)
                 {
                     Ok(Ok(())) => unreachable!(
-                        "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
+                        "route_joined(shutdown_was_sent=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                     ),
                     Ok(Err(e)) => return Err(e),
                     Err(e) => {
@@ -271,7 +337,7 @@ impl ExtensionLifecycle {
                     }
                     match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined) {
                         Ok(Ok(())) => unreachable!(
-                            "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
+                            "route_joined(shutdown_was_sent=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                         ),
                         Ok(Err(e)) => return Err(e),
                         Err(e) => {
@@ -330,7 +396,7 @@ impl ExtensionLifecycle {
                 Some(joined) = futures.next(), if !futures.is_empty() => {
                     match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined) {
                         Ok(Ok(())) => unreachable!(
-                            "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
+                            "route_joined(shutdown_was_sent=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                         ),
                         Ok(Err(e)) => return Err(e),
                         Err(e) => {
@@ -381,12 +447,13 @@ impl ExtensionLifecycle {
 
     /// Records the completion in the monitor, prunes the shutdown channel for
     /// this extension, and upgrades an early `Ok(())` to
-    /// `ExtensionExitedBeforeShutdown` when shutdown hasn't been initiated.
+    /// `ExtensionExitedBeforeShutdown` until that specific variant has entered
+    /// the current signaled shutdown wave.
     fn route_joined(
         monitor: &mut ExtensionMetricsMonitor,
         task_id_to_key: &mut HashMap<task::Id, ExtensionKey>,
         shutdown_channels: &mut Vec<(ExtensionKey, ExtensionShutdownChannel)>,
-        shutdown_initiated: bool,
+        shutdown_was_sent: bool,
         joined: Result<(ExtensionKey, Result<(), Error>), JoinError>,
     ) -> Result<Result<(), Error>, JoinError> {
         match joined {
@@ -394,7 +461,7 @@ impl ExtensionLifecycle {
                 task_id_to_key.retain(|_, k| k != &key);
                 shutdown_channels.retain(|(k, _)| k != &key);
                 let res = match res {
-                    Ok(()) if !shutdown_initiated => Err(Error::ExtensionExitedBeforeShutdown {
+                    Ok(()) if !shutdown_was_sent => Err(Error::ExtensionExitedBeforeShutdown {
                         extension: key.id.to_string(),
                     }),
                     other => other,
@@ -448,113 +515,294 @@ impl ExtensionLifecycle {
         matches!(self.phase, LifecyclePhase::ShuttingDown { .. })
     }
 
-    /// Broadcasts `Shutdown` to every active+background extension via its
-    /// priority oneshot channel. Single-shot: subsequent calls are no-ops.
+    /// Begins consumer-first dependency-order shutdown.
+    ///
+    /// Every live extension in the current wave is signaled together.
+    /// [`Self::drain_until_deadline`] advances after that wave exits or exhausts
+    /// its share of the global budget, so a stuck consumer cannot starve its
+    /// providers. Single-shot: subsequent calls are no-ops.
     pub fn initiate_shutdown(&mut self, reason: Option<&str>) {
+        self.initiate_shutdown_until(reason, Instant::now() + EXTENSION_SHUTDOWN_GRACE);
+    }
+
+    pub(crate) fn initiate_shutdown_until(&mut self, reason: Option<&str>, deadline: Instant) {
         if matches!(self.phase, LifecyclePhase::ShuttingDown { .. }) {
             return;
         }
-        if self.shutdown_channels.is_empty() {
+
+        if self.shutdown_layers.is_empty() && !self.shutdown_channels.is_empty() {
+            self.shutdown_layers.push(
+                self.shutdown_channels
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect(),
+            );
+        }
+        self.phase = LifecyclePhase::ShuttingDown {
+            deadline,
+            wave_deadline: None,
+            reason: reason.unwrap_or(DEFAULT_SHUTDOWN_REASON).to_string(),
+            in_flight: HashSet::new(),
+            delivered: HashSet::new(),
+        };
+        self.send_next_shutdown();
+    }
+
+    fn send_next_shutdown(&mut self) {
+        let Self {
+            phase,
+            shutdown_channels,
+            shutdown_layers,
+            task_id_to_key,
+            monitor,
+            ..
+        } = self;
+        let LifecyclePhase::ShuttingDown {
+            deadline,
+            wave_deadline,
+            reason,
+            in_flight,
+            delivered,
+        } = phase
+        else {
+            return;
+        };
+
+        in_flight.retain(|key| task_id_to_key.values().any(|candidate| candidate == key));
+        if !in_flight.is_empty() {
             return;
         }
 
-        let deadline = Instant::now() + EXTENSION_SHUTDOWN_GRACE;
-        self.phase = LifecyclePhase::ShuttingDown { deadline };
-
-        let reason = reason.unwrap_or(DEFAULT_SHUTDOWN_REASON).to_string();
-        for (key, channel) in self.shutdown_channels.drain(..) {
-            let payload = ShutdownPayload {
-                deadline,
-                reason: reason.clone(),
-            };
-            match channel.sender.send(payload) {
-                Ok(()) => {
-                    self.monitor
-                        .apply_event(ExtensionLifecycleEvent::ShutdownSent { key });
+        *wave_deadline = None;
+        while !shutdown_layers.is_empty() {
+            let layer = shutdown_layers.remove(0);
+            let remaining_active_waves = 1 + shutdown_layers
+                .iter()
+                .filter(|wave| {
+                    wave.iter()
+                        .any(|key| task_id_to_key.values().any(|candidate| candidate == key))
+                })
+                .count();
+            let now = Instant::now();
+            let budget = deadline.saturating_duration_since(now)
+                / u32::try_from(remaining_active_waves).unwrap_or(u32::MAX);
+            let current_wave_deadline = now + budget;
+            for key in layer {
+                let Some(channel_index) = shutdown_channels
+                    .iter()
+                    .rposition(|(candidate, _)| candidate == &key)
+                else {
+                    continue;
+                };
+                let (_, channel) = shutdown_channels.remove(channel_index);
+                let payload = ShutdownPayload {
+                    deadline: current_wave_deadline,
+                    reason: reason.clone(),
+                };
+                let task_alive = task_id_to_key.values().any(|candidate| candidate == &key);
+                match channel.sender.send(payload) {
+                    Ok(()) => {
+                        let _ = delivered.insert(key.clone());
+                        monitor.apply_event(ExtensionLifecycleEvent::ShutdownSent {
+                            key: key.clone(),
+                        });
+                    }
+                    Err(_payload) => {
+                        otel_warn!(
+                            "extension.shutdown.receiver_dropped",
+                            extension = channel.name.as_ref(),
+                        );
+                    }
                 }
-                Err(_payload) => {
-                    otel_warn!(
-                        "extension.shutdown.receiver_dropped",
-                        extension = channel.name.as_ref(),
-                    );
+                if task_alive {
+                    let _ = in_flight.insert(key);
                 }
+            }
+            // Every live extension in this dependency layer was signaled
+            // together. Lower provider layers wait for all of them to exit.
+            if !in_flight.is_empty() {
+                *wave_deadline = Some(current_wave_deadline);
+                return;
             }
         }
     }
 
-    /// Drains remaining extension tasks, bounded by the shutdown deadline.
-    pub async fn drain_until_deadline(&mut self) {
-        if self.futures.is_empty() {
+    fn send_remaining_shutdown(&mut self) {
+        let Self {
+            phase,
+            shutdown_channels,
+            monitor,
+            ..
+        } = self;
+        let LifecyclePhase::ShuttingDown {
+            deadline, reason, ..
+        } = phase
+        else {
             return;
-        }
-        let deadline = match self.phase {
-            LifecyclePhase::ShuttingDown { deadline } => deadline,
-            LifecyclePhase::Running => {
-                let deadline = Instant::now() + EXTENSION_SHUTDOWN_GRACE;
-                self.phase = LifecyclePhase::ShuttingDown { deadline };
-                deadline
-            }
         };
-        let drain_deadline = TokioInstant::from_std(deadline + EXTENSION_SHUTDOWN_DRAIN_SLACK);
+        while let Some((key, channel)) = shutdown_channels.pop() {
+            let payload = ShutdownPayload {
+                deadline: *deadline,
+                reason: reason.clone(),
+            };
+            if channel.sender.send(payload).is_ok() {
+                monitor.apply_event(ExtensionLifecycleEvent::ShutdownSent { key });
+            }
+        }
+    }
 
-        let futures = &mut self.futures;
-        let task_id_to_key = &mut self.task_id_to_key;
-        let shutdown_channels = &mut self.shutdown_channels;
-        let monitor = &mut self.monitor;
-        let drain = async {
-            while let Some(result) = futures.next().await {
-                match result {
-                    Ok((key, Ok(()))) => {
-                        task_id_to_key.retain(|_, k| k != &key);
-                        shutdown_channels.retain(|(k, _)| k != &key);
-                        monitor.apply_event(ExtensionLifecycleEvent::Completed {
-                            key,
-                            outcome: ExtensionOutcome::Ok,
-                        });
-                    }
-                    Ok((key, Err(e))) => {
-                        task_id_to_key.retain(|_, k| k != &key);
-                        shutdown_channels.retain(|(k, _)| k != &key);
-                        otel_warn!("extension.shutdown.task.error", error = format!("{e}"));
-                        monitor.apply_event(ExtensionLifecycleEvent::Completed {
-                            key,
-                            outcome: ExtensionOutcome::Err(e.to_string()),
-                        });
-                    }
-                    Err(e) => {
-                        let task_id = e.id();
-                        otel_warn!(
-                            "extension.shutdown.task.join_error",
-                            is_canceled = e.is_cancelled(),
-                            is_panic = e.is_panic(),
-                            error = e.to_string()
-                        );
-                        if let Some(key) = task_id_to_key.remove(&task_id) {
-                            shutdown_channels.retain(|(k, _)| k != &key);
-                            let outcome = if e.is_cancelled() {
-                                ExtensionOutcome::JoinCancelled
-                            } else {
-                                ExtensionOutcome::JoinPanic
-                            };
-                            monitor
-                                .apply_event(ExtensionLifecycleEvent::Completed { key, outcome });
-                        }
-                    }
+    fn abort_tasks(&self, keys: &HashSet<ExtensionKey>) {
+        for handle in self.futures.iter() {
+            if self
+                .task_id_to_key
+                .get(&handle.id())
+                .is_some_and(|key| keys.contains(key))
+            {
+                handle.abort();
+            }
+        }
+    }
+
+    fn route_shutdown_completion(
+        &mut self,
+        result: Result<(ExtensionKey, Result<(), Error>), JoinError>,
+    ) -> Option<Error> {
+        let completed_key = Self::pending_key_for(&result, &self.task_id_to_key);
+        let shutdown_was_sent = completed_key.as_ref().is_some_and(|key| {
+            matches!(
+                &self.phase,
+                LifecyclePhase::ShuttingDown { delivered, .. } if delivered.contains(key)
+            )
+        });
+        let mut unexpected_exit = None;
+        match Self::route_joined(
+            &mut self.monitor,
+            &mut self.task_id_to_key,
+            &mut self.shutdown_channels,
+            shutdown_was_sent,
+            result,
+        ) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                otel_warn!("extension.shutdown.task.error", error = error.to_string());
+                if !shutdown_was_sent {
+                    unexpected_exit = Some(error);
                 }
             }
-        };
-
-        if tokio::time::timeout_at(drain_deadline, drain)
-            .await
-            .is_err()
-        {
-            otel_warn!(
-                "extension.shutdown.timeout",
-                grace_secs = EXTENSION_SHUTDOWN_GRACE.as_secs(),
-                remaining = self.futures.len()
-            );
-            self.monitor.mark_stragglers_as_timeout();
+            Err(error) => {
+                otel_warn!(
+                    "extension.shutdown.task.join_error",
+                    is_canceled = error.is_cancelled(),
+                    is_panic = error.is_panic(),
+                    error = error.to_string()
+                );
+                if !shutdown_was_sent {
+                    unexpected_exit = Some(Error::JoinTaskError {
+                        is_canceled: error.is_cancelled(),
+                        is_panic: error.is_panic(),
+                        error: error.to_string(),
+                    });
+                }
+            }
         }
+        if let (
+            Some(completed_key),
+            LifecyclePhase::ShuttingDown {
+                in_flight,
+                delivered,
+                ..
+            },
+        ) = (completed_key, &mut self.phase)
+        {
+            let _ = in_flight.remove(&completed_key);
+            let _ = delivered.remove(&completed_key);
+        }
+        self.send_next_shutdown();
+        unexpected_exit
+    }
+
+    fn timeout_current_wave(&mut self) {
+        let LifecyclePhase::ShuttingDown {
+            wave_deadline,
+            in_flight,
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        let timed_out = in_flight.clone();
+        if timed_out.is_empty() {
+            return;
+        }
+        *wave_deadline = None;
+        self.monitor.mark_as_timeout(timed_out.iter());
+        self.abort_tasks(&timed_out);
+    }
+
+    /// Drains remaining extension tasks, bounded by per-wave shares of one
+    /// global shutdown deadline plus a small cancellation-drain slack.
+    pub async fn drain_until_deadline(&mut self) -> Result<(), Error> {
+        if self.futures.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.phase, LifecyclePhase::Running) {
+            self.initiate_shutdown(None);
+        }
+        let deadline = match &self.phase {
+            LifecyclePhase::ShuttingDown { deadline, .. } => *deadline,
+            LifecyclePhase::Running => unreachable!("shutdown was initiated above"),
+        };
+        let hard_deadline = deadline + EXTENSION_SHUTDOWN_DRAIN_SLACK;
+        let mut unexpected_exit = None;
+
+        while !self.futures.is_empty() {
+            self.send_next_shutdown();
+            let wave_deadline = match &self.phase {
+                LifecyclePhase::ShuttingDown { wave_deadline, .. } => *wave_deadline,
+                LifecyclePhase::Running => unreachable!("shutdown was initiated above"),
+            };
+            let wait_deadline = wave_deadline.unwrap_or(hard_deadline).min(hard_deadline);
+            match tokio::time::timeout_at(
+                TokioInstant::from_std(wait_deadline),
+                self.futures.next(),
+            )
+            .await
+            {
+                Ok(Some(result)) => {
+                    if let Some(error) = self.route_shutdown_completion(result)
+                        && unexpected_exit.is_none()
+                    {
+                        unexpected_exit = Some(error);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) if wave_deadline.is_some() && Instant::now() < hard_deadline => {
+                    let timed_out = match &self.phase {
+                        LifecyclePhase::ShuttingDown { in_flight, .. } => in_flight.len(),
+                        LifecyclePhase::Running => 0,
+                    };
+                    otel_warn!(
+                        "extension.shutdown.wave_timeout",
+                        timed_out,
+                        remaining = self.futures.len()
+                    );
+                    self.timeout_current_wave();
+                }
+                Err(_) => {
+                    otel_warn!(
+                        "extension.shutdown.timeout",
+                        grace_secs = EXTENSION_SHUTDOWN_GRACE.as_secs(),
+                        remaining = self.futures.len()
+                    );
+                    self.send_remaining_shutdown();
+                    self.monitor.mark_stragglers_as_timeout();
+                    let remaining: HashSet<_> = self.task_id_to_key.values().cloned().collect();
+                    self.abort_tasks(&remaining);
+                    break;
+                }
+            }
+        }
+        unexpected_exit.map_or(Ok(()), Err)
     }
 }
 
@@ -608,9 +856,14 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: Vec::new(),
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::ShuttingDown {
                     deadline: injected_deadline,
+                    wave_deadline: None,
+                    reason: DEFAULT_SHUTDOWN_REASON.to_string(),
+                    in_flight: HashSet::new(),
+                    delivered: HashSet::new(),
                 },
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
                 started_rx,
@@ -619,7 +872,10 @@ mod tests {
             };
 
             let start = Instant::now();
-            lifecycle.drain_until_deadline().await;
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
             let elapsed = start.elapsed();
 
             let upper_bound = Duration::from_millis(100)
@@ -682,6 +938,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: Vec::new(),
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor,
@@ -737,6 +994,7 @@ mod tests {
                 futures: FuturesUnordered::new(),
                 task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_a, channel_a), (key_b, channel_b)],
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -766,6 +1024,352 @@ mod tests {
                 .try_recv()
                 .expect("b must receive exactly one Shutdown");
             assert_eq!(payload_b.reason, "first");
+        }));
+    }
+
+    /// Scenario: Two live extensions occupy the same dependency layer.
+    /// Guarantees: Both receive shutdown before either task must complete.
+    #[test]
+    fn shutdown_signals_every_extension_in_a_layer_concurrently() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let (key_a, channel_a, rx_a) = make_shutdown_channel("a");
+            let (key_b, channel_b, rx_b) = make_shutdown_channel("b");
+
+            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
+                FuturesUnordered::new();
+            let mut task_id_to_key = HashMap::new();
+            for (key, receiver) in [(key_a.clone(), rx_a), (key_b.clone(), rx_b)] {
+                let task_key = key.clone();
+                let handle = local_tasks.spawn_local(async move {
+                    let _ = receiver.await;
+                    (task_key, Ok(()))
+                });
+                let _ = task_id_to_key.insert(handle.id(), key);
+                futures.push(handle);
+            }
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                task_id_to_key,
+                shutdown_channels: vec![(key_a.clone(), channel_a), (key_b.clone(), channel_b)],
+                shutdown_layers: vec![vec![key_a, key_b]],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::Running,
+                monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            lifecycle.initiate_shutdown(Some("test"));
+            assert!(
+                lifecycle.shutdown_channels.is_empty(),
+                "all channels in the current layer must be signaled together"
+            );
+            assert!(matches!(
+                &lifecycle.phase,
+                LifecyclePhase::ShuttingDown { in_flight, .. } if in_flight.len() == 2
+            ));
+
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
+            assert!(lifecycle.futures.is_empty());
+        }));
+    }
+
+    /// Scenario: A live extension has dropped its control receiver before its shutdown wave.
+    /// Guarantees: Failed shutdown delivery does not make its later clean exit look expected.
+    #[test]
+    fn shutdown_delivery_failure_does_not_mark_extension_signaled() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let (key, channel, receiver) = make_shutdown_channel("dropped-control");
+            drop(receiver);
+            let (release_tx, release_rx) = oneshot::channel();
+
+            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
+                FuturesUnordered::new();
+            let task_key = key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = release_rx.await;
+                (task_key, Ok(()))
+            });
+            let mut task_id_to_key = HashMap::new();
+            let _ = task_id_to_key.insert(handle.id(), key.clone());
+            futures.push(handle);
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                task_id_to_key,
+                shutdown_channels: vec![(key.clone(), channel)],
+                shutdown_layers: vec![vec![key.clone()]],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::Running,
+                monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            lifecycle.initiate_shutdown(Some("test"));
+            assert!(matches!(
+                &lifecycle.phase,
+                LifecyclePhase::ShuttingDown {
+                    in_flight,
+                    delivered,
+                    ..
+                } if in_flight.contains(&key) && !delivered.contains(&key)
+            ));
+
+            let _ = release_tx.send(());
+            let error = lifecycle
+                .drain_until_deadline()
+                .await
+                .expect_err("failed shutdown delivery must remain an unexpected exit");
+            assert!(matches!(
+                error,
+                Error::ExtensionExitedBeforeShutdown { extension }
+                    if extension == "dropped-control"
+            ));
+        }));
+    }
+
+    /// Scenario: One of two consumers in a shutdown layer remains active.
+    /// Guarantees: Its provider is not signaled until both consumers exit.
+    #[test]
+    fn shutdown_waits_for_entire_consumer_layer_before_provider() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let (provider_key, provider_channel, mut provider_rx) =
+                make_shutdown_channel("provider");
+            let (consumer_a_key, consumer_a_channel, consumer_a_rx) =
+                make_shutdown_channel("consumer-a");
+            let (consumer_b_key, consumer_b_channel, consumer_b_rx) =
+                make_shutdown_channel("consumer-b");
+            let (consumer_b_received_tx, consumer_b_received_rx) = oneshot::channel();
+            let (consumer_b_release_tx, consumer_b_release_rx) = oneshot::channel();
+
+            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
+                FuturesUnordered::new();
+            let mut task_id_to_key = HashMap::new();
+
+            let task_key = consumer_a_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = consumer_a_rx.await;
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), consumer_a_key.clone());
+            futures.push(handle);
+
+            let task_key = consumer_b_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = consumer_b_rx.await;
+                let _ = consumer_b_received_tx.send(());
+                let _ = consumer_b_release_rx.await;
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), consumer_b_key.clone());
+            futures.push(handle);
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                task_id_to_key,
+                shutdown_channels: vec![
+                    (provider_key.clone(), provider_channel),
+                    (consumer_a_key.clone(), consumer_a_channel),
+                    (consumer_b_key.clone(), consumer_b_channel),
+                ],
+                shutdown_layers: vec![vec![consumer_a_key, consumer_b_key], vec![provider_key]],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::Running,
+                monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            lifecycle.initiate_shutdown(Some("test"));
+            consumer_b_received_rx
+                .await
+                .expect("consumer B received shutdown");
+            assert!(
+                provider_rx.try_recv().is_err(),
+                "provider must remain live while consumer B is still active"
+            );
+
+            let _ = consumer_b_release_tx.send(());
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
+            let _ = provider_rx
+                .try_recv()
+                .expect("provider receives shutdown after all consumers exit");
+        }));
+    }
+
+    /// Scenario: A provider exits cleanly while its consumer is still draining.
+    /// Guarantees: The unsignaled provider exit fails shutdown without skipping consumer cleanup.
+    #[test]
+    fn shutdown_rejects_provider_exit_before_its_wave() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let (provider_key, provider_channel, mut provider_shutdown_rx) =
+                make_shutdown_channel("provider");
+            let (consumer_key, consumer_channel, consumer_shutdown_rx) =
+                make_shutdown_channel("consumer");
+            let (provider_exit_tx, provider_exit_rx) = oneshot::channel();
+            let (consumer_received_tx, consumer_received_rx) = oneshot::channel();
+            let (consumer_release_tx, consumer_release_rx) = oneshot::channel();
+
+            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
+                FuturesUnordered::new();
+            let mut task_id_to_key = HashMap::new();
+
+            let task_key = provider_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = provider_exit_rx.await;
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), provider_key.clone());
+            futures.push(handle);
+
+            let task_key = consumer_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = consumer_shutdown_rx.await;
+                let _ = consumer_received_tx.send(());
+                let _ = consumer_release_rx.await;
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), consumer_key.clone());
+            futures.push(handle);
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                task_id_to_key,
+                shutdown_channels: vec![
+                    (provider_key.clone(), provider_channel),
+                    (consumer_key.clone(), consumer_channel),
+                ],
+                shutdown_layers: vec![vec![consumer_key], vec![provider_key]],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::Running,
+                monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            lifecycle.initiate_shutdown(Some("test"));
+            consumer_received_rx
+                .await
+                .expect("consumer receives shutdown");
+            assert!(
+                provider_shutdown_rx.try_recv().is_err(),
+                "provider must not receive shutdown while its consumer is active"
+            );
+
+            let _ = provider_exit_tx.send(());
+            task::yield_now().await;
+            let _release_handle = task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = consumer_release_tx.send(());
+            });
+            let error = lifecycle
+                .drain_until_deadline()
+                .await
+                .expect_err("an unsignaled provider exit must fail shutdown");
+
+            assert!(matches!(
+                error,
+                Error::ExtensionExitedBeforeShutdown { extension }
+                    if extension == "provider"
+            ));
+            assert!(
+                lifecycle.futures.is_empty(),
+                "consumer cleanup must finish before the error is returned"
+            );
+        }));
+    }
+
+    /// Scenario: A consumer ignores shutdown until its wave budget expires.
+    /// Guarantees: The consumer is aborted and its provider receives a usable remaining budget.
+    #[test]
+    fn stuck_consumer_cannot_starve_provider_shutdown() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let (provider_key, provider_channel, provider_rx) = make_shutdown_channel("provider");
+            let (consumer_key, consumer_channel, consumer_rx) = make_shutdown_channel("consumer");
+            let (provider_observed_tx, provider_observed_rx) = oneshot::channel();
+
+            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
+                FuturesUnordered::new();
+            let mut task_id_to_key = HashMap::new();
+
+            let task_key = consumer_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let _ = consumer_rx.await;
+                std::future::pending::<()>().await;
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), consumer_key.clone());
+            futures.push(handle);
+
+            let task_key = provider_key.clone();
+            let handle = local_tasks.spawn_local(async move {
+                let payload = provider_rx.await.expect("provider receives shutdown");
+                let _ = provider_observed_tx.send((Instant::now(), payload.deadline));
+                (task_key, Ok(()))
+            });
+            let _ = task_id_to_key.insert(handle.id(), provider_key.clone());
+            futures.push(handle);
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                task_id_to_key,
+                shutdown_channels: vec![
+                    (provider_key.clone(), provider_channel),
+                    (consumer_key.clone(), consumer_channel),
+                ],
+                shutdown_layers: vec![vec![consumer_key], vec![provider_key]],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::Running,
+                monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            let global_deadline = Instant::now() + Duration::from_millis(120);
+            lifecycle.initiate_shutdown_until(Some("test"), global_deadline);
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
+
+            let (observed_at, provider_deadline) = provider_observed_rx
+                .await
+                .expect("provider task reports its shutdown payload");
+            assert!(
+                observed_at < global_deadline,
+                "provider must be signaled before the global deadline"
+            );
+            assert!(
+                provider_deadline > observed_at,
+                "provider must receive a non-expired shutdown deadline"
+            );
+            assert!(
+                lifecycle.futures.is_empty(),
+                "timed-out consumer and completed provider must both be reaped"
+            );
         }));
     }
 
@@ -872,6 +1476,7 @@ mod tests {
                 futures: FuturesUnordered::new(),
                 task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_a, channel_a)],
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ctx_a),
@@ -883,6 +1488,7 @@ mod tests {
                 futures: FuturesUnordered::new(),
                 task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_b, channel_b)],
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ctx_b),
@@ -990,6 +1596,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: vec![(key_a.clone(), channel_a), (key_b.clone(), channel_b)],
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -1051,6 +1658,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: vec![(key_a.clone(), channel_a), (key_b.clone(), channel_b)],
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -1104,6 +1712,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: Vec::new(),
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -1179,6 +1788,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: Vec::new(),
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -1224,6 +1834,7 @@ mod tests {
                 futures,
                 task_id_to_key,
                 shutdown_channels: Vec::new(),
+                shutdown_layers: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
                 monitor: ExtensionMetricsMonitor::disabled(ext_ctx),
@@ -1340,7 +1951,10 @@ mod tests {
             );
 
             lifecycle.initiate_shutdown(Some("test"));
-            lifecycle.drain_until_deadline().await;
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
 
             assert!(
                 observed_shutdown.get(),
@@ -1422,7 +2036,10 @@ mod tests {
             );
 
             lifecycle.initiate_shutdown(Some("test"));
-            lifecycle.drain_until_deadline().await;
+            lifecycle
+                .drain_until_deadline()
+                .await
+                .expect("extension shutdown should complete");
 
             assert!(observed_shutdown.get(), "extension must have observed Shutdown");
             assert!(!observed_close.get(), "extension control channel must not have closed early");
@@ -1446,6 +2063,7 @@ mod tests {
             futures: FuturesUnordered::new(),
             task_id_to_key: HashMap::new(),
             shutdown_channels: Vec::new(),
+            shutdown_layers: Vec::new(),
             _passive: Vec::new(),
             phase: LifecyclePhase::Running,
             monitor: ExtensionMetricsMonitor::disabled(ext_ctx),

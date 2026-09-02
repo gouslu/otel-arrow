@@ -5,7 +5,7 @@
 //!
 //! [`CapabilityRegistry`] collects type-erased capability entries from
 //! extensions during the build phase. [`Capabilities`] is produced
-//! per-node by [`resolve_bindings`] and provides the consumer API
+//! per consumer by [`resolve_bindings`] and provides the consumer API
 //! (`require_local`, `require_shared`, `optional_local`,
 //! `optional_shared`).
 //!
@@ -15,9 +15,9 @@
 //! |------------------|-------------------------------------------------------------------------------|
 //! | [`entry`]        | [`LocalCapabilityEntry`], [`SharedCapabilityEntry`], plus resolved-entry types |
 //! | [`storage`]      | [`CapabilityRegistry`] -- build-phase storage of registrations                  |
-//! | [`capabilities`] | [`Capabilities`] -- per-node consumer API                                       |
+//! | [`capabilities`] | [`Capabilities`] -- per-consumer API                                            |
 //! | [`tracker`]      | [`ConsumedTracker`] -- records which variants were consumed                     |
-//! | [`resolve`]      | [`resolve_bindings`] -- the per-node resolution pass                            |
+//! | [`resolve`]      | [`resolve_bindings`] -- the per-consumer resolution pass                        |
 
 mod capabilities;
 mod entry;

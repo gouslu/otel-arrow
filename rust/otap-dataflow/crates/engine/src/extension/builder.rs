@@ -68,6 +68,7 @@
 
 use super::readiness::{ReadinessProbe, ReadinessSignaller};
 use super::{ExtensionBundle, ExtensionLifecycle, ExtensionWrapper};
+use super::{LocalExtensionDependency, SharedExtensionDependency};
 use crate::capability::factory::{LocalInstanceFactory, SharedInstanceFactory};
 use crate::config::ExtensionConfig;
 use crate::error::Error;
@@ -196,6 +197,18 @@ impl ActiveStage {
         }
     }
 
+    /// Register a shared variant constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E>(
+        self,
+        extension: SharedExtensionDependency<E>,
+    ) -> ActiveSharedStage
+    where
+        E: shared_ext::Extension + Clone + Send + 'static,
+    {
+        self.shared(extension.into_inner())
+    }
+
     /// Register the local (!Send) variant.
     #[must_use]
     pub fn local<E>(mut self, extension: std::rc::Rc<E>) -> ActiveLocalStage
@@ -211,6 +224,18 @@ impl ActiveStage {
             parent: self.parent,
             readiness_timeout: self.readiness_timeout,
         }
+    }
+
+    /// Register a local variant constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E>(
+        self,
+        extension: LocalExtensionDependency<std::rc::Rc<E>>,
+    ) -> ActiveLocalStage
+    where
+        E: local_ext::Extension + Clone + 'static,
+    {
+        self.local(extension.into_inner())
     }
 }
 
@@ -241,6 +266,18 @@ impl ActiveSharedStage {
         ActiveCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local variant constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E>(
+        self,
+        extension: LocalExtensionDependency<std::rc::Rc<E>>,
+    ) -> ActiveCompleteStage
+    where
+        E: local_ext::Extension + Clone + 'static,
+    {
+        self.local(extension.into_inner())
     }
 
     /// Finalize the bundle.
@@ -277,6 +314,18 @@ impl ActiveLocalStage {
         ActiveCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a shared variant constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E>(
+        self,
+        extension: SharedExtensionDependency<E>,
+    ) -> ActiveCompleteStage
+    where
+        E: shared_ext::Extension + Clone + Send + 'static,
+    {
+        self.shared(extension.into_inner())
     }
 
     /// Finalize the bundle.
@@ -361,6 +410,18 @@ impl PassiveClonedStage {
         }
     }
 
+    /// Register a shared variant constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E>(
+        self,
+        extension: SharedExtensionDependency<E>,
+    ) -> PassiveClonedSharedStage
+    where
+        E: Clone + Send + 'static,
+    {
+        self.shared(extension.into_inner())
+    }
+
     /// Register the local (!Send) variant. Consumers receive
     /// independent clones of the prototype, mirroring `.shared(...)`.
     #[must_use]
@@ -372,6 +433,18 @@ impl PassiveClonedStage {
         PassiveClonedLocalStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local variant constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E>(
+        self,
+        extension: LocalExtensionDependency<E>,
+    ) -> PassiveClonedLocalStage
+    where
+        E: Clone + 'static,
+    {
+        self.local(extension.into_inner())
     }
 }
 
@@ -394,6 +467,18 @@ impl PassiveClonedSharedStage {
         PassiveClonedCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local variant constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E>(
+        self,
+        extension: LocalExtensionDependency<E>,
+    ) -> PassiveClonedCompleteStage
+    where
+        E: Clone + 'static,
+    {
+        self.local(extension.into_inner())
     }
 
     /// Finalize the bundle.
@@ -425,6 +510,18 @@ impl PassiveClonedLocalStage {
         PassiveClonedCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a shared variant constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E>(
+        self,
+        extension: SharedExtensionDependency<E>,
+    ) -> PassiveClonedCompleteStage
+    where
+        E: Clone + Send + 'static,
+    {
+        self.shared(extension.into_inner())
     }
 
     /// Finalize the bundle.
@@ -482,6 +579,19 @@ impl PassiveConstructedStage {
         }
     }
 
+    /// Register a shared factory closure constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E, F>(
+        self,
+        produce: SharedExtensionDependency<F>,
+    ) -> PassiveConstructedSharedStage
+    where
+        E: Send + 'static,
+        F: Fn() -> E + Clone + Send + 'static,
+    {
+        self.shared(produce.into_inner())
+    }
+
     /// Register the local (!Send) variant via a factory closure. Each
     /// consumer receives a freshly-constructed instance.
     #[must_use]
@@ -494,6 +604,19 @@ impl PassiveConstructedStage {
         PassiveConstructedLocalStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local factory closure constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E, F>(
+        self,
+        produce: LocalExtensionDependency<F>,
+    ) -> PassiveConstructedLocalStage
+    where
+        E: 'static,
+        F: Fn() -> E + Clone + 'static,
+    {
+        self.local(produce.into_inner())
     }
 }
 
@@ -517,6 +640,19 @@ impl PassiveConstructedSharedStage {
         PassiveConstructedCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local factory closure constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E, F>(
+        self,
+        produce: LocalExtensionDependency<F>,
+    ) -> PassiveConstructedCompleteStage
+    where
+        E: 'static,
+        F: Fn() -> E + Clone + 'static,
+    {
+        self.local(produce.into_inner())
     }
 
     /// Finalize the bundle.
@@ -549,6 +685,19 @@ impl PassiveConstructedLocalStage {
         PassiveConstructedCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a shared factory closure constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E, F>(
+        self,
+        produce: SharedExtensionDependency<F>,
+    ) -> PassiveConstructedCompleteStage
+    where
+        E: Send + 'static,
+        F: Fn() -> E + Clone + Send + 'static,
+    {
+        self.shared(produce.into_inner())
     }
 
     /// Finalize the bundle.
@@ -632,6 +781,18 @@ impl BackgroundEmptyStage {
         }
     }
 
+    /// Register a shared background variant constructed from its dependency scope.
+    #[must_use]
+    pub fn shared_with_dependencies<E>(
+        self,
+        extension: SharedExtensionDependency<E>,
+    ) -> BackgroundCompleteStage
+    where
+        E: shared_ext::Extension + Clone + Send + 'static,
+    {
+        self.shared(extension.into_inner())
+    }
+
     /// Register the local (!Send) bg task instance.
     #[must_use]
     pub fn local<E>(mut self, extension: std::rc::Rc<E>) -> BackgroundCompleteStage
@@ -646,6 +807,18 @@ impl BackgroundEmptyStage {
         BackgroundCompleteStage {
             parent: self.parent,
         }
+    }
+
+    /// Register a local background variant constructed from its dependency scope.
+    #[must_use]
+    pub fn local_with_dependencies<E>(
+        self,
+        extension: LocalExtensionDependency<std::rc::Rc<E>>,
+    ) -> BackgroundCompleteStage
+    where
+        E: local_ext::Extension + Clone + 'static,
+    {
+        self.local(extension.into_inner())
     }
 }
 

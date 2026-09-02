@@ -18,7 +18,7 @@ use crate::{
     entity_context::{NodeTelemetryGuard, NodeTelemetryHandle, with_node_telemetry_handle},
     error::{Error, TypedError},
     exporter::ExporterWrapper,
-    extension::ExtensionBundle,
+    extension::{ExtensionBundle, ExtensionDependencies, wrapper::ExtensionVariant},
     local::message::{LocalReceiver, LocalSender},
     message::{Receiver, Sender},
     node::{Node, NodeDefs, NodeId, NodeName, NodeType},
@@ -37,6 +37,7 @@ use otel_arrow_dfe_config::MetricLevel;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_config::{
     PipelineGroupId, PipelineId, PortName,
+    dependency_graph::DependencyGraph,
     engine::INTERNAL_TELEMETRY_RECEIVER_URN,
     node::NodeUserConfig,
     pipeline::{DispatchPolicy, PipelineConfig},
@@ -54,7 +55,7 @@ use std::fmt::Debug;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::OnceLock,
 };
 
@@ -294,16 +295,22 @@ pub struct ExtensionFactory {
     /// `Some(caps)` for active or passive extensions (caps lists are
     /// non-empty by macro construction). `None` marks a Background
     /// extension -- engine-driven event loop with no capabilities
-    /// exposed to nodes; `register_into` skips capability registration.
+    /// exposed to consumers; `register_into` skips capability registration.
     pub capabilities: Option<capability::ExtensionCapabilities>,
     /// A function that creates a new extension instance.
+    ///
+    /// `dependencies` contains independent, one-shot local and shared views of
+    /// the capabilities bound in this extension's configuration. Providers
+    /// have already been constructed and registered before this function is
+    /// called.
     pub create: fn(
         ext_ctx: &ExtensionContext,
         name: otel_arrow_dfe_config::ExtensionId,
         ext_config: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
         extension_config: &ExtensionConfig,
+        dependencies: &ExtensionDependencies,
     ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error>,
-    /// Validates the node-specific config statically, without creating the component.
+    /// Validates the extension-specific config without creating the component.
     pub validate_config:
         fn(config: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error>,
 }
@@ -744,6 +751,96 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         })
     }
 
+    /// Validates capability names and provider metadata without constructing components.
+    ///
+    /// This complements structural configuration validation by checking the
+    /// capabilities and extension factories linked into the current binary.
+    pub fn validate_capability_bindings(&self, config: &PipelineConfig) -> Result<(), Error> {
+        let known_capabilities: HashSet<&str> = capability::KNOWN_CAPABILITIES
+            .iter()
+            .map(|capability| capability.name)
+            .collect();
+        let mut known_names: Vec<_> = known_capabilities.iter().copied().collect();
+        known_names.sort_unstable();
+
+        let validate_bindings = |bindings: &HashMap<
+            otel_arrow_dfe_config::CapabilityId,
+            otel_arrow_dfe_config::ExtensionId,
+        >| {
+            let mut sorted_bindings: Vec<_> = bindings.iter().collect();
+            sorted_bindings.sort_unstable_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
+
+            for (capability_name, extension_id) in sorted_bindings {
+                let capability_name: &str = capability_name.as_ref();
+                if !known_capabilities.contains(capability_name) {
+                    return Err(format!(
+                        "unknown capability '{capability_name}'. Known capabilities: {known_names:?}",
+                    ));
+                }
+
+                let extension_config = config.extensions().get(extension_id).ok_or_else(|| {
+                    format!(
+                        "capability binding '{capability_name}': no extension named '{}' exists",
+                        extension_id.as_ref(),
+                    )
+                })?;
+                let extension_factory = self
+                        .get_extension_factory_map()
+                        .get(extension_config.r#type.as_str())
+                        .ok_or_else(|| {
+                            format!(
+                                "capability '{capability_name}': extension '{}' uses unknown plugin '{}'",
+                                extension_id.as_ref(),
+                                extension_config.r#type.as_str(),
+                            )
+                        })?;
+                let provides_capability =
+                    extension_factory
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|capabilities| {
+                            capabilities.local.contains(&capability_name)
+                                || capabilities.shared.contains(&capability_name)
+                        });
+                if !provides_capability {
+                    return Err(format!(
+                        "capability '{capability_name}': extension '{}' does not provide it",
+                        extension_id.as_ref(),
+                    ));
+                }
+            }
+
+            Ok(())
+        };
+
+        let mut nodes: Vec<_> = config.node_iter().collect();
+        nodes.sort_unstable_by(|(left, _), (right, _)| {
+            AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+        });
+        for (node_name, node_config) in nodes {
+            validate_bindings(&node_config.capabilities).map_err(|message| {
+                Error::CapabilityResolutionFailed {
+                    node: node_name.clone(),
+                    message,
+                }
+            })?;
+        }
+        let mut extensions: Vec<_> = config.extension_iter().collect();
+        extensions.sort_unstable_by(|(left, _), (right, _)| {
+            AsRef::<str>::as_ref(left).cmp(AsRef::<str>::as_ref(right))
+        });
+        for (extension_id, extension_config) in extensions {
+            validate_bindings(&extension_config.capabilities).map_err(|message| {
+                Error::ExtensionCapabilityResolutionFailed {
+                    extension: extension_id.clone(),
+                    message,
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Builds a runtime pipeline from the given pipeline configuration.
     ///
     /// Main phases:
@@ -776,6 +873,8 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         let mut processors = Vec::new();
         let mut exporters = Vec::new();
         let mut build_state = BuildState::new();
+
+        self.validate_capability_bindings(&config)?;
 
         let pipeline_group_id = pipeline_ctx.pipeline_group_id();
         let pipeline_id = pipeline_ctx.pipeline_id();
@@ -863,17 +962,16 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
 
         // -- Extension instantiation + capability registry build -------------
         //
-        // Run before node-wrapper creation so resolve_bindings can validate
-        // each node's `node_config.capabilities` against the populated
-        // registry, and so factories that call `require_local::<C>()` /
-        // `require_shared::<C>()` see a fully-populated `Capabilities`.
-        // Capabilities are resolved EAGERLY at build time -- node create()
-        // bodies run inside this same `build` call, so extension `start()`
-        // side effects (which happen later, in `run_forever`) cannot be
-        // observed by capability construction.
+        // Extensions are constructed in deterministic dependency layers.
+        // Each provider layer is registered before the next layer resolves
+        // its bindings. Extension factories receive independent typed,
+        // one-shot dependency scopes for their local and shared variants.
         let known_extensions: HashSet<otel_arrow_dfe_config::ExtensionId> =
             config.extensions().keys().cloned().collect();
+        let dependency_layers = extension::dependency::dependency_layers(config.extensions())?;
         let mut capability_registry = capability::registry::CapabilityRegistry::new();
+        type ExtensionVariantKey = (otel_arrow_dfe_config::ExtensionId, ExtensionVariant);
+        let mut extension_dependency_graph = DependencyGraph::<ExtensionVariantKey>::new();
         // Each entry tracks (extension id, bundle, is_background). The
         // `is_background` flag is captured here while we still have the
         // factory in hand -- Background extensions register zero
@@ -882,53 +980,130 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         // unconditionally (they are engine-driven and do not need a
         // node binding to be useful).
         let mut extension_bundles: Vec<(
+            usize,
             otel_arrow_dfe_config::ExtensionId,
             ExtensionBundle,
             bool,
             extension::wrapper::ExtensionEntityKeys,
         )> = Vec::new();
-        for (ext_id, ext_user_config) in config.extension_iter() {
-            let raw_urn = ext_user_config.r#type.as_str();
-            let factory = self
-                .get_extension_factory_map()
-                .get(raw_urn)
-                .ok_or_else(|| Error::UnknownExtension {
-                    plugin_urn: raw_urn.to_string(),
-                })?;
-            let runtime_config = ExtensionConfig::with_control_channel_capacity(
-                ext_id.clone(),
-                channel_capacity_policy.control.node,
-            );
-            let ext_ctx = pipeline_ctx.extension_context();
-            let bundle = (factory.create)(
-                &ext_ctx,
-                ext_id.clone(),
-                ext_user_config.clone(),
-                &runtime_config,
-            )
-            .map_err(|e| Error::ConfigError(Box::new(e)))?;
-            let mut bundle = bundle;
-            let entity_keys = bundle.wire_telemetry(
-                ext_id.clone(),
-                &ext_ctx,
-                &mut build_state.channel_metrics,
-                basic_runtime_metrics_enabled,
-            );
-            bundle
-                .register_into(factory.capabilities.as_ref(), &mut capability_registry)
-                .map_err(|e| Error::CapabilityRegistrationFailed {
+        for (layer_index, layer) in dependency_layers.iter().enumerate() {
+            for ext_id in layer {
+                let ext_user_config = config
+                    .extensions()
+                    .get(ext_id)
+                    .expect("dependency layers only contain configured extensions");
+                let raw_urn = ext_user_config.r#type.as_str();
+                let factory = self
+                    .get_extension_factory_map()
+                    .get(raw_urn)
+                    .ok_or_else(|| Error::UnknownExtension {
+                        plugin_urn: raw_urn.to_string(),
+                    })?;
+                let mut local_dependency_tracker = capability::registry::ConsumedTracker::new();
+                let local_capabilities = capability::registry::resolve_bindings(
+                    &ext_user_config.capabilities,
+                    &capability_registry,
+                    &known_extensions,
+                    &mut local_dependency_tracker,
+                )
+                .map_err(|e| Error::ExtensionCapabilityResolutionFailed {
                     extension: ext_id.clone(),
                     message: format!("{e}"),
                 })?;
-            let is_background = factory.capabilities.is_none();
-            extension_bundles.push((ext_id.clone(), bundle, is_background, entity_keys));
+                let mut shared_dependency_tracker = capability::registry::ConsumedTracker::new();
+                let shared_capabilities = capability::registry::resolve_bindings(
+                    &ext_user_config.capabilities,
+                    &capability_registry,
+                    &known_extensions,
+                    &mut shared_dependency_tracker,
+                )
+                .map_err(|e| Error::ExtensionCapabilityResolutionFailed {
+                    extension: ext_id.clone(),
+                    message: format!("{e}"),
+                })?;
+                let dependencies =
+                    ExtensionDependencies::new(local_capabilities, shared_capabilities);
+                let runtime_config = ExtensionConfig::with_control_channel_capacity(
+                    ext_id.clone(),
+                    channel_capacity_policy.control.node,
+                );
+                let ext_ctx = pipeline_ctx.extension_context();
+                let bundle = (factory.create)(
+                    &ext_ctx,
+                    ext_id.clone(),
+                    ext_user_config.clone(),
+                    &runtime_config,
+                    &dependencies,
+                )
+                .map_err(|e| Error::ConfigError(Box::new(e)))?;
+                let consumed_variants = |tracker: &capability::registry::ConsumedTracker| {
+                    tracker
+                        .consumed_local()
+                        .into_iter()
+                        .map(|provider| (provider, ExtensionVariant::Local))
+                        .chain(
+                            tracker
+                                .consumed_shared()
+                                .into_iter()
+                                .map(|provider| (provider, ExtensionVariant::Shared)),
+                        )
+                        .collect::<HashSet<_>>()
+                };
+                let local_dependencies = consumed_variants(&local_dependency_tracker);
+                let shared_dependencies = consumed_variants(&shared_dependency_tracker);
+                if !local_dependencies.is_empty() && bundle.local().is_none() {
+                    return Err(Error::ExtensionDependencyVariantMissing {
+                        extension: ext_id.clone(),
+                        variant: ExtensionVariant::Local.as_str(),
+                    });
+                }
+                if !shared_dependencies.is_empty() && bundle.shared().is_none() {
+                    return Err(Error::ExtensionDependencyVariantMissing {
+                        extension: ext_id.clone(),
+                        variant: ExtensionVariant::Shared.as_str(),
+                    });
+                }
+                if bundle.local().is_some() {
+                    extension_dependency_graph.add_dependencies(
+                        (ext_id.clone(), ExtensionVariant::Local),
+                        local_dependencies,
+                    );
+                }
+                if bundle.shared().is_some() {
+                    extension_dependency_graph.add_dependencies(
+                        (ext_id.clone(), ExtensionVariant::Shared),
+                        shared_dependencies,
+                    );
+                }
+                let mut bundle = bundle;
+                let entity_keys = bundle.wire_telemetry(
+                    ext_id.clone(),
+                    &ext_ctx,
+                    &mut build_state.channel_metrics,
+                    basic_runtime_metrics_enabled,
+                );
+                bundle
+                    .register_into(factory.capabilities.as_ref(), &mut capability_registry)
+                    .map_err(|e| Error::CapabilityRegistrationFailed {
+                        extension: ext_id.clone(),
+                        message: format!("{e}"),
+                    })?;
+                let is_background = factory.capabilities.is_none();
+                extension_bundles.push((
+                    layer_index,
+                    ext_id.clone(),
+                    bundle,
+                    is_background,
+                    entity_keys,
+                ));
+            }
         }
 
         // Resolve each node's bindings against the populated registry. A
         // single shared `ConsumedTracker` records consumption across all
         // nodes so the engine can prune unused extension variants after
         // the build phase.
-        let mut consumed_tracker = capability::registry::ConsumedTracker::new();
+        let mut node_consumed_tracker = capability::registry::ConsumedTracker::new();
         let mut per_node_capabilities: HashMap<NodeName, capability::registry::Capabilities> =
             HashMap::new();
         for (name, node_config) in config.node_iter() {
@@ -936,7 +1111,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                 &node_config.capabilities,
                 &capability_registry,
                 &known_extensions,
-                &mut consumed_tracker,
+                &mut node_consumed_tracker,
             )
             .map_err(|e| Error::CapabilityResolutionFailed {
                 node: name.clone(),
@@ -1093,124 +1268,91 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
         //      drop their event loop, which is exactly the work they
         //      exist to do. They're spawned in `run_forever` like Active.
         //
-        //   2. **Defined but unbound** (no node references this extension
-        //      from `node_config.capabilities`): warn + drop the entire
-        //      bundle. The author wrote an extension into the pipeline
-        //      config but no node references it -- keeping it would
-        //      waste the resources of an active lifecycle (or hold
-        //      passive state) for nothing. The warning helps debug
-        //      "why isn't my extension running?" by surfacing the
-        //      missing binding.
+        //   2. **Defined but unbound** (no node or extension references this
+        //      extension): warn + drop the entire bundle. Keeping it would
+        //      waste the resources of an active lifecycle (or hold passive
+        //      state) for nothing.
         //
         //   3. **Bound but neither variant consumed**: warn + drop the
         //      entire bundle. At least one node declared a binding to
-        //      this extension but no node's `create()` actually called
+        //      this extension but no consumer's `create()` actually called
         //      `require_*` / `optional_*` for *any* of its variants.
-        //      The warning surfaces node factories that declared a
+        //      The warning surfaces factories that declared a
         //      binding but forgot to consume it.
         //
         //   3a. **Bound and at least one variant consumed**: keep each
         //       consumed variant; silently drop the variant(s) that
-        //       weren't consumed. Dropping an unused variant when the
-        //       other is in use is a normal optimization (no node ever
-        //       wanted that path), not an error condition.
+        //       weren't consumed. Dropping an unused variant when the other
+        //       is in use is a normal optimization, not an error condition.
         //
         // A bundle's two variants (local + shared) are evaluated
         // independently in 3/3a -- a SharedAsLocal-fallback bundle
         // (shared-only) only ever populates the consumed_shared set,
         // so the local check naturally fails for it (and the bundle's
         // missing local variant is dropped accordingly).
-        let bound_extensions: HashSet<otel_arrow_dfe_config::ExtensionId> = config
-            .node_iter()
-            .flat_map(|(_, node_config)| node_config.capabilities.values().cloned())
-            .collect();
-        // Per-variant consumption: an extension's local (resp. shared)
-        // variant is considered "in use" iff at least one of the
-        // capabilities it exposes for that variant was bound by some
-        // node. Tracking presence-of-consumed (rather than
-        // presence-of-unconsumed) is required because an extension may
-        // expose multiple capabilities of the same variant -- under the
-        // unconsumed view, a single unbound capability would mask the
-        // bound ones and the whole variant would be incorrectly dropped.
-        let consumed_local: HashSet<otel_arrow_dfe_config::ExtensionId> =
-            consumed_tracker.consumed_local();
-        let consumed_shared: HashSet<otel_arrow_dfe_config::ExtensionId> =
-            consumed_tracker.consumed_shared();
-        let extension_wrappers: Vec<(
-            extension::ExtensionWrapper,
-            otel_arrow_dfe_telemetry::registry::EntityKey,
-        )> = extension_bundles
+        let bound_extensions: HashSet<otel_arrow_dfe_config::ExtensionId> =
+            config
+                .node_iter()
+                .flat_map(|(_, node_config)| node_config.capabilities.values().cloned())
+                .chain(config.extension_iter().flat_map(|(_, extension_config)| {
+                    extension_config.capabilities.values().cloned()
+                }))
+                .collect();
+        // Start from exact provider variants consumed by nodes plus each
+        // physical background variant. Following variant-scoped dependency
+        // edges keeps only the provider chain needed by a live physical
+        // consumer. A dead local or shared consumer cannot retain its own
+        // dependency branch.
+        let mut live_variants: BTreeSet<ExtensionVariantKey> = node_consumed_tracker
+            .consumed_local()
             .into_iter()
-            .flat_map(|(ext_id, mut bundle, is_background, entity_keys)| {
-                let mut kept: Vec<(
-                    extension::ExtensionWrapper,
-                    otel_arrow_dfe_telemetry::registry::EntityKey,
-                )> = Vec::new();
+            .map(|provider| (provider, ExtensionVariant::Local))
+            .chain(
+                node_consumed_tracker
+                    .consumed_shared()
+                    .into_iter()
+                    .map(|provider| (provider, ExtensionVariant::Shared)),
+            )
+            .collect();
+        for (_, ext_id, bundle, is_background, _) in &extension_bundles {
+            if !is_background {
+                continue;
+            }
+            if bundle.local().is_some() {
+                let _ = live_variants.insert((ext_id.clone(), ExtensionVariant::Local));
+            }
+            if bundle.shared().is_some() {
+                let _ = live_variants.insert((ext_id.clone(), ExtensionVariant::Shared));
+            }
+        }
+        live_variants =
+            extension_dependency_graph.reachable_dependencies(live_variants.iter().cloned());
+        let extension_shutdown_waves = extension_dependency_graph
+            .shutdown_waves(&live_variants)
+            .expect("configured extension dependencies were validated as acyclic")
+            .into_iter()
+            .map(|wave| {
+                wave.into_iter()
+                    .map(|(id, variant)| extension_monitor::ExtensionKey::new(id, variant))
+                    .collect()
+            })
+            .collect();
 
-                // Category 1: Background -- always kept, no warning.
-                if is_background {
-                    if let Some(local) = bundle.take_local() {
-                        kept.push((
-                            local,
-                            entity_keys
-                                .local
-                                .expect("wire_telemetry mints a key for every present variant"),
-                        ));
-                    }
-                    if let Some(shared) = bundle.take_shared() {
-                        kept.push((
-                            shared,
-                            entity_keys
-                                .shared
-                                .expect("wire_telemetry mints a key for every present variant"),
-                        ));
-                    }
-                    return kept;
-                }
+        let mut extension_wrappers: Vec<
+            Vec<(
+                extension::ExtensionWrapper,
+                otel_arrow_dfe_telemetry::registry::EntityKey,
+            )>,
+        > = (0..dependency_layers.len()).map(|_| Vec::new()).collect();
+        for (layer_index, ext_id, mut bundle, is_background, entity_keys) in extension_bundles {
+            let mut kept: Vec<(
+                extension::ExtensionWrapper,
+                otel_arrow_dfe_telemetry::registry::EntityKey,
+            )> = Vec::new();
 
-                // Category 2: defined but no node binds to it. Warn and
-                // drop the whole bundle (both variants if present).
-                if !bound_extensions.contains(&ext_id) {
-                    otel_warn!(
-                        "extension.unbound",
-                        message = "extension defined in pipeline config but no node binds to any of its capabilities; dropping",
-                        pipeline_group_id = pipeline_group_id.as_ref(),
-                        pipeline_id = pipeline_id.as_ref(),
-                        core_id = core_id,
-                        extension = ext_id.as_ref(),
-                    );
-                    return kept;
-                }
-
-                // Category 3 / 3a: per-variant consumption.
-                // A variant is "consumed" iff it exists in the bundle
-                // AND at least one of the extension's capabilities for
-                // that variant was bound by a node (i.e., ext_id is
-                // present in the corresponding consumed set).
-                let local_present = bundle.local().is_some();
-                let shared_present = bundle.shared().is_some();
-                let local_consumed = local_present && consumed_local.contains(&ext_id);
-                let shared_consumed = shared_present && consumed_shared.contains(&ext_id);
-
-                // Category 3: bound but no variant consumed -> warn + drop.
-                if !local_consumed && !shared_consumed {
-                    otel_warn!(
-                        "extension.unconsumed",
-                        message = "node bindings reference this extension but no node called require_*/optional_* for any of its variants; dropping",
-                        pipeline_group_id = pipeline_group_id.as_ref(),
-                        pipeline_id = pipeline_id.as_ref(),
-                        core_id = core_id,
-                        extension = ext_id.as_ref(),
-                    );
-                    return kept;
-                }
-
-                // Category 3a: at least one variant consumed. Keep the
-                // consumed variant(s); silently drop the unused one -- no
-                // warning, since the extension as a whole is in use.
-                if let Some(local) = bundle.take_local()
-                    && local_consumed
-                {
+            // Category 1: Background -- always kept, no warning.
+            if is_background {
+                if let Some(local) = bundle.take_local() {
                     kept.push((
                         local,
                         entity_keys
@@ -1218,9 +1360,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                             .expect("wire_telemetry mints a key for every present variant"),
                     ));
                 }
-                if let Some(shared) = bundle.take_shared()
-                    && shared_consumed
-                {
+                if let Some(shared) = bundle.take_shared() {
                     kept.push((
                         shared,
                         entity_keys
@@ -1228,9 +1368,61 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
                             .expect("wire_telemetry mints a key for every present variant"),
                     ));
                 }
-                kept
-            })
-            .collect();
+            } else if !bound_extensions.contains(&ext_id) {
+                // Category 2: defined but no consumer binds to it. Warn
+                // and drop the whole bundle (both variants if present).
+                otel_warn!(
+                    "extension.unbound",
+                    message = "extension defined in pipeline config but no node or extension binds to any of its capabilities; dropping",
+                    pipeline_group_id = pipeline_group_id.as_ref(),
+                    pipeline_id = pipeline_id.as_ref(),
+                    core_id = core_id,
+                    extension = ext_id.as_ref(),
+                );
+            } else {
+                // Category 3 / 3a: retain only variants consumed by a
+                // live node-or-extension dependency chain.
+                let local_present = bundle.local().is_some();
+                let shared_present = bundle.shared().is_some();
+                let local_consumed = local_present
+                    && live_variants.contains(&(ext_id.clone(), ExtensionVariant::Local));
+                let shared_consumed = shared_present
+                    && live_variants.contains(&(ext_id.clone(), ExtensionVariant::Shared));
+
+                if !local_consumed && !shared_consumed {
+                    otel_warn!(
+                        "extension.unconsumed",
+                        message = "capability bindings reference this extension but no live node or extension consumed any variant; dropping",
+                        pipeline_group_id = pipeline_group_id.as_ref(),
+                        pipeline_id = pipeline_id.as_ref(),
+                        core_id = core_id,
+                        extension = ext_id.as_ref(),
+                    );
+                } else {
+                    if let Some(local) = bundle.take_local()
+                        && local_consumed
+                    {
+                        kept.push((
+                            local,
+                            entity_keys
+                                .local
+                                .expect("wire_telemetry mints a key for every present variant"),
+                        ));
+                    }
+                    if let Some(shared) = bundle.take_shared()
+                        && shared_consumed
+                    {
+                        kept.push((
+                            shared,
+                            entity_keys
+                                .shared
+                                .expect("wire_telemetry mints a key for every present variant"),
+                        ));
+                    }
+                }
+            }
+            extension_wrappers[layer_index].extend(kept);
+        }
 
         let edges = collect_hyper_edges_runtime_from_connections(&config, &build_state)?;
 
@@ -1244,6 +1436,7 @@ impl<PData: 'static + Clone + Debug> PipelineFactory<PData> {
             processors,
             exporters,
             extension_wrappers,
+            extension_shutdown_waves,
             nodes,
             telemetry_policy,
         );
@@ -2948,6 +3141,7 @@ mod test {
             _: otel_arrow_dfe_config::ExtensionId,
             _: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
             _: &ExtensionConfig,
+            _: &ExtensionDependencies,
         ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
             unimplemented!()
         }
@@ -2990,6 +3184,7 @@ mod test {
             _: otel_arrow_dfe_config::ExtensionId,
             _: Arc<otel_arrow_dfe_config::extension::ExtensionUserConfig>,
             _: &ExtensionConfig,
+            _: &ExtensionDependencies,
         ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
             unimplemented!()
         }
@@ -3042,6 +3237,7 @@ mod test {
             name: otel_arrow_dfe_config::ExtensionId,
             _: Arc<ExtensionUserConfig>,
             _: &ExtensionConfig,
+            _: &ExtensionDependencies,
         ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
             let entity = ext_ctx.register_extension_entity(name, ExtensionVariant::Local);
             REGISTERED_ENTITY.with(|cell| cell.set(Some(entity)));
@@ -3072,7 +3268,13 @@ mod test {
         )));
         let ext_config = ExtensionConfig::with_control_channel_capacity("test_ext", 16);
 
-        let result = (factory.create)(&ctx, "test_ext".into(), user_config, &ext_config);
+        let result = (factory.create)(
+            &ctx,
+            "test_ext".into(),
+            user_config,
+            &ext_config,
+            &ExtensionDependencies::empty(),
+        );
         assert!(result.is_err());
         assert_eq!(registry.entity_count(), entities_before + 1);
 

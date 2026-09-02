@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`resolve_bindings`] -- the per-node resolution pass that validates
-//! a node's capability bindings against the registry and produces a
+//! [`resolve_bindings`] -- the per-consumer resolution pass that validates
+//! capability bindings against the registry and produces a
 //! [`Capabilities`] for consumption.
 
 use super::{
@@ -13,7 +13,7 @@ use otel_arrow_dfe_config::ExtensionId;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 
-/// Resolves a node's capability bindings against the registry.
+/// Resolves a consumer's capability bindings against the registry.
 ///
 /// For each `(capability_name, extension_name)` in the node's config:
 ///
@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 /// 4. **Specific extension provides it** -- The registry entry was registered
 ///    by `extension_name`.
 ///
-/// On success, returns a [`Capabilities`] for the node and updates the
+/// On success, returns a [`Capabilities`] for the consumer and updates the
 /// `tracker` with consumption flags.
 ///
 /// # Errors
