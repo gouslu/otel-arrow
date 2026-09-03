@@ -80,6 +80,9 @@ use otel_arrow_dfe_engine::entity_context::{
     node_entity_key, pipeline_entity_key, set_pipeline_entity_key,
 };
 use otel_arrow_dfe_engine::error::Error as EngineError;
+use otel_arrow_dfe_engine::extension::hierarchy::{
+    HierarchicalExtensionRegistry, InheritedExtensionRegistrations,
+};
 use otel_arrow_dfe_engine::listener_group::ListenerGroupSnapshot;
 use otel_arrow_dfe_engine::memory_limiter::{
     EffectiveMemoryLimiter, MemoryLimiterTick, MemoryPressureBehaviorConfig, MemoryPressureChanged,
@@ -1510,6 +1513,7 @@ impl<
         let placement_snapshot =
             Self::preflight_pipeline_placement(&pipelines, &all_cores, &topology)?;
 
+        let hierarchical_extensions = HierarchicalExtensionRegistry::default();
         let runtime = Arc::new(ControllerRuntime::new(
             self.pipeline_factory,
             controller_ctx.clone(),
@@ -1517,6 +1521,7 @@ impl<
             obs_state_handle.clone(),
             engine_evt_reporter.clone(),
             metrics_reporter.clone(),
+            hierarchical_extensions.clone(),
             declared_topics,
             all_cores.clone(),
             topology,
@@ -1558,6 +1563,110 @@ impl<
         collector_ready_rx.recv().map_err(|_| {
             Error::from(otel_arrow_dfe_telemetry::error::Error::MetricsCollectorNotRunning)
         })?;
+
+        // Engine and group extensions are instantiated once on a dedicated
+        // controller-owned LocalSet. Their shared capability catalog is
+        // published only after every active extension passes startup and
+        // readiness barriers, before any pipeline thread can resolve bindings.
+        let hierarchy_config = engine_config.clone();
+        let hierarchy_controller_ctx = controller_ctx.clone();
+        let hierarchy_metrics_reporter = metrics_reporter.clone();
+        let hierarchy_registry = hierarchical_extensions.clone();
+        let hierarchy_pipeline_factory = self.pipeline_factory;
+        let hierarchy_runtime = Arc::downgrade(&runtime);
+        let (hierarchy_ready_tx, hierarchy_ready_rx) =
+            std_mpsc::sync_channel::<Result<(), String>>(1);
+        let hierarchical_extension_handle = spawn_thread_local_task(
+            "hierarchical-extensions",
+            telemetry_system.engine_tracing_setup(),
+            move |cancellation_token| async move {
+                let prepared = match hierarchy_pipeline_factory.prepare_hierarchical_extensions(
+                    &hierarchy_config,
+                    &hierarchy_controller_ctx,
+                    hierarchy_metrics_reporter,
+                    hierarchy_registry,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = hierarchy_ready_tx.send(Err(message));
+                        return Err(Error::PipelineRuntimeError {
+                            source: Box::new(error),
+                        });
+                    }
+                };
+                let running = match prepared.start().await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = hierarchy_ready_tx.send(Err(message));
+                        return Err(Error::PipelineRuntimeError {
+                            source: Box::new(error),
+                        });
+                    }
+                };
+                if hierarchy_ready_tx.send(Ok(())).is_err() {
+                    return Ok(());
+                }
+
+                running
+                    .run(cancellation_token.cancelled_owned(), move |message| {
+                        otel_error!(
+                            "controller.hierarchical_extension_runtime_failed",
+                            error = message.as_str(),
+                            message = "An engine or pipeline-group extension failed; requesting engine shutdown"
+                        );
+                        if let Some(runtime) = hierarchy_runtime.upgrade() {
+                            runtime.record_fatal_runtime_error(message);
+                            if let Err(shutdown_error) = runtime.control_plane().shutdown_all(10) {
+                                otel_warn!(
+                                    "controller.hierarchical_extension_shutdown_failed",
+                                    error = format!("{shutdown_error:?}")
+                                );
+                            }
+                            runtime.release_instance_wait();
+                        }
+                    })
+                    .await
+                    .map_err(|error| Error::PipelineRuntimeError {
+                        source: Box::new(error),
+                    })
+            },
+        )?;
+        match hierarchy_ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                let host_error = hierarchical_extension_handle
+                    .shutdown_and_join()
+                    .err()
+                    .unwrap_or_else(|| Error::PipelineRuntimeError {
+                        source: Box::new(std::io::Error::other(message)),
+                    });
+                if let Err(error) = metrics_agg_handle.shutdown_and_join() {
+                    otel_warn!(
+                        "controller.hierarchical_extension_startup_metrics_shutdown_failed",
+                        error = error.to_string()
+                    );
+                }
+                return Err(host_error);
+            }
+            Err(error) => {
+                let host_error = hierarchical_extension_handle
+                    .shutdown_and_join()
+                    .err()
+                    .unwrap_or_else(|| Error::PipelineRuntimeError {
+                        source: Box::new(error),
+                    });
+                if let Err(error) = metrics_agg_handle.shutdown_and_join() {
+                    otel_warn!(
+                        "controller.hierarchical_extension_startup_metrics_shutdown_failed",
+                        error = error.to_string()
+                    );
+                }
+                return Err(host_error);
+            }
+        }
+        let mut hierarchical_extension_handle = Some(hierarchical_extension_handle);
 
         // Pipeline threads receive only a Weak handle back to the controller runtime. That lets
         // them report their terminal exit without becoming owners that keep the runtime alive
@@ -1695,6 +1804,10 @@ impl<
             );
 
             for placement in &pipeline_placement.cores {
+                let inherited_extensions = runtime.inherited_extensions_for_pipeline(
+                    &pipeline_entry.pipeline_group_id,
+                    &pipeline_entry.pipeline,
+                );
                 // Pass a Weak runtime handle into each pipeline thread. The thread upgrades it
                 // only when it needs to report Success/Error/Panic on exit, and silently skips
                 // that late report if shutdown has already dropped the runtime.
@@ -1716,6 +1829,7 @@ impl<
                     pipeline_entry.policies.transport_headers.clone(),
                     pipeline_entry.policies.rate_limiters.clone(),
                     pipeline_entry.policies.rate_limiter_scope.clone(),
+                    inherited_extensions,
                     controller_ctx.clone(),
                     metrics_reporter.clone(),
                     engine_evt_reporter.clone(),
@@ -1778,6 +1892,14 @@ impl<
                         message = "Timed out waiting for pipelines and system observability to stop after controller extension startup failed"
                     );
                 }
+                if let Some(handle) = hierarchical_extension_handle.take()
+                    && let Err(stop_err) = handle.shutdown_and_join()
+                {
+                    otel_warn!(
+                        "controller.extension_startup_hierarchical_extension_shutdown_failed",
+                        error = stop_err.to_string()
+                    );
+                }
                 return Err(err);
             }
         };
@@ -1800,6 +1922,18 @@ impl<
                 )
             },
         )?;
+
+        // A hierarchy failure can race with initial pipeline registration. The
+        // failure callback shuts down the instances visible at that moment; a
+        // second idempotent pass after startup closes the registration window.
+        if runtime.has_fatal_runtime_error()
+            && let Err(error) = control_plane.shutdown_all(10)
+        {
+            otel_warn!(
+                "controller.hierarchical_extension_late_shutdown_failed",
+                error = format!("{error:?}")
+            );
+        }
 
         if run_mode == RunMode::ShutdownWhenDone {
             runtime.wait_until_all_producer_instances_exit();
@@ -1865,6 +1999,12 @@ impl<
             }
         }
 
+        // Pipelines stop before their ancestor extensions so no capability
+        // handle can outlive the declaration-scope lifecycle it references.
+        let hierarchical_extension_error = hierarchical_extension_handle
+            .take()
+            .and_then(|handle| handle.shutdown_and_join().err());
+
         // All telemetry producers and pipelines have finished; shut down the
         // remaining support tasks and the metric aggregator gracefully.
         admin_server_handle.shutdown_and_join()?;
@@ -1876,6 +2016,10 @@ impl<
         }
 
         if let Some(err) = controller_extension_error {
+            return Err(err);
+        }
+
+        if let Some(err) = hierarchical_extension_error {
             return Err(err);
         }
 
@@ -2546,6 +2690,7 @@ impl<
         transport_headers_policy: Option<TransportHeadersPolicy>,
         rate_limiter_policies: BTreeMap<String, RateLimiterPolicy>,
         rate_limiter_scope: Option<otel_arrow_dfe_config::policy::RateLimiterDeclarationScope>,
+        inherited_extensions: InheritedExtensionRegistrations,
         controller_ctx: ControllerContext,
         metrics_reporter: MetricsReporter,
         engine_evt_reporter: ObservedEventReporter,
@@ -2608,6 +2753,7 @@ impl<
                         transport_headers_policy,
                         rate_limiter_policies,
                         rate_limiter_scope,
+                        inherited_extensions,
                         telemetry_reporting_interval,
                         pipeline_factory,
                         pipeline_ctx,
@@ -2681,6 +2827,13 @@ impl<
         let pipeline_config = observability_pipeline.pipeline;
 
         let internal_telemetry_settings = telemetry_system.internal_telemetry_settings();
+        let runtime = runtime
+            .upgrade()
+            .expect("controller runtime should exist while spawning observability pipeline");
+        let inherited_extensions = runtime.inherited_extensions_for_pipeline(
+            &observability_key.pipeline_group_id,
+            &pipeline_config,
+        );
 
         // Create a channel to signal startup success/failure
         let (startup_tx, startup_rx) = std_mpsc::sync_channel::<Result<(), EngineError>>(1);
@@ -2697,6 +2850,7 @@ impl<
             None,
             BTreeMap::new(),
             None,
+            inherited_extensions,
             controller_ctx.clone(),
             metrics_reporter.clone(),
             engine_evt_reporter.clone(),
@@ -2704,11 +2858,8 @@ impl<
             telemetry_reporting_interval,
             memory_pressure_tx.clone(),
             config,
-            runtime
-                .upgrade()
-                .expect("controller runtime should exist while spawning observability pipeline")
-                .declared_topics(),
-            runtime,
+            runtime.declared_topics(),
+            Arc::downgrade(&runtime),
             0,
             Some((internal_telemetry_settings, startup_tx)),
         )?;
@@ -2748,6 +2899,7 @@ impl<
         transport_headers_policy: Option<TransportHeadersPolicy>,
         rate_limiter_policies: BTreeMap<String, RateLimiterPolicy>,
         rate_limiter_scope: Option<otel_arrow_dfe_config::policy::RateLimiterDeclarationScope>,
+        inherited_extensions: InheritedExtensionRegistrations,
         telemetry_reporting_interval: Duration,
         pipeline_factory: &'static PipelineFactory<PData>,
         pipeline_context: PipelineContext,
@@ -2800,7 +2952,7 @@ impl<
                 .map(|(settings, _)| settings)
                 .cloned();
             let runtime_pipeline = pipeline_factory
-                .build(
+                .build_with_inherited_extensions(
                     pipeline_context.clone(),
                     pipeline_config.clone(),
                     channel_capacity_policy,
@@ -2809,6 +2961,7 @@ impl<
                     rate_limiter_policies,
                     rate_limiter_scope,
                     internal_telemetry_settings,
+                    inherited_extensions,
                 )
                 .map_err(|e| {
                     if let Some((_, startup_tx)) = internal_telemetry.as_ref() {

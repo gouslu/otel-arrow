@@ -75,6 +75,8 @@ pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::
     engine_event_reporter: ObservedEventReporter,
     /// Metrics reporter cloned into launched runtime instances.
     metrics_reporter: MetricsReporter,
+    /// Shared capability catalogs for engine and pipeline-group extensions.
+    hierarchical_extensions: HierarchicalExtensionRegistry,
     /// Topic registry shared by all runtime instances.
     declared_topics: DeclaredTopics<PData>,
     /// Controller-wide core ids available for policy-based allocation.
@@ -127,6 +129,7 @@ impl<
         observed_state_handle: ObservedStateHandle,
         engine_event_reporter: ObservedEventReporter,
         metrics_reporter: MetricsReporter,
+        hierarchical_extensions: HierarchicalExtensionRegistry,
         declared_topics: DeclaredTopics<PData>,
         available_core_ids: Vec<CoreId>,
         topology: NumaTopology,
@@ -143,6 +146,7 @@ impl<
             observed_state_handle,
             engine_event_reporter,
             metrics_reporter,
+            hierarchical_extensions,
             declared_topics,
             available_core_ids,
             topology,
@@ -234,6 +238,16 @@ impl<
     /// Returns the declared-topic registry shared with launched pipelines.
     pub(super) fn declared_topics(&self) -> &DeclaredTopics<PData> {
         &self.declared_topics
+    }
+
+    /// Resolves the shared ancestor providers visible from one pipeline.
+    pub(super) fn inherited_extensions_for_pipeline(
+        &self,
+        pipeline_group_id: &PipelineGroupId,
+        pipeline: &PipelineConfig,
+    ) -> InheritedExtensionRegistrations {
+        self.hierarchical_extensions
+            .registrations_for_pipeline(pipeline_group_id, pipeline.extensions())
     }
 
     /// Exposes the runtime as the admin control-plane trait object.

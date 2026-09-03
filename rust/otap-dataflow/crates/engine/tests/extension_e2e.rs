@@ -26,8 +26,12 @@
 //! 5. **Shutdown ordering** -- extensions receive
 //!    `ExtensionControlMsg::Shutdown` only after data-path nodes have
 //!    drained.
+//! 6. **Hierarchical inheritance** -- engine and group extension scopes
+//!    publish shared providers that descendant pipeline nodes resolve with
+//!    nearest-scope shadowing.
 
 use async_trait::async_trait;
+use otel_arrow_dfe_config::engine::OtelDataflowSpec;
 use otel_arrow_dfe_config::observed_state::{ObservedStateSettings, SendPolicy};
 use otel_arrow_dfe_config::pipeline::PipelineConfig;
 use otel_arrow_dfe_config::policy::{
@@ -47,6 +51,7 @@ use otel_arrow_dfe_engine::control::{
 };
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
+use otel_arrow_dfe_engine::extension::hierarchy::HierarchicalExtensionRegistry;
 use otel_arrow_dfe_engine::extension::{EffectHandler, ExtensionBundle, ExtensionWrapper};
 use otel_arrow_dfe_engine::local::exporter as local_exp;
 use otel_arrow_dfe_engine::local::processor as local_proc;
@@ -2183,6 +2188,335 @@ connections:
         Some("passive-noop"),
         "name from passive-cloned extension is observable to the consumer"
     );
+}
+
+/// Scenario: engine and group scopes declare the same extension ID, and a
+/// descendant receiver binds the provided capability.
+/// Guarantees: the hierarchy host publishes the nearest group provider and the
+/// pipeline builder resolves it without a pipeline-local extension declaration.
+#[test]
+fn hierarchical_extensions_resolve_nearest_ancestor_into_pipeline() {
+    let probe_key = "hierarchical-inheritance";
+    let probe = make_probe(probe_key, CallSequence::Local);
+    let config = OtelDataflowSpec::from_yaml(&format!(
+        r#"
+version: otel_dataflow/v1
+extensions:
+  inherited:
+    type: "{PASSIVE_EXTENSION_URN}"
+groups:
+  test-group:
+    extensions:
+      inherited:
+        type: "{DUAL_EXTENSION_URN}"
+    pipelines:
+      test-pipeline:
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: "{probe_key}"
+            capabilities:
+              no_op_stateless: inherited
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+"#
+    ))
+    .expect("hierarchical engine config should parse and validate");
+    let group_id = PipelineGroupId::from("test-group");
+    let pipeline_id = PipelineId::from("test-pipeline");
+    let pipeline = config.groups[&group_id].pipelines[&pipeline_id].clone();
+
+    let telemetry_system = InternalTelemetrySystem::default();
+    let controller_ctx = ControllerContext::new(telemetry_system.registry());
+    let pipeline_ctx = controller_ctx.pipeline_context_with(group_id.clone(), pipeline_id, 0, 1, 0);
+    let registry = HierarchicalExtensionRegistry::default();
+    let prepared = TEST_PIPELINE_FACTORY
+        .prepare_hierarchical_extensions(
+            &config,
+            &controller_ctx,
+            telemetry_system.reporter(),
+            registry.clone(),
+        )
+        .expect("hierarchical extension host should prepare");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let local_set = tokio::task::LocalSet::new();
+    local_set.block_on(&runtime, async move {
+        let running = prepared
+            .start()
+            .await
+            .expect("hierarchical extension host should start");
+        let inherited = registry.registrations_for_pipeline(&group_id, pipeline.extensions());
+        let _runtime_pipeline = TEST_PIPELINE_FACTORY
+            .build_with_inherited_extensions(
+                pipeline_ctx,
+                pipeline,
+                ChannelCapacityPolicy::default(),
+                TelemetryPolicy::default(),
+                None,
+                std::collections::BTreeMap::new(),
+                None,
+                None,
+                inherited,
+            )
+            .expect("descendant pipeline should resolve inherited capability");
+        running
+            .run(async {}, |error| {
+                panic!("hierarchical extension host failed: {error}")
+            })
+            .await
+            .expect("hierarchical extension host should stop cleanly");
+    });
+
+    assert_eq!(probe.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.first_call_succeeded.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe.captured_name.lock().as_deref(),
+        Some("dual-noop"),
+        "the group declaration should shadow the engine declaration"
+    );
+}
+
+/// Scenario: multiple pipelines in different groups consume one engine-scoped
+/// cloned provider, while group and pipeline declarations shadow that provider.
+/// Guarantees: engine descendants share one Arc-backed state root, and each
+/// shadowing declaration creates an independent root for its own descendants.
+#[test]
+fn hierarchical_cloned_state_is_shared_across_descendants_and_split_by_shadowing() {
+    let engine_counter_key = "hierarchy-engine-counter";
+    let group_counter_key = "hierarchy-group-counter";
+    let pipeline_counter_key = "hierarchy-pipeline-counter";
+    let engine_counter = Arc::new(AtomicU64::new(0));
+    let group_counter = Arc::new(AtomicU64::new(0));
+    let pipeline_counter = Arc::new(AtomicU64::new(0));
+    register_shared_counter_probe(
+        engine_counter_key,
+        SharedCounterProbe {
+            counter: Arc::clone(&engine_counter),
+        },
+    );
+    register_shared_counter_probe(
+        group_counter_key,
+        SharedCounterProbe {
+            counter: Arc::clone(&group_counter),
+        },
+    );
+    register_shared_counter_probe(
+        pipeline_counter_key,
+        SharedCounterProbe {
+            counter: Arc::clone(&pipeline_counter),
+        },
+    );
+
+    let engine_a = make_probe("hierarchy-engine-a", CallSequence::SharedStatefulIncrement);
+    let engine_b = make_probe("hierarchy-engine-b", CallSequence::SharedStatefulIncrement);
+    let group_shadow_a = make_probe(
+        "hierarchy-group-shadow-a",
+        CallSequence::SharedStatefulIncrement,
+    );
+    let group_shadow_b = make_probe(
+        "hierarchy-group-shadow-b",
+        CallSequence::SharedStatefulIncrement,
+    );
+    let pipeline_shadow = make_probe(
+        "hierarchy-pipeline-shadow",
+        CallSequence::SharedStatefulIncrement,
+    );
+    let config = OtelDataflowSpec::from_yaml(&format!(
+        r#"
+version: otel_dataflow/v1
+extensions:
+  shared-state:
+    type: "{SHARED_COUNTER_SHARED_EXTENSION_URN}"
+    config:
+      probe_key: "{engine_counter_key}"
+groups:
+  group-a:
+    pipelines:
+      pipeline-a:
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: hierarchy-engine-a
+            capabilities:
+              no_op_stateful: shared-state
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+  group-b:
+    pipelines:
+      pipeline-b:
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: hierarchy-engine-b
+            capabilities:
+              no_op_stateful: shared-state
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+  shadow-group:
+    extensions:
+      shared-state:
+        type: "{SHARED_COUNTER_SHARED_EXTENSION_URN}"
+        config:
+          probe_key: "{group_counter_key}"
+    pipelines:
+      group-provider:
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: hierarchy-group-shadow-a
+            capabilities:
+              no_op_stateful: shared-state
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+      group-provider-b:
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: hierarchy-group-shadow-b
+            capabilities:
+              no_op_stateful: shared-state
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+      pipeline-provider:
+        extensions:
+          shared-state:
+            type: "{SHARED_COUNTER_SHARED_EXTENSION_URN}"
+            config:
+              probe_key: "{pipeline_counter_key}"
+        nodes:
+          receiver:
+            type: "{PROBE_RECEIVER_URN}"
+            config:
+              probe_key: hierarchy-pipeline-shadow
+            capabilities:
+              no_op_stateful: shared-state
+          exporter:
+            type: "{NOOP_EXPORTER_URN}"
+        connections:
+          - from: receiver
+            to: exporter
+"#
+    ))
+    .expect("hierarchical state-sharing config should parse and validate");
+
+    let telemetry_system = InternalTelemetrySystem::default();
+    let controller_ctx = ControllerContext::new(telemetry_system.registry());
+    let registry = HierarchicalExtensionRegistry::default();
+    let prepared = TEST_PIPELINE_FACTORY
+        .prepare_hierarchical_extensions(
+            &config,
+            &controller_ctx,
+            telemetry_system.reporter(),
+            registry.clone(),
+        )
+        .expect("hierarchical extension host should prepare");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let local_set = tokio::task::LocalSet::new();
+    local_set.block_on(&runtime, async move {
+        let running = prepared
+            .start()
+            .await
+            .expect("hierarchical extension host should start");
+        let mut runtime_pipelines = Vec::new();
+        for (group, pipeline) in [
+            ("group-a", "pipeline-a"),
+            ("group-b", "pipeline-b"),
+            ("shadow-group", "group-provider"),
+            ("shadow-group", "group-provider-b"),
+            ("shadow-group", "pipeline-provider"),
+        ] {
+            let group_id = PipelineGroupId::from(group);
+            let pipeline_id = PipelineId::from(pipeline);
+            let pipeline_config = config.groups[&group_id].pipelines[&pipeline_id].clone();
+            let inherited =
+                registry.registrations_for_pipeline(&group_id, pipeline_config.extensions());
+            let pipeline_ctx = controller_ctx.pipeline_context_with(group_id, pipeline_id, 0, 1, 0);
+            let runtime_pipeline = TEST_PIPELINE_FACTORY
+                .build_with_inherited_extensions(
+                    pipeline_ctx,
+                    pipeline_config,
+                    ChannelCapacityPolicy::default(),
+                    TelemetryPolicy::default(),
+                    None,
+                    std::collections::BTreeMap::new(),
+                    None,
+                    None,
+                    inherited,
+                )
+                .expect("descendant pipeline should resolve its nearest provider");
+            runtime_pipelines.push(runtime_pipeline);
+        }
+        drop(runtime_pipelines);
+        running
+            .run(async {}, |error| {
+                panic!("hierarchical extension host failed: {error}")
+            })
+            .await
+            .expect("hierarchical extension host should stop cleanly");
+    });
+
+    let mut engine_returns = [
+        engine_a
+            .stateful_increment_return
+            .lock()
+            .expect("group-a pipeline should increment engine state"),
+        engine_b
+            .stateful_increment_return
+            .lock()
+            .expect("group-b pipeline should increment engine state"),
+    ];
+    engine_returns.sort_unstable();
+    assert_eq!(engine_returns, [1, 2]);
+    assert_eq!(engine_counter.load(Ordering::SeqCst), 2);
+    let mut group_returns = [
+        group_shadow_a
+            .stateful_increment_return
+            .lock()
+            .expect("first group pipeline should increment group state"),
+        group_shadow_b
+            .stateful_increment_return
+            .lock()
+            .expect("second group pipeline should increment group state"),
+    ];
+    group_returns.sort_unstable();
+    assert_eq!(group_returns, [1, 2]);
+    assert_eq!(group_counter.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        pipeline_shadow
+            .stateful_increment_return
+            .lock()
+            .as_ref()
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(pipeline_counter.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------

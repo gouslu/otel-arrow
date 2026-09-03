@@ -18,10 +18,10 @@ pub type ControlChannel = crate::extension::ControlChannel<SharedReceiver<Extens
 
 /// A trait for extensions (Send variant).
 ///
-/// Extensions are long-lived components hosted alongside the data path --
-/// today at pipeline scope, and in the future at engine, pipeline-group,
-/// or node scope -- that expose functionality (e.g., authentication,
-/// service discovery) to other components.
+/// Extensions are long-lived components that expose functionality
+/// (e.g., authentication or service discovery) to other components.
+/// Shared variants may be hosted at engine, pipeline-group, or pipeline
+/// scope.
 ///
 /// Unlike receivers, processors, and exporters, extensions are NOT generic
 /// over PData -- they never process PData.

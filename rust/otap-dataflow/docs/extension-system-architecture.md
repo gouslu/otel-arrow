@@ -2,50 +2,41 @@
 
 ## Overview
 
-This document describes the proposed Phase 1 architecture
+This document describes the implemented Phase 1 and Phase 2 architecture
 for the extension system in the OTAP dataflow engine,
 building on the [extension system proposal](
 extension-requirements.md) which establishes the vision, goals, and
 phased rollout plan.
 
-A working proof of concept is available on the
-[PoC branch](https://github.com/gouslu/otel-arrow/tree/gouslu/extension-system-p1-local-shared).
-
 ### How this document relates to the proposal
 
 The proposal defines *what* the extension system should do
 and *why*. This document describes *how* each requirement
-is addressed in the Phase 1 implementation:
+is addressed in the implementation:
 
-| Proposal Requirement | Phase 1 Approach |
+| Proposal Requirement | Implementation |
 | --- | --- |
 | Capability-based access | `#[capability]` proc macro generates typed traits; consumers resolve via `require_local()` / `require_shared()` |
 | Multiple implementations of same capability | `CapabilityRegistry` keyed by `(extension_name, TypeId)` -- different extensions can provide the same capability |
 | Multiple configured instances | `extensions:` section in YAML, each with a unique name; nodes bind by name in `capabilities:` |
-| Existing config model integration | Extensions are siblings to `nodes` in the pipeline config hierarchy |
-| Preserve performance model (thread-per-core) | Local extensions use `Rc<RefCell<T>>` for shared state (no locks); shared extensions use `Clone + Send` with `Arc`-wrapped state. Both are still instantiated per pipeline instance (per core) at pipeline scope -- see *Pipeline-scoped extensions are per-core* below. |
+| Existing config model integration | Extensions may be declared at engine, group, or pipeline scope |
+| Preserve performance model (thread-per-core) | Pipeline-local variants remain per-core; engine/group providers distribute prebuilt shared factories without hot-path lookup |
 | Background tasks | Active extensions get their own event loop via `Extension::start()` |
 | Explicit capability binding | Nodes declare `capabilities: { name: extension_instance }` -- no implicit discovery |
 | No hot-path registry lookup | Capabilities resolved once at factory time; nodes hold typed handles for their lifetime |
-| Future hierarchical scopes | `CapabilityRegistry` and `resolve_bindings()` are scope-agnostic by design |
+| Hierarchical scopes | Lexical engine/group/pipeline catalogs use nearest-declaration shadowing and a dedicated higher-scope host |
 
 Beyond the proposal's requirements, the design rests on
 four additional principles:
 
-- **Pipeline-scoped extensions are per-core.** Both local
-  and shared pipeline-scoped extensions are instantiated
-  **per pipeline instance** (i.e., per core). The
-  local/shared distinction at pipeline scope is about type
-  constraints (`!Send` vs `Send + Clone`), not about
-  cross-core sharing. This follows a consistent principle:
-  **an extension's sharing boundary is determined by the
-  scope it is declared in**, not by its execution model.
-  Pipeline is the only scope in Phase 1; broader scopes
-  (group, engine) and narrower scopes (node-set, node) are
-  future work and will each define their own sharing
-  boundary. The execution model (local vs shared)
-  determines only the type constraints imposed on the
-  implementation.
+- **Declaration scope determines the sharing boundary.**
+  Pipeline-scoped extensions are instantiated per pipeline
+  instance (per core) and may provide local, shared, or dual
+  variants. Engine- and group-scoped declarations are
+  constructed once by the hierarchy host and must provide a
+  shared variant. Descendant pipelines receive clones of the
+  declaration scope's `SharedInstanceFactory`; no extension
+  object or registry lock is shared on the data-path hot path.
 - **Active/Passive lifecycle distinction.** Not every
   extension needs a background task. Extensions that only
   provide capabilities are marked *Passive* -- no task is
@@ -122,96 +113,114 @@ struct MyExtension {
 
 ## What Are Extensions?
 
-Extensions are standalone pipeline components that provide
+Extensions are standalone engine components that provide
 **shared, cross-cutting capabilities** -- such as
 authentication, storage etc. -- to
-data-path nodes (receivers, processors, exporters). They
-are configured as siblings to `nodes`, not as nodes
-themselves, and they never touch pipeline data directly.
+data-path nodes (receivers, processors, exporters). They may
+be configured at engine, pipeline-group, or pipeline scope.
+They are not nodes and never touch pipeline data directly.
+
+## Hierarchical Scopes and Configuration
+
+The declaration hierarchy is lexical:
+
+1. A pipeline declaration shadows a same-named group or engine declaration.
+2. A group declaration shadows a same-named engine declaration.
+3. Sibling groups and sibling pipelines are never visible.
+4. The engine observability pipeline can see engine-scoped extensions, but no
+   user pipeline-group scope.
+
+```yaml
+version: otel_dataflow/v1
+
+extensions:
+  fleet_auth:
+    type: urn:example:extension:auth
+
+groups:
+  ingest:
+    extensions:
+      tenant_store:
+        type: urn:example:extension:store
+
+    pipelines:
+      traces:
+        extensions:
+          pipeline_override:
+            type: urn:example:extension:auth
+
+        nodes:
+          exporter:
+            type: urn:example:exporter:backend
+            capabilities:
+              auth: fleet_auth
+              store: tenant_store
+```
+
+Top-level `extensions:` is distinct from
+`engine.controller.extensions`. Controller extensions receive controller
+handles and are not capability providers for pipeline nodes. There is no
+`engine.extensions` configuration path.
+
+Engine and group scopes accept only shared variants:
+
+- shared-only bundles are hosted normally;
+- dual bundles retain the shared variant and discard the local variant;
+- local-only bundles fail startup.
+
+Pipeline scope continues to support local-only, shared-only, and dual bundles.
 
 ## Architecture Overview
 
 ```text
-+----------------------------------------------------------+
-|                     Pipeline Engine                      |
-|                                                          |
-|  +-------------------+  +-------------------+            |
-|  | Extension A       |  | Extension B       |  ...       |
-|  | Active(auth)      |  | Passive(kv store) |            |
-|  | local + shared    |  | shared only       |            |
-|  | lifecycle         |  | no task spawned   |            |
-|  +---------+---------+  +---------+---------+            |
-|            | #[capability] proc macro                    |
-|            | + extension_capabilities!() macro           |
-|            v                                             |
-|  +----------------------------+                          |
-|  |    CapabilityRegistry      |  (built once per         |
-|  |  local_handles HashMap     |   pipeline)              |
-|  |  shared_handles HashMap    |                          |
-|  +----+-----------------+-----+                          |
-|       | resolve_bindings|                                |
-|       v                 v                                |
-|  +-----------+  +-----------+                            |
-|  | Receiver  |  | Exporter  |                            |
-|  | require   |  | require   |                            |
-|  | _local()  |  | _shared() |                            |
-|  | -> Box<T> |  | -> Box<T> |                            |
-|  +-----------+  +-----------+                            |
-|                                                          |
-|  Local consumers get Box<dyn local::Trait>               |
-|  Shared consumers get Box<dyn shared::Trait>             |
-|  Shared capability trait objects are Send + Sync         |
-+----------------------------------------------------------+
++------------------------------------------------------------------+
+|                         Controller                               |
+|                                                                  |
+|  hierarchical-extensions thread                                  |
+|  +--------------------+       +-------------------------------+   |
+|  | Engine extensions  | ----> | Group extension scopes        |   |
+|  | shared variants    |       | shared variants, concurrent   |   |
+|  +----------+---------+       +---------------+---------------+   |
+|             | immutable SharedInstanceFactory catalog          |   |
+|             +------------------------+--------------------------+   |
+|                                      v                              |
+|  pipeline thread per core                                          |
+|  +--------------------------------------------------------------+  |
+|  | inherited shared registrations                               |  |
+|  |        + pipeline-local extension registrations              |  |
+|  |                         |                                    |  |
+|  |                         v                                    |  |
+|  |                CapabilityRegistry                            |  |
+|  |                         | resolve once                       |  |
+|  |                         v                                    |  |
+|  |                  receivers/processors/exporters              |  |
+|  +--------------------------------------------------------------+  |
++------------------------------------------------------------------+
 ```
 
 ## Key Design Decisions
 
-1. **Extensions start first, shut down last.** Active
-   extensions are spawned before data-path nodes. At
-   shutdown, extensions terminate only after all data-path
-   nodes have drained. Passive extensions (no lifecycle)
-   skip spawning entirely.
+1. **Startup and shutdown use scope barriers.**
 
-   *Scope of the guarantee.* This orders **lifecycle
-   calls**, not init completion. `start()` is async, so
-   invoking it merely enqueues a future; the extension's
-   init body runs concurrently with the data path once
-   polling begins. Capability *construction* happens at
-   build time (before any spawn), so structural wiring is
-   always in place. However, if an extension performs
-   deferred async init in `start()` (opening a
-   connection, loading config, warming a cache),
-   capability consumers may observe the pre-init state
-   until that work completes. Today, extensions handle
-   this themselves -- e.g., produce final state at
-   capability construction time, or have the capability
-   surface a not-ready error/default until init has
-   progressed.
+   Startup proceeds in this order:
 
-   *Future consideration.* If an extension genuinely
-   needs an init-complete guarantee before the data path
-   runs, the framework can later add an opt-in readiness
-   probe so participating extensions can block data-path
-   spawn until they signal ready, while non-participating
-   extensions keep today's behavior unchanged.
+   1. Construct and spawn all engine-scoped shared variants.
+   2. Wait for their spawn and opt-in readiness probes.
+   3. Construct and spawn every group scope concurrently.
+   4. Wait for the combined group spawn/readiness barrier.
+   5. Publish the immutable inherited-provider catalog.
+   6. Start pipelines. Each pipeline starts its local extensions and waits for
+      their opt-in readiness before starting data-path nodes.
 
-   *Runtime cost.* `start()` runs on the same per-core
-   async runtime as the data path -- the runtime that
-   drives every node, channel, and extension on this
-   core. Blocking calls (synchronous I/O, lock
-   contention, file reads without `tokio::fs`) and
-   CPU-heavy work (compression, large
-   serialization/deserialization, cryptographic
-   operations) inside `start()` -- or inside any
-   capability method dispatched on that runtime --
-   stall every other future on the core, including the
-   data path itself. Extensions that need such work
-   must move it off the per-core runtime: a bounded
-   `tokio::task::spawn_blocking` for blocking I/O, a
-   dedicated worker thread for sustained CPU work, or
-   a Rayon pool for parallel compute. The same
-   guidance applies to background extensions, whose
-   `start()` body shares the same runtime.
+   A timeout or early extension exit fails the level and prevents descendant
+   scopes from starting. Shutdown reverses the ownership order: pipelines stop
+   first, all group scopes stop concurrently, and engine extensions stop last.
+
+   Higher-scope lifecycle tasks run on one dedicated OS thread with a
+   current-thread Tokio runtime and `LocalSet`. Pipeline-scoped lifecycle tasks
+   continue to run on their pipeline's per-core runtime. Blocking or sustained
+   CPU work must be moved to bounded blocking workers or dedicated worker
+   threads in either host.
 
 2. **PData-free.** Extensions are completely decoupled from
    the pipeline data type. They use `ExtensionControlMsg`
@@ -232,7 +241,7 @@ themselves, and they never touch pipeline data directly.
    / `.passive()` for engine-driven services that expose
    no capability -- periodic reporters, schedulers, health
    monitors, global rate-limit coordinators. The builder
-   shape is `.background().shared(impl_)` or
+   shape is    `.background().shared(impl_)` or, at pipeline scope,
    `.background().local(Rc::new(impl_))` followed by
    `.build()`; exactly one registration is required and a
    second is unrepresentable in the typestate. The choice
@@ -299,6 +308,9 @@ themselves, and they never touch pipeline data directly.
      -- no lifecycle; each consumer invokes the stored
      constructor closure.
 
+   Engine and group declarations retain only the shared side of these shapes.
+   A local-only bundle at either scope is a configuration error.
+
 7. **Type-safe capability resolution.** Consumers call
    `capabilities.require_local::<BearerTokenProvider>()`
    (returns `Box<dyn local::BearerTokenProvider>`) or
@@ -348,6 +360,8 @@ engine/src/
     builder.rs              -> Typestate builder: ActiveStage,
                               PassiveStage, PassiveClonedStage,
                               PassiveConstructedStage
+    hierarchy.rs            -> engine/group host, immutable inherited
+                              catalogs, scope barriers, lexical shadowing
     wrapper.rs              -> ExtensionWrapper variants,
                               ControlChannel, EffectHandler
     tests.rs                -> extension-level tests
@@ -397,3 +411,32 @@ Concrete capabilities (e.g. `bearer_token_provider`,
 subsequent PRs; the `capability/` tree above holds only the
 registry infrastructure and the sealed
 `ExtensionCapability` trait.
+
+## State Propagation Across Scopes
+
+The declaration scope owns the configured prototype. With cloned instance
+policy, `SharedInstanceFactory` captures that prototype and each descendant
+catalog receives a clone of the factory closure. If the implementation stores
+mutable state behind `Arc`, lifecycle work and all descendant capability
+handles observe the same state. Plain fields are copied normally.
+
+Constructed policy intentionally calls the provider's constructor for every
+consumer, so it does not imply shared mutable state. A shadowing declaration
+creates a new root prototype; otherwise the nearest ancestor's root propagates
+downward.
+
+## Live Reconfiguration
+
+The engine/group hierarchy catalog is immutable after process startup. Live
+reconciliation therefore:
+
+- rejects top-level extension changes;
+- rejects changes to extension declarations on existing groups;
+- rejects creating a group with extensions;
+- rejects deleting a group that owns hosted extensions;
+- rejects changes to the effective control-channel capacity or telemetry policy
+  of a scope that owns hosted extensions.
+
+These operations require an engine restart. Pipeline-local extension changes
+remain supported, and replacement pipelines may continue binding to providers
+already hosted by their lexical ancestors.

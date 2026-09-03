@@ -290,6 +290,24 @@ impl ControllerContext {
         self.telemetry_registry_handle.clone()
     }
 
+    /// Returns an extension context hosted once for the engine.
+    #[must_use]
+    pub fn engine_extension_context(&self) -> ExtensionContext {
+        ExtensionContext::new(self.clone(), ExtensionScopeAttributeSet::engine())
+    }
+
+    /// Returns an extension context hosted once for a pipeline group.
+    #[must_use]
+    pub fn pipeline_group_extension_context(
+        &self,
+        pipeline_group_id: PipelineGroupId,
+    ) -> ExtensionContext {
+        ExtensionContext::new(
+            self.clone(),
+            ExtensionScopeAttributeSet::group(pipeline_group_id),
+        )
+    }
+
     /// Returns the shared process-wide memory pressure state.
     #[must_use]
     pub fn memory_pressure_state(&self) -> MemoryPressureState {
@@ -1218,6 +1236,77 @@ mod tests {
         assert!(
             !rendered.contains("custom="),
             "nodes without custom attributes must not emit a custom attribute: {rendered}"
+        );
+    }
+
+    /// Scenario: an engine-scoped extension registers its telemetry entity.
+    /// Guarantees: the entity identifies the shared variant and engine scope
+    /// while emitting each descendant identity key exactly once with its
+    /// default value.
+    #[test]
+    fn engine_extension_context_registers_engine_scope_identity() {
+        let registry = TelemetryRegistryHandle::new();
+        let context = ControllerContext::new(registry.clone()).engine_extension_context();
+        let key = context.register_extension_entity(
+            Cow::Borrowed("root-auth"),
+            crate::extension::wrapper::ExtensionVariant::Shared,
+        );
+
+        let attributes = registry
+            .visit_entity(key, |attributes| {
+                attributes
+                    .iter_attributes()
+                    .map(|(key, value)| (key, value.to_string_value()))
+                    .collect::<Vec<_>>()
+            })
+            .expect("engine extension entity should be registered");
+        assert!(attributes.contains(&("extension.id", "root-auth".to_owned())));
+        assert!(attributes.contains(&("extension.variant", "shared".to_owned())));
+        assert!(attributes.contains(&("scope.kind", "engine".to_owned())));
+        assert!(attributes.contains(&("pipeline.group.id", String::new())));
+        assert!(attributes.contains(&("pipeline.id", String::new())));
+        assert_eq!(
+            attributes
+                .iter()
+                .filter(|(key, _)| *key == "pipeline.group.id")
+                .count(),
+            1
+        );
+    }
+
+    /// Scenario: a pipeline-group-scoped extension registers its telemetry
+    /// entity.
+    /// Guarantees: the entity carries the owning group and group scope while
+    /// retaining an empty pipeline ID and no duplicate group dimension.
+    #[test]
+    fn group_extension_context_registers_group_scope_identity() {
+        let registry = TelemetryRegistryHandle::new();
+        let context = ControllerContext::new(registry.clone())
+            .pipeline_group_extension_context(PipelineGroupId::from("ingest"));
+        let key = context.register_extension_entity(
+            Cow::Borrowed("group-store"),
+            crate::extension::wrapper::ExtensionVariant::Shared,
+        );
+
+        let attributes = registry
+            .visit_entity(key, |attributes| {
+                attributes
+                    .iter_attributes()
+                    .map(|(key, value)| (key, value.to_string_value()))
+                    .collect::<Vec<_>>()
+            })
+            .expect("group extension entity should be registered");
+        assert!(attributes.contains(&("extension.id", "group-store".to_owned())));
+        assert!(attributes.contains(&("extension.variant", "shared".to_owned())));
+        assert!(attributes.contains(&("scope.kind", "group".to_owned())));
+        assert!(attributes.contains(&("pipeline.group.id", "ingest".to_owned())));
+        assert!(attributes.contains(&("pipeline.id", String::new())));
+        assert_eq!(
+            attributes
+                .iter()
+                .filter(|(key, _)| *key == "pipeline.group.id")
+                .count(),
+            1
         );
     }
 }

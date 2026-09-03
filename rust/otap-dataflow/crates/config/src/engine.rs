@@ -14,7 +14,7 @@ use crate::extension::ExtensionUserConfig;
 use crate::health::HealthPolicy;
 use crate::observed_state::ObservedStateSettings;
 use crate::pipeline::telemetry::TelemetryConfig;
-use crate::pipeline::{PipelineConfig, PipelineConnection, PipelineNodes};
+use crate::pipeline::{PipelineConfig, PipelineConnection, PipelineExtensions, PipelineNodes};
 use crate::pipeline_group::PipelineGroupConfig;
 use crate::policy::{ChannelCapacityPolicy, Policies, TelemetryPolicy};
 use crate::topic::{TopicImplSelectionPolicy, TopicSpec};
@@ -51,6 +51,10 @@ pub struct OtelDataflowSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topics: HashMap<TopicName, TopicSpec>,
 
+    /// Engine-scoped extension declarations visible to every pipeline.
+    #[serde(default, skip_serializing_if = "PipelineExtensions::is_empty")]
+    pub extensions: PipelineExtensions,
+
     /// Engine-wide runtime declarations.
     #[serde(default)]
     pub engine: EngineConfig,
@@ -72,6 +76,7 @@ impl OtelDataflowSpec {
     #[must_use]
     pub fn redacted_for_snapshot(&self) -> OtelDataflowSpec {
         let mut redacted = self.clone();
+        redacted.extensions = redacted.extensions.redacted_for_snapshot();
         redacted.engine = redacted.engine.redacted_for_snapshot();
         for group in redacted.groups.values_mut() {
             *group = group.redacted_for_snapshot();
@@ -542,6 +547,123 @@ groups:
         assert!(
             original_json.contains("Bearer super-secret-token"),
             "original spec must retain the cleartext credential"
+        );
+    }
+
+    /// Scenario: root and group extension configurations contain authentication
+    /// headers exposed through the config snapshot API.
+    /// Guarantees: snapshot redaction masks both hierarchy levels without
+    /// modifying the controller's stored configuration.
+    #[test]
+    fn redacted_for_snapshot_masks_hierarchical_extension_headers() {
+        let yaml = r#"
+version: otel_dataflow/v1
+extensions:
+  root_auth:
+    type: "urn:test:extension:auth"
+    config:
+      headers:
+        authorization: "root-secret-value"
+groups:
+  default:
+    extensions:
+      group_auth:
+        type: "urn:test:extension:auth"
+        config:
+          headers:
+            authorization: "group-secret-value"
+"#;
+        let spec: OtelDataflowSpec = serde_yaml::from_str(yaml).expect("spec should deserialize");
+        let redacted = spec.redacted_for_snapshot();
+
+        let redacted_json = serde_json::to_string(&redacted).expect("redacted spec serializes");
+        assert!(!redacted_json.contains("root-secret-value"));
+        assert!(!redacted_json.contains("group-secret-value"));
+        assert!(redacted_json.contains(crate::node::REDACTED_HEADER_VALUE));
+
+        let original_json = serde_json::to_string(&spec).expect("spec serializes");
+        assert!(original_json.contains("root-secret-value"));
+        assert!(original_json.contains("group-secret-value"));
+    }
+
+    /// Scenario: a pipeline binds capabilities to one engine extension and one
+    /// extension declared by its containing group.
+    /// Guarantees: both lexical ancestors are accepted as visible providers and
+    /// preserved in the parsed hierarchy.
+    #[test]
+    fn from_yaml_accepts_capability_bindings_to_ancestor_extensions() {
+        let yaml = r#"
+version: otel_dataflow/v1
+extensions:
+  root_auth:
+    type: "urn:test:extension:auth"
+groups:
+  default:
+    extensions:
+      group_store:
+        type: "urn:test:extension:kv"
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+          exporter:
+            type: "urn:test:exporter:example"
+            capabilities:
+              bearer_token_provider: root_auth
+              key_value_store: group_store
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let spec = OtelDataflowSpec::from_yaml(yaml)
+            .expect("ancestor capability bindings should validate");
+
+        assert!(spec.extensions.contains_key("root_auth"));
+        assert!(
+            spec.groups["default"]
+                .extensions
+                .contains_key("group_store")
+        );
+    }
+
+    /// Scenario: a pipeline binds a capability to an extension declared only by
+    /// a sibling pipeline group.
+    /// Guarantees: sibling group declarations are not visible and validation
+    /// reports the inaccessible extension name.
+    #[test]
+    fn from_yaml_rejects_capability_binding_to_sibling_group_extension() {
+        let yaml = r#"
+version: otel_dataflow/v1
+groups:
+  owner:
+    extensions:
+      private_auth:
+        type: "urn:test:extension:auth"
+  consumer:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+          exporter:
+            type: "urn:test:exporter:example"
+            capabilities:
+              bearer_token_provider: private_auth
+        connections:
+          - from: receiver
+            to: exporter
+"#;
+        let error = OtelDataflowSpec::from_yaml(yaml)
+            .expect_err("sibling group extension binding should fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains("private_auth"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("visible from the pipeline scope"),
+            "unexpected error: {message}"
         );
     }
 

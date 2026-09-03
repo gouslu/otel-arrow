@@ -103,7 +103,8 @@ pub struct NodeUserConfig {
     /// Capability bindings mapping capability names to extension instance names.
     ///
     /// Each entry maps a capability (e.g., `bearer_token_provider`) to the name
-    /// of an extension instance declared in the pipeline's `extensions` section.
+    /// of an extension visible from the pipeline's lexical engine/group/pipeline
+    /// scope.
     ///
     /// Example:
     /// ```yaml

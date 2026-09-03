@@ -6,12 +6,17 @@ use async_trait::async_trait;
 use otel_arrow_dfe_config::engine::ResolvedPipelineRole;
 use otel_arrow_dfe_config::observed_state::ObservedStateSettings;
 use otel_arrow_dfe_config::settings::telemetry::logs::LogLevel;
-use otel_arrow_dfe_engine::config::{ExporterConfig, ProcessorConfig, ReceiverConfig};
+use otel_arrow_dfe_engine::capability::ExtensionCapabilities;
+use otel_arrow_dfe_engine::config::{
+    ExporterConfig, ExtensionConfig, ProcessorConfig, ReceiverConfig,
+};
+use otel_arrow_dfe_engine::context::ExtensionContext;
 use otel_arrow_dfe_engine::control::{
     NodeControlMsg, RuntimeControlMsg, RuntimeCtrlMsgReceiver, runtime_ctrl_msg_channel,
 };
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
+use otel_arrow_dfe_engine::extension::ExtensionBundle;
 use otel_arrow_dfe_engine::listener_group::ListenerProtocol;
 use otel_arrow_dfe_engine::local::{exporter, receiver};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
@@ -20,7 +25,7 @@ use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_engine::topology::NumaTopology;
 use otel_arrow_dfe_engine::wiring_contract::WiringContract;
-use otel_arrow_dfe_engine::{ExporterFactory, ProcessorFactory, ReceiverFactory};
+use otel_arrow_dfe_engine::{ExporterFactory, ExtensionFactory, ProcessorFactory, ReceiverFactory};
 use otel_arrow_dfe_state::pipeline_status::PipelineStatus;
 use otel_arrow_dfe_telemetry::TracingSetup;
 use otel_arrow_dfe_telemetry::event::EngineEvent;
@@ -224,11 +229,34 @@ static TEST_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
     },
 ];
 
+fn test_hierarchy_extension_create(
+    _context: &ExtensionContext,
+    _name: ExtensionId,
+    _user_config: Arc<ExtensionUserConfig>,
+    _runtime_config: &ExtensionConfig,
+) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
+    panic!("live-control planning tests must not instantiate extensions")
+}
+
+static TEST_EXTENSION_FACTORIES: &[ExtensionFactory] = &[ExtensionFactory {
+    name: "urn:test:extension:hierarchy-shared",
+    description: "shared extension for hierarchy-aware live-control tests",
+    documentation_url: "",
+    capabilities: Some(ExtensionCapabilities {
+        shared: &["bearer_token_provider"],
+        local: &[],
+        register_shared: |_, _, _| Ok(()),
+        register_local: |_, _, _| Ok(()),
+    }),
+    create: test_hierarchy_extension_create,
+    validate_config: test_validate_config,
+}];
+
 static TEST_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
     TEST_RECEIVER_FACTORIES,
     TEST_PROCESSOR_FACTORIES,
     TEST_EXPORTER_FACTORIES,
-    &[],
+    TEST_EXTENSION_FACTORIES,
 );
 
 static RECOVERY_TEST_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
@@ -341,6 +369,7 @@ fn test_runtime_with_log_filter_and_topology(
             observed_state_handle,
             engine_event_reporter,
             metrics_reporter,
+            HierarchicalExtensionRegistry::default(),
             declared_topics,
             available_core_ids(),
             topology,
@@ -3670,6 +3699,96 @@ fn create_group_rejects_payload_with_pipelines() {
     assert!(runtime.group_details_snapshot(&group_id).is_none());
 }
 
+/// Scenario: a control-plane caller submits a group-create payload containing
+/// an extension declaration.
+/// Guarantees: live group creation rejects the request because higher-scope
+/// extensions are owned by the process-lifetime hierarchy host.
+#[test]
+fn create_group_rejects_payload_with_extensions() {
+    let config = empty_engine_config();
+    let runtime = test_runtime(&config);
+    let group: PipelineGroupConfig = serde_yaml::from_str(
+        r#"
+extensions:
+  auth:
+    type: urn:test:extension:auth
+"#,
+    )
+    .expect("group config should parse");
+
+    let error = runtime
+        .create_group("g1", group)
+        .expect_err("group extensions should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message == "pipeline group creation with extensions requires an engine restart"
+    ));
+    assert!(
+        !runtime
+            .engine_config_snapshot()
+            .groups
+            .contains_key(&PipelineGroupId::from("g1"))
+    );
+}
+
+/// Scenario: a live pipeline replacement binds a capability to an
+/// engine-scoped extension already hosted by the controller.
+/// Guarantees: rollout planning validates the candidate in its full lexical
+/// hierarchy instead of rejecting the ancestor provider as pipeline-local.
+#[test]
+fn prepare_rollout_plan_accepts_ancestor_extension_binding() {
+    let config = OtelDataflowSpec::from_yaml(&format!(
+        r#"
+version: otel_dataflow/v1
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+groups:
+  g1:
+    pipelines:
+      p1:
+{}
+"#,
+        simple_pipeline_yaml()
+    ))
+    .expect("config should parse");
+    let runtime = test_runtime(&config);
+    let pipeline: PipelineConfig = serde_yaml::from_str(
+        r#"
+nodes:
+  receiver:
+    type: urn:test:receiver:example
+    capabilities:
+      bearer_token_provider: root_auth
+  exporter:
+    type: urn:test:exporter:example
+connections:
+  - from: receiver
+    to: exporter
+"#,
+    )
+    .expect("candidate pipeline should parse structurally with its ancestor binding");
+
+    let plan = runtime
+        .prepare_rollout_plan(
+            "g1",
+            "p1",
+            &ReconfigureRequest {
+                pipeline,
+                step_timeout_secs: 5,
+                drain_timeout_secs: 5,
+            },
+        )
+        .expect("ancestor capability binding should be valid during rollout");
+
+    assert_eq!(
+        plan.resolved_pipeline.pipeline.nodes()["receiver"].capabilities["bearer_token_provider"],
+        "root_auth"
+    );
+}
+
 /// Scenario: a control-plane caller deletes a stopped logical pipeline.
 /// Guarantees: the pipeline is removed from committed live config and the
 /// containing group remains available as an empty group.
@@ -3852,6 +3971,42 @@ fn delete_group_removes_empty_group_from_live_config() {
     );
 }
 
+/// Scenario: a control-plane caller attempts to delete a pipeline group that
+/// owns a hosted extension.
+/// Guarantees: deletion is rejected before changing committed config because
+/// stopping that scope requires an engine restart.
+#[test]
+fn delete_group_rejects_group_with_hosted_extensions() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    extensions:
+      auth:
+        type: urn:test:extension:auth
+"#,
+    )
+    .expect("config should parse");
+    let runtime = test_runtime(&config);
+
+    let error = runtime
+        .request_delete_group("g1", 5)
+        .expect_err("hosted group extensions should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message.contains("hosted extensions requires an engine restart")
+    ));
+    assert!(
+        runtime
+            .engine_config_snapshot()
+            .groups
+            .contains_key(&PipelineGroupId::from("g1"))
+    );
+}
+
 /// Scenario: a control-plane caller deletes a group containing stopped
 /// pipelines.
 /// Guarantees: the runtime deletes each pipeline in deterministic order and
@@ -3940,6 +4095,178 @@ fn reconcile_engine_config_reports_noop_for_matching_live_config() {
             .groups
             .contains_key(&PipelineGroupId::from("g1"))
     );
+}
+
+/// Scenario: full-config reconciliation changes the root extension
+/// declarations while the hierarchy host is running.
+/// Guarantees: the request is rejected with restart guidance before component
+/// lookup or any live config mutation.
+#[test]
+fn reconcile_engine_config_rejects_top_level_extension_mutation() {
+    let config = empty_engine_config();
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+extensions:
+  auth:
+    type: urn:test:extension:auth
+"#,
+    )
+    .expect("desired config should parse");
+    let runtime = test_runtime(&config);
+
+    let error = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("root extension mutation should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message.contains("restart the engine to change top-level extensions")
+    ));
+    assert!(runtime.engine_config_snapshot().extensions.is_empty());
+}
+
+/// Scenario: full-config reconciliation changes the extension declarations of
+/// an existing pipeline group.
+/// Guarantees: the request is rejected with restart guidance and the hosted
+/// group declaration remains unchanged.
+#[test]
+fn reconcile_engine_config_rejects_existing_group_extension_mutation() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    extensions:
+      auth:
+        type: urn:test:extension:auth
+        config:
+          audience: original
+"#,
+    )
+    .expect("config should parse");
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+groups:
+  g1:
+    extensions:
+      auth:
+        type: urn:test:extension:auth
+        config:
+          audience: changed
+"#,
+    )
+    .expect("desired config should parse");
+    let runtime = test_runtime(&config);
+
+    let error = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("group extension mutation should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message.contains("restart the engine to change group extensions")
+    ));
+    assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: full-config reconciliation changes a channel-capacity policy
+/// used by an engine-scoped extension while leaving its declaration unchanged.
+/// Guarantees: the request requires restart instead of publishing policy state
+/// that disagrees with the already-running hierarchy host.
+#[test]
+fn reconcile_engine_config_rejects_engine_extension_runtime_policy_mutation() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  channel_capacity:
+    control:
+      node: 8
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("config should parse");
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  channel_capacity:
+    control:
+      node: 16
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("desired config should parse");
+    let runtime = test_runtime(&config);
+
+    let error = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("hosted engine-extension policy mutation should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message.contains("runtime policies used by hosted engine extensions")
+    ));
+    assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: a top-level policy inherited by a group-scoped extension changes
+/// during full-config reconciliation.
+/// Guarantees: effective group-host runtime settings remain immutable even
+/// when the changed value is declared by an ancestor policy scope.
+#[test]
+fn reconcile_engine_config_rejects_group_extension_inherited_policy_mutation() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  channel_capacity:
+    control:
+      node: 8
+groups:
+  g1:
+    extensions:
+      group_auth:
+        type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("config should parse");
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  channel_capacity:
+    control:
+      node: 16
+groups:
+  g1:
+    extensions:
+      group_auth:
+        type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("desired config should parse");
+    let runtime = test_runtime(&config);
+
+    let error = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect_err("hosted group-extension policy mutation should require restart");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::InvalidRequest { ref message }
+            if message.contains("hosted extensions in pipeline group `g1`")
+    ));
+    assert_eq!(runtime.engine_config_snapshot(), config);
 }
 
 /// Scenario: successful full-config reconciliation changes the configured log level.

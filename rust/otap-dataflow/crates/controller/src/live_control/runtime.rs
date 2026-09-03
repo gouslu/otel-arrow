@@ -100,6 +100,10 @@ impl<
             core_id,
             deployment_generation,
         };
+        let inherited_extensions = self.inherited_extensions_for_pipeline(
+            &resolved_pipeline.pipeline_group_id,
+            &resolved_pipeline.pipeline,
+        );
         let launched = Controller::<PData>::launch_pipeline_thread(
             self.pipeline_factory,
             deployed_key.clone(),
@@ -113,6 +117,7 @@ impl<
             resolved_pipeline.policies.transport_headers.clone(),
             resolved_pipeline.policies.rate_limiters.clone(),
             resolved_pipeline.policies.rate_limiter_scope.clone(),
+            inherited_extensions,
             self.controller_context.clone(),
             self.metrics_reporter.clone(),
             self.engine_event_reporter.clone(),
@@ -1753,6 +1758,26 @@ impl<
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_instances
             == 0
+    }
+
+    /// Records a fatal controller-owned runtime error for final teardown.
+    pub(crate) fn record_fatal_runtime_error(&self, message: String) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.first_error.is_none() {
+            state.first_error = Some(message);
+        }
+    }
+
+    /// Returns whether teardown has a fatal runtime error to surface.
+    pub(crate) fn has_fatal_runtime_error(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .first_error
+            .is_some()
     }
 
     /// Restores system observability senders if the coordinator could not start.

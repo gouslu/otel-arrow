@@ -107,9 +107,10 @@ impl OtelDataflowSpec {
             });
         } else {
             let pipeline_cfg = observability_pipeline.clone().into_pipeline_config();
-            if let Err(e) = pipeline_cfg.validate(
+            if let Err(e) = pipeline_cfg.validate_with_visible_extensions(
                 &SYSTEM_PIPELINE_GROUP_ID.into(),
                 &SYSTEM_OBSERVABILITY_PIPELINE_ID.into(),
+                |extension_id| self.extensions.contains_key(extension_id),
             ) {
                 errors.push(e);
             }
@@ -156,7 +157,9 @@ impl OtelDataflowSpec {
                 });
                 continue;
             }
-            if let Err(e) = pipeline_group.validate(pipeline_group_id) {
+            if let Err(e) =
+                pipeline_group.validate_with_engine_extensions(pipeline_group_id, &self.extensions)
+            {
                 errors.push(e);
             }
             if pipeline_group

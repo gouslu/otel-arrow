@@ -22,6 +22,7 @@ use crate::extension_monitor::{
 };
 use crate::terminal_state::TerminalMetricsDeadline;
 use futures::FutureExt;
+use futures::future::LocalBoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use otel_arrow_dfe_telemetry::otel_warn;
 use otel_arrow_dfe_telemetry::registry::EntityKey;
@@ -75,7 +76,49 @@ impl ExtensionLifecycle {
         metrics_reporter: MetricsReporter,
         terminal_metrics_deadline: TerminalMetricsDeadline,
         ext_ctx: &ExtensionContext,
+        monitor: ExtensionMetricsMonitor,
+    ) -> Self {
+        Self::spawn_with(
+            extensions,
+            metrics_reporter,
+            terminal_metrics_deadline,
+            ext_ctx,
+            monitor,
+            |future| local_tasks.spawn_local(future),
+        )
+    }
+
+    /// Spawn extensions on the [`LocalSet`] currently driving this task.
+    ///
+    /// This is used by controller-owned extension hosts whose setup runs from
+    /// inside an existing `LocalSet`, where a direct reference to that set is
+    /// intentionally not threaded through the host API.
+    pub(crate) fn spawn_current(
+        extensions: Vec<(ExtensionWrapper, EntityKey)>,
+        metrics_reporter: MetricsReporter,
+        terminal_metrics_deadline: TerminalMetricsDeadline,
+        ext_ctx: &ExtensionContext,
+        monitor: ExtensionMetricsMonitor,
+    ) -> Self {
+        Self::spawn_with(
+            extensions,
+            metrics_reporter,
+            terminal_metrics_deadline,
+            ext_ctx,
+            monitor,
+            task::spawn_local,
+        )
+    }
+
+    fn spawn_with(
+        extensions: Vec<(ExtensionWrapper, EntityKey)>,
+        metrics_reporter: MetricsReporter,
+        terminal_metrics_deadline: TerminalMetricsDeadline,
+        ext_ctx: &ExtensionContext,
         mut monitor: ExtensionMetricsMonitor,
+        mut spawn_task: impl FnMut(
+            LocalBoxFuture<'static, (ExtensionKey, Result<(), Error>)>,
+        ) -> JoinHandle<(ExtensionKey, Result<(), Error>)>,
     ) -> Self {
         let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
             FuturesUnordered::new();
@@ -144,7 +187,7 @@ impl ExtensionLifecycle {
                 drop(control_sender);
                 (task_key, res)
             };
-            let handle = local_tasks.spawn_local(fut);
+            let handle = spawn_task(fut.boxed_local());
             let _ = task_id_to_key.insert(handle.id(), key.clone());
             futures.push(handle);
             let _ = pending_starts.insert(key);

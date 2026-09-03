@@ -451,11 +451,12 @@ impl IntoIterator for PipelineNodes {
     }
 }
 
-/// A collection of pipeline extensions, keyed by extension ID.
+/// A collection of extension declarations, keyed by extension ID.
 ///
 /// Mirrors [`PipelineNodes`] but uses [`ExtensionUserConfig`] instead of
 /// [`NodeUserConfig`], reflecting that extensions have a simpler configuration
-/// model (no output ports, wiring, or header policies).
+/// model (no output ports, wiring, or header policies). The collection is
+/// reused at engine, pipeline-group, and pipeline scope.
 ///
 /// Deserialization rejects duplicate extension IDs (see
 /// [`Self::deserialize`]) so a config that accidentally repeats an
@@ -541,6 +542,16 @@ impl PipelineExtensions {
     /// Returns an iterator over extension IDs.
     pub fn keys(&self) -> impl Iterator<Item = &ExtensionId> {
         self.0.keys()
+    }
+
+    /// Returns a clone with every extension's credential header values redacted.
+    #[must_use]
+    pub fn redacted_for_snapshot(&self) -> PipelineExtensions {
+        let mut redacted = self.clone();
+        for extension in redacted.0.values_mut() {
+            *extension = Arc::new(extension.redacted_for_snapshot());
+        }
+        redacted
     }
 }
 
@@ -654,9 +665,7 @@ impl PipelineConfig {
         for node in redacted.nodes.0.values_mut() {
             *node = Arc::new(node.redacted_for_snapshot());
         }
-        for extension in redacted.extensions.0.values_mut() {
-            *extension = Arc::new(extension.redacted_for_snapshot());
-        }
+        redacted.extensions = redacted.extensions.redacted_for_snapshot();
         redacted
     }
 
@@ -818,6 +827,19 @@ impl PipelineConfig {
         pipeline_group_id: &PipelineGroupId,
         pipeline_id: &PipelineId,
     ) -> Result<(), Error> {
+        self.validate_with_visible_extensions(pipeline_group_id, pipeline_id, |extension_id| {
+            self.extensions.contains_key(extension_id)
+        })
+    }
+
+    /// Validates this pipeline using the extension declarations visible from
+    /// its position in the engine configuration hierarchy.
+    pub(crate) fn validate_with_visible_extensions(
+        &self,
+        pipeline_group_id: &PipelineGroupId,
+        pipeline_id: &PipelineId,
+        extension_exists: impl Fn(&str) -> bool,
+    ) -> Result<(), Error> {
         let mut errors = Vec::new();
 
         // Validate node-level transport header policy fields.
@@ -833,7 +855,7 @@ impl PipelineConfig {
             &mut errors,
         );
 
-        self.validate_capability_bindings(&mut errors);
+        self.validate_capability_bindings(&extension_exists, &mut errors);
 
         if !errors.is_empty() {
             Err(Error::InvalidConfiguration { errors })
@@ -842,19 +864,21 @@ impl PipelineConfig {
         }
     }
 
-    /// Validates that every capability binding references an extension that
-    /// exists in the `extensions:` section, and that extensions themselves
-    /// do not declare capability bindings (they provide capabilities, not
-    /// consume them).
-    fn validate_capability_bindings(&self, errors: &mut Vec<Error>) {
+    /// Validates that every capability binding references an extension visible
+    /// from this pipeline's lexical configuration scope.
+    fn validate_capability_bindings(
+        &self,
+        extension_exists: &impl Fn(&str) -> bool,
+        errors: &mut Vec<Error>,
+    ) {
         // Check that capability bindings on nodes reference valid extensions
         for (node_id, node_config) in self.nodes.iter() {
             for (capability_name, extension_name) in &node_config.capabilities {
-                if !self.extensions.contains_key(extension_name.as_ref()) {
+                if !extension_exists(extension_name.as_ref()) {
                     errors.push(Error::InvalidUserConfig {
                         error: format!(
                             "Node '{}' binds capability '{}' to extension '{}', \
-                             but no extension with that name exists in the `extensions` section.",
+                             but no extension with that name is visible from the pipeline scope.",
                             node_id.as_ref(),
                             capability_name,
                             extension_name,
@@ -3132,10 +3156,10 @@ connections:
         );
     }
 
+    /// Scenario: a pipeline group declares a shared extension beside its pipelines.
+    /// Guarantees: group-level extensions deserialize into the hierarchy scope.
     #[test]
-    fn test_extensions_at_group_level_rejected_by_serde() {
-        // PipelineGroupConfig uses #[serde(deny_unknown_fields)],
-        // so `extensions:` at the group level is rejected by deserialization.
+    fn test_extensions_at_group_level_accepted_by_serde() {
         let yaml = r#"
 pipelines:
   main:
@@ -3151,12 +3175,9 @@ extensions:
   auth:
     type: "urn:test:extension:auth"
 "#;
-        let result: Result<crate::pipeline_group::PipelineGroupConfig, _> =
-            serde_yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "extensions at group level should be rejected by serde"
-        );
+        let group: crate::pipeline_group::PipelineGroupConfig =
+            serde_yaml::from_str(yaml).expect("group-level extensions should deserialize");
+        assert!(group.extensions.contains_key("auth"));
     }
 
     #[test]

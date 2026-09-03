@@ -17,6 +17,7 @@
 //! [`shared::extension`](crate::shared::extension).
 
 pub mod builder;
+pub mod hierarchy;
 pub mod readiness;
 pub mod wrapper;
 

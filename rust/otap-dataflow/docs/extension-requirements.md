@@ -145,37 +145,41 @@ This approach improves:
 The extension system integrates directly into the engine's configuration
 hierarchy.
 
-For phase 1, extensions are declared at the **pipeline level** and consumed by
-nodes within that pipeline.
+Extensions may be declared at the **engine**, **pipeline-group**, or
+**pipeline** level and consumed by nodes in descendant pipelines.
 
 Example:
 
 ```yaml
 version: otel_dataflow/v1
 
+extensions:
+  fleet_auth:
+    type: extension:oidc_auth
+    config:
+      issuer: https://accounts.example.com
+
 groups:
   continuous_benchmark:
+    extensions:
+      tenant_auth:
+        type: extension:basic_auth
+        config:
+          file: /etc/auth/tokens.yaml
+
     pipelines:
       sut:
-
         extensions:
-
-          oidc_auth_main:
+          pipeline_auth:
             type: extension:oidc_auth
             config:
-              issuer: https://accounts.example.com
-
-          local_auth:
-            type: extension:basic_auth
-            config:
-              file: /etc/auth/tokens.yaml
+              issuer: https://pipeline.example.com
 
         nodes:
-
           otlp_recv1:
             type: receiver:otlp
             capabilities:
-              auth_check: oidc_auth_main
+              auth_check: fleet_auth
             config:
               protocols:
                 grpc:
@@ -184,7 +188,7 @@ groups:
           otlp_recv2:
             type: receiver:otlp
             capabilities:
-              auth_check: local_auth
+              auth_check: tenant_auth
             config:
               protocols:
                 grpc:
@@ -192,7 +196,9 @@ groups:
 ```
 
 This model keeps extension usage explicit and consistent with the existing
-`groups -> pipelines -> nodes` structure.
+`groups -> pipelines -> nodes` structure. Resolution is lexical: pipeline
+declarations shadow group declarations, group declarations shadow engine
+declarations, and sibling scopes are not visible.
 
 ## User Experience
 
@@ -360,6 +366,29 @@ The supported model is declared by the extension provider implementation.
 > "per-pipeline-instance, ready to be hoisted to a broader scope without code
 > changes" rather than "one instance for the whole engine".
 
+### Phase 2 - Engine and Group Scopes
+
+Engine-scoped extensions are declared in the root `extensions:` collection.
+Group-scoped extensions are declared in `groups.<group>.extensions`. Both
+scopes are hosted once outside pipeline threads and support only shared
+variants:
+
+| Declaration Scope | Supported Variants | Sharing Boundary |
+|-------------------|--------------------|------------------|
+| engine            | shared             | all descendant pipelines |
+| pipeline group    | shared             | descendant pipelines in that group |
+| pipeline          | local and/or shared | one pipeline instance per core |
+
+A dual local/shared bundle declared above pipeline scope retains only its
+shared variant. A local-only bundle fails startup. With cloned instance policy,
+all descendant capability handles derive from the same configured prototype,
+so `Arc`-backed state is genuinely shared across cores and pipelines. With
+constructed policy, each consumer still receives a fresh instance.
+
+Higher-scope startup uses ordered readiness barriers: engine extensions become
+ready first, then all group scopes initialize concurrently, then pipelines may
+start. Shutdown reverses that order.
+
 ### Local Execution Model Advantages
 
 Local execution allows extension implementations to remain **thread-local**.
@@ -394,12 +423,17 @@ Features:
 
 ### Phase 2 - Hierarchical Extensions
 
-Adds:
+Implemented features:
 
 * extension declarations at
 
   * top/engine-level
   * group-level
+* lexical visibility and nearest-scope shadowing
+* shared state propagation across descendant pipeline instances
+* ordered readiness and shutdown barriers
+* restart-required live-update rules for higher-scope declarations and their
+  effective control-channel and telemetry policies
 
 Possible future distributed scope.
 
@@ -539,7 +573,7 @@ A typical pattern is:
 
 ### 6. Shared scopes should avoid making every call cross-core
 
-For non-local `pipeline` scope and future broader scopes, implementations should
+For non-local `pipeline` scope and broader engine/group scopes, implementations should
 avoid designs where every capability call requires cross-core communication.
 
 A better pattern is usually:

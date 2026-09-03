@@ -345,6 +345,17 @@ pub enum Error {
         plugin_urn: String,
     },
 
+    /// An extension declared above pipeline scope has no shared variant.
+    #[error(
+        "Extension `{extension}` declared at {scope} scope must provide a shared variant; engine and pipeline-group scopes support shared extensions only"
+    )]
+    HierarchicalExtensionRequiresShared {
+        /// The configured extension identifier.
+        extension: ExtensionId,
+        /// Human-readable declaration scope.
+        scope: String,
+    },
+
     /// Capability registration failed for an extension.
     #[error("Failed to register capabilities for extension `{extension}`: {message}")]
     CapabilityRegistrationFailed {
@@ -633,6 +644,9 @@ impl Error {
             Error::UnknownExporter { .. } => "UnknownExporter",
             Error::ExtensionAlreadyExists { .. } => "ExtensionAlreadyExists",
             Error::UnknownExtension { .. } => "UnknownExtension",
+            Error::HierarchicalExtensionRequiresShared { .. } => {
+                "HierarchicalExtensionRequiresShared"
+            }
             Error::CapabilityRegistrationFailed { .. } => "CapabilityRegistrationFailed",
             Error::CapabilityResolutionFailed { .. } => "CapabilityResolutionFailed",
             Error::UnknownNode { .. } => "UnknownNode",
