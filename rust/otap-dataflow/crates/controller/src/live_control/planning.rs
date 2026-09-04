@@ -10,6 +10,7 @@
 
 use super::*;
 use otel_arrow_dfe_config::policy::{Policies, ResolvedPolicies};
+use otel_arrow_dfe_engine::extension::hierarchy::HostedExtensionRuntimePolicy;
 
 pub(super) struct EngineOperationGuard<
     PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
@@ -661,8 +662,8 @@ impl<
         desired_config: &OtelDataflowSpec,
     ) -> Result<(), ControlPlaneError> {
         let runtime_policy_changed = |current: &ResolvedPolicies, desired: &ResolvedPolicies| {
-            current.channel_capacity.control.node != desired.channel_capacity.control.node
-                || current.telemetry != desired.telemetry
+            HostedExtensionRuntimePolicy::from_resolved(current)
+                != HostedExtensionRuntimePolicy::from_resolved(desired)
         };
 
         if !current_config.extensions.is_empty() {
@@ -838,6 +839,10 @@ impl<
             .ok_or_else(|| ControlPlaneError::Internal {
                 message: "candidate pipeline disappeared during resolution".to_owned(),
             })?;
+        let target_inherited_extensions = self.inherited_extensions_for_pipeline(
+            &resolved_pipeline.pipeline_group_id,
+            &resolved_pipeline.pipeline,
+        );
         let current_pipeline_placement = current_record
             .as_ref()
             .map(|record| record.placement.clone());
@@ -1074,6 +1079,7 @@ impl<
             pipeline_id,
             action,
             resolved_pipeline,
+            target_inherited_extensions,
             base_config_revision,
             current_record,
             current_placement,
@@ -1279,6 +1285,7 @@ impl<
                 plan.pipeline_key.clone(),
                 LogicalPipelineRecord {
                     resolved: plan.resolved_pipeline.clone(),
+                    inherited_extensions: plan.target_inherited_extensions.clone(),
                     active_generation,
                     placement: plan.target_placement.placement.clone(),
                     placement_generation: plan.target_placement.listener_group_snapshot.generation,

@@ -145,10 +145,7 @@ pub use controller_monitor::{
     register_builtin_controller_extensions,
 };
 
-use live_control::{
-    ControllerRuntime, LaunchedPipelineThread, PanicReport, RuntimeInstanceError,
-    RuntimeInstanceExit,
-};
+use live_control::{ControllerRuntime, PanicReport, RuntimeInstanceError, RuntimeInstanceExit};
 use placement::{CorePlacement, PipelinePlacement, PlacementPlanner, PlacementSnapshot};
 
 use otel_arrow_dfe_engine::component_inventory;
@@ -173,6 +170,97 @@ pub struct Controller<PData: 'static + Clone + Send + Sync + std::fmt::Debug> {
 enum RunMode {
     ParkMainThread,
     ShutdownWhenDone,
+}
+
+/// Keeps ancestor extension providers alive until every descendant pipeline
+/// thread has exited, including on early-return error paths.
+struct HierarchyHostGuard<
+    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+> {
+    handle: Option<ThreadLocalTaskHandle<(), Error>>,
+    runtime: Arc<ControllerRuntime<PData>>,
+    shutdown_timeout_secs: u64,
+}
+
+impl<
+    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+> HierarchyHostGuard<PData>
+{
+    fn new(
+        handle: ThreadLocalTaskHandle<(), Error>,
+        runtime: Arc<ControllerRuntime<PData>>,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            runtime,
+            shutdown_timeout_secs: 10,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_timeout(
+        handle: ThreadLocalTaskHandle<(), Error>,
+        runtime: Arc<ControllerRuntime<PData>>,
+        shutdown_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            runtime,
+            shutdown_timeout_secs,
+        }
+    }
+
+    fn drain_descendants(&self) {
+        self.runtime.close_pipeline_launches();
+        loop {
+            if let Err(error) = self
+                .runtime
+                .control_plane()
+                .shutdown_all(self.shutdown_timeout_secs)
+            {
+                otel_warn!(
+                    "controller.hierarchical_extension_pipeline_shutdown_failed",
+                    error = format!("{error:?}")
+                );
+            }
+            let _ = self.runtime.wait_for_global_shutdown_completion();
+            if self.runtime.all_instances_exited()
+                || self
+                    .runtime
+                    .wait_until_all_instances_exit_for(Duration::from_millis(100))
+            {
+                break;
+            }
+        }
+        self.runtime.wait_until_all_instances_exit_unconditionally();
+    }
+
+    fn shutdown_after_descendants(&mut self) -> Option<Error> {
+        self.drain_descendants();
+        self.handle
+            .take()
+            .and_then(|handle| handle.shutdown_and_join().err())
+    }
+}
+
+impl<
+    PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
+> Drop for HierarchyHostGuard<PData>
+{
+    fn drop(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        self.drain_descendants();
+        if let Some(handle) = self.handle.take()
+            && let Err(error) = handle.shutdown_and_join()
+        {
+            otel_warn!(
+                "controller.hierarchical_extension_cleanup_failed",
+                error = error.to_string()
+            );
+        }
+    }
 }
 
 /// Error type returned by controller extension startup and runtime tasks.
@@ -1595,8 +1683,17 @@ impl<
                         });
                     }
                 };
-                let running = match prepared.start().await {
-                    Ok(running) => running,
+                let running = match prepared
+                    .start_with_shutdown(cancellation_token.clone().cancelled_owned())
+                    .await
+                {
+                    Ok(Some(running)) => running,
+                    Ok(None) => {
+                        let _ = hierarchy_ready_tx.send(Err(
+                            "hierarchical extension startup was cancelled".to_owned(),
+                        ));
+                        return Ok(());
+                    }
                     Err(error) => {
                         let message = error.to_string();
                         let _ = hierarchy_ready_tx.send(Err(message));
@@ -1606,7 +1703,12 @@ impl<
                     }
                 };
                 if hierarchy_ready_tx.send(Ok(())).is_err() {
-                    return Ok(());
+                    return running
+                        .shutdown()
+                        .await
+                        .map_err(|error| Error::PipelineRuntimeError {
+                            source: Box::new(error),
+                        });
                 }
 
                 running
@@ -1666,13 +1768,11 @@ impl<
                 return Err(host_error);
             }
         }
-        let mut hierarchical_extension_handle = Some(hierarchical_extension_handle);
+        let mut hierarchy_host =
+            HierarchyHostGuard::new(hierarchical_extension_handle, Arc::clone(&runtime));
 
-        // Pipeline threads receive only a Weak handle back to the controller runtime. That lets
-        // them report their terminal exit without becoming owners that keep the runtime alive
-        // during shutdown.
-        let observability_pipeline_handle = Self::spawn_observability_pipeline(
-            Arc::downgrade(&runtime),
+        Self::spawn_observability_pipeline(
+            &runtime,
             observability_key.clone(),
             observability_core,
             observability_pipeline,
@@ -1756,13 +1856,16 @@ impl<
             },
         )?;
 
-        runtime.register_launched_instance(observability_pipeline_handle);
-
         for (pipeline_entry, pipeline_placement) in
             pipelines.iter().zip(placement_snapshot.pipelines.iter())
         {
-            runtime.register_committed_pipeline(
+            let inherited_extensions = runtime.inherited_extensions_for_pipeline(
+                &pipeline_entry.pipeline_group_id,
+                &pipeline_entry.pipeline,
+            );
+            runtime.register_committed_pipeline_with_inherited(
                 pipeline_entry.clone(),
+                inherited_extensions.clone(),
                 pipeline_placement.clone(),
                 0,
             );
@@ -1804,14 +1907,7 @@ impl<
             );
 
             for placement in &pipeline_placement.cores {
-                let inherited_extensions = runtime.inherited_extensions_for_pipeline(
-                    &pipeline_entry.pipeline_group_id,
-                    &pipeline_entry.pipeline,
-                );
-                // Pass a Weak runtime handle into each pipeline thread. The thread upgrades it
-                // only when it needs to report Success/Error/Panic on exit, and silently skips
-                // that late report if shutdown has already dropped the runtime.
-                let launched = Self::launch_pipeline_thread(
+                Self::launch_pipeline_thread(
                     self.pipeline_factory,
                     DeployedPipelineKey {
                         pipeline_group_id: pipeline_entry.pipeline_group_id.clone(),
@@ -1829,7 +1925,7 @@ impl<
                     pipeline_entry.policies.transport_headers.clone(),
                     pipeline_entry.policies.rate_limiters.clone(),
                     pipeline_entry.policies.rate_limiter_scope.clone(),
-                    inherited_extensions,
+                    inherited_extensions.clone(),
                     controller_ctx.clone(),
                     metrics_reporter.clone(),
                     engine_evt_reporter.clone(),
@@ -1838,11 +1934,10 @@ impl<
                     memory_pressure_tx.clone(),
                     &engine_config,
                     runtime.declared_topics(),
-                    Arc::downgrade(&runtime),
+                    &runtime,
                     runtime.next_thread_id(),
                     None,
                 )?;
-                runtime.register_launched_instance(launched);
             }
         }
 
@@ -1890,14 +1985,6 @@ impl<
                     otel_warn!(
                         "controller.extension_startup_pipeline_shutdown_timeout",
                         message = "Timed out waiting for pipelines and system observability to stop after controller extension startup failed"
-                    );
-                }
-                if let Some(handle) = hierarchical_extension_handle.take()
-                    && let Err(stop_err) = handle.shutdown_and_join()
-                {
-                    otel_warn!(
-                        "controller.extension_startup_hierarchical_extension_shutdown_failed",
-                        error = stop_err.to_string()
                     );
                 }
                 return Err(err);
@@ -2001,9 +2088,7 @@ impl<
 
         // Pipelines stop before their ancestor extensions so no capability
         // handle can outlive the declaration-scope lifecycle it references.
-        let hierarchical_extension_error = hierarchical_extension_handle
-            .take()
-            .and_then(|handle| handle.shutdown_and_join().err());
+        let hierarchical_extension_error = hierarchy_host.shutdown_after_descendants();
 
         // All telemetry producers and pipelines have finished; shut down the
         // remaining support tasks and the metric aggregator gracefully.
@@ -2673,9 +2758,8 @@ impl<
     /// Launches one pipeline OS thread and wires its terminal exit back into the controller.
     ///
     /// The spawned thread owns the actual pipeline execution and maps success, runtime error, or
-    /// panic into RuntimeInstanceExit. `runtime` is a Weak handle on purpose: the pipeline thread
-    /// should be able to report its exit, but it must not become an owner that prolongs the
-    /// controller runtime during shutdown.
+    /// panic into RuntimeInstanceExit. Launch liveness is reserved before spawn so hierarchy
+    /// teardown cannot overtake a thread that exists but is not yet registered.
     #[allow(clippy::too_many_arguments)]
     fn launch_pipeline_thread(
         pipeline_factory: &'static PipelineFactory<PData>,
@@ -2699,13 +2783,13 @@ impl<
         memory_pressure_tx: tokio::sync::watch::Sender<MemoryPressureChanged>,
         config: &OtelDataflowSpec,
         declared_topics: &DeclaredTopics<PData>,
-        runtime: std::sync::Weak<ControllerRuntime<PData>>,
+        runtime: &Arc<ControllerRuntime<PData>>,
         thread_id: usize,
         internal_telemetry: Option<(
             InternalTelemetrySettings,
             std_mpsc::SyncSender<Result<(), EngineError>>,
         )>,
-    ) -> Result<LaunchedPipelineThread<PData>, Error> {
+    ) -> Result<(), Error> {
         let mut pipeline_ctx = controller_ctx.pipeline_context_with_placement(
             pipeline_key.pipeline_group_id.clone(),
             pipeline_key.pipeline_id.clone(),
@@ -2740,7 +2824,9 @@ impl<
         let run_key = pipeline_key.clone();
         let runtime_key = pipeline_key.clone();
         let runtime_thread_name = thread_name.clone();
-        let _handle = thread::Builder::new()
+        runtime.reserve_instance_launch(&pipeline_key)?;
+        let runtime_weak = Arc::downgrade(runtime);
+        let spawn_result = thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
                 let exit = match catch_unwind(AssertUnwindSafe(|| {
@@ -2782,28 +2868,43 @@ impl<
                         ),
                     )),
                 };
-                if let Some(runtime) = runtime.upgrade() {
+                if let Some(runtime) = runtime_weak.upgrade() {
                     runtime.note_instance_exit(runtime_key, exit);
                 }
                 // The controller runtime may already be gone during teardown. In that case there
                 // is nothing left to update, so late exit reporting is intentionally best-effort.
-            })
-            .map_err(|e| Error::ThreadSpawnError {
+            });
+        if let Err(source) = spawn_result {
+            runtime.abort_instance_launch(&pipeline_key);
+            return Err(Error::ThreadSpawnError {
                 thread_name: thread_name.clone(),
-                source: e,
-            })?;
+                source,
+            });
+        }
+        if let Some(deadline) =
+            runtime.activate_instance_launch(pipeline_key.clone(), control_sender.clone())
+        {
+            if let Err(error) =
+                control_sender.try_send_shutdown(deadline, "global shutdown".to_owned())
+            {
+                if runtime.instance_exit(&pipeline_key).is_none() {
+                    runtime.record_fatal_runtime_error(format!(
+                        "failed to stop pipeline launched during global shutdown ({}): {error}",
+                        live_control::deployed_instance_label(&pipeline_key)
+                    ));
+                }
+            } else {
+                runtime.release_instance_control_sender(&pipeline_key);
+            }
+        }
 
-        Ok(LaunchedPipelineThread {
-            pipeline_key,
-            control_sender,
-            _marker: std::marker::PhantomData,
-        })
+        Ok(())
     }
 
     /// Spawns the engine's mandatory observability pipeline and waits for startup.
     #[allow(clippy::too_many_arguments)]
     fn spawn_observability_pipeline(
-        runtime: std::sync::Weak<ControllerRuntime<PData>>,
+        runtime: &Arc<ControllerRuntime<PData>>,
         observability_key: DeployedPipelineKey,
         observability_core: CoreId,
         observability_pipeline: ResolvedPipelineConfig,
@@ -2817,7 +2918,7 @@ impl<
         memory_pressure_tx: &tokio::sync::watch::Sender<MemoryPressureChanged>,
         tracing_setup: TracingSetup,
         observability_numa_node_id: usize,
-    ) -> Result<LaunchedPipelineThread<PData>, Error> {
+    ) -> Result<(), Error> {
         debug_assert_eq!(
             observability_pipeline.role,
             ResolvedPipelineRole::ObservabilityInternal
@@ -2827,9 +2928,6 @@ impl<
         let pipeline_config = observability_pipeline.pipeline;
 
         let internal_telemetry_settings = telemetry_system.internal_telemetry_settings();
-        let runtime = runtime
-            .upgrade()
-            .expect("controller runtime should exist while spawning observability pipeline");
         let inherited_extensions = runtime.inherited_extensions_for_pipeline(
             &observability_key.pipeline_group_id,
             &pipeline_config,
@@ -2837,7 +2935,7 @@ impl<
 
         // Create a channel to signal startup success/failure
         let (startup_tx, startup_rx) = std_mpsc::sync_channel::<Result<(), EngineError>>(1);
-        let launched = Self::launch_pipeline_thread(
+        Self::launch_pipeline_thread(
             pipeline_factory,
             observability_key,
             observability_core,
@@ -2859,7 +2957,7 @@ impl<
             memory_pressure_tx.clone(),
             config,
             runtime.declared_topics(),
-            Arc::downgrade(&runtime),
+            runtime,
             0,
             Some((internal_telemetry_settings, startup_tx)),
         )?;
@@ -2886,7 +2984,7 @@ impl<
             }
         }
 
-        Ok(launched)
+        Ok(())
     }
 
     /// Runs a single pipeline in the current thread.

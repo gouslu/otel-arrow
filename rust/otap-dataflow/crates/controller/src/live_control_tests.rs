@@ -16,7 +16,7 @@ use otel_arrow_dfe_engine::control::{
 };
 use otel_arrow_dfe_engine::error::Error as EngineError;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
-use otel_arrow_dfe_engine::extension::ExtensionBundle;
+use otel_arrow_dfe_engine::extension::{ExtensionBundle, ExtensionWrapper};
 use otel_arrow_dfe_engine::listener_group::ListenerProtocol;
 use otel_arrow_dfe_engine::local::{exporter, receiver};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
@@ -231,11 +231,16 @@ static TEST_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
 
 fn test_hierarchy_extension_create(
     _context: &ExtensionContext,
-    _name: ExtensionId,
-    _user_config: Arc<ExtensionUserConfig>,
-    _runtime_config: &ExtensionConfig,
+    name: ExtensionId,
+    user_config: Arc<ExtensionUserConfig>,
+    runtime_config: &ExtensionConfig,
 ) -> Result<ExtensionBundle, otel_arrow_dfe_config::error::Error> {
-    panic!("live-control planning tests must not instantiate extensions")
+    Ok(ExtensionWrapper::builder(name, user_config, runtime_config)
+        .passive()
+        .cloned()
+        .shared(())
+        .build()
+        .expect("test hierarchy extension should build"))
 }
 
 static TEST_EXTENSION_FACTORIES: &[ExtensionFactory] = &[ExtensionFactory {
@@ -328,6 +333,19 @@ fn test_runtime_with_factory_and_topology(
     test_runtime_with_log_filter_and_topology(config, pipeline_factory, topology).0
 }
 
+fn test_runtime_with_hierarchy_registry(
+    config: &OtelDataflowSpec,
+    hierarchical_extensions: HierarchicalExtensionRegistry,
+) -> Arc<ControllerRuntime<()>> {
+    test_runtime_with_log_filter_topology_and_hierarchy(
+        config,
+        &TEST_PIPELINE_FACTORY,
+        NumaTopology::unknown(),
+        hierarchical_extensions,
+    )
+    .0
+}
+
 fn test_runtime_with_log_filter(
     config: &OtelDataflowSpec,
     pipeline_factory: &'static PipelineFactory<()>,
@@ -343,6 +361,24 @@ fn test_runtime_with_log_filter_and_topology(
     config: &OtelDataflowSpec,
     pipeline_factory: &'static PipelineFactory<()>,
     topology: NumaTopology,
+) -> (
+    Arc<ControllerRuntime<()>>,
+    RuntimeLogFilterHandle,
+    RuntimeLogFilter,
+) {
+    test_runtime_with_log_filter_topology_and_hierarchy(
+        config,
+        pipeline_factory,
+        topology,
+        HierarchicalExtensionRegistry::default(),
+    )
+}
+
+fn test_runtime_with_log_filter_topology_and_hierarchy(
+    config: &OtelDataflowSpec,
+    pipeline_factory: &'static PipelineFactory<()>,
+    topology: NumaTopology,
+    hierarchical_extensions: HierarchicalExtensionRegistry,
 ) -> (
     Arc<ControllerRuntime<()>>,
     RuntimeLogFilterHandle,
@@ -369,7 +405,7 @@ fn test_runtime_with_log_filter_and_topology(
             observed_state_handle,
             engine_event_reporter,
             metrics_reporter,
-            HierarchicalExtensionRegistry::default(),
+            hierarchical_extensions,
             declared_topics,
             available_core_ids(),
             topology,
@@ -3789,6 +3825,164 @@ connections:
     );
 }
 
+/// Scenario: a committed pipeline inherits an engine provider, then a live
+/// replacement shadows that extension with a pipeline-local declaration.
+/// Guarantees: planning retains the previous generation's inherited snapshot,
+/// captures an independent target snapshot, and commit stores exactly the
+/// target snapshot for later rollback and runtime recovery decisions.
+#[test]
+fn rollout_generation_records_exact_inherited_extension_snapshot() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+groups:
+  g1:
+    pipelines:
+      p1:
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: 1
+        nodes:
+          receiver:
+            type: urn:test:receiver:example
+          exporter:
+            type: urn:test:exporter:example
+        connections:
+          - from: receiver
+            to: exporter
+"#,
+    )
+    .expect("config should parse");
+
+    let async_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let local = tokio::task::LocalSet::new();
+    async_runtime.block_on(local.run_until(async {
+        let hierarchy_registry = HierarchicalExtensionRegistry::default();
+        let controller_context = ControllerContext::new(TelemetryRegistryHandle::new());
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(8);
+        let prepared = TEST_PIPELINE_FACTORY
+            .prepare_hierarchical_extensions(
+                &config,
+                &controller_context,
+                metrics_reporter,
+                hierarchy_registry.clone(),
+            )
+            .expect("hierarchy should prepare");
+        let running = prepared.start().await.expect("hierarchy should start");
+
+        let runtime = test_runtime_with_hierarchy_registry(&config, hierarchy_registry);
+        register_existing_pipeline(&runtime, &config);
+        let _control =
+            register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+        let replacement = PipelineConfig::from_yaml(
+            "g1".into(),
+            "p1".into(),
+            r#"
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+nodes:
+  receiver:
+    type: urn:test:receiver:example
+  exporter:
+    type: urn:test:exporter:example
+connections:
+  - from: receiver
+    to: exporter
+"#,
+        )
+        .expect("replacement should parse");
+
+        let plan = runtime
+            .prepare_rollout_plan(
+                "g1",
+                "p1",
+                &ReconfigureRequest {
+                    pipeline: replacement,
+                    step_timeout_secs: 5,
+                    drain_timeout_secs: 5,
+                },
+            )
+            .expect("shadowing replacement should plan");
+
+        assert_eq!(plan.action, RolloutAction::Replace);
+        assert!(
+            !plan
+                .current_record
+                .as_ref()
+                .expect("replacement should retain its previous record")
+                .inherited_extensions
+                .is_empty()
+        );
+        assert!(
+            plan.target_inherited_extensions.is_empty(),
+            "pipeline-local shadowing must be frozen into the target generation"
+        );
+
+        runtime.commit_pipeline_record(&plan, plan.target_generation);
+        let committed_snapshot_is_empty = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .logical_pipelines
+            .get(&plan.pipeline_key)
+            .expect("target generation should be committed")
+            .inherited_extensions
+            .is_empty();
+        assert!(committed_snapshot_is_empty);
+
+        let recovery_policy = {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = state
+                .logical_pipelines
+                .get(&plan.pipeline_key)
+                .expect("target generation should remain committed");
+            let recovery_policy = record.resolved.policies.runtime_recovery.clone();
+            let _ = state.runtime_recoveries.insert(
+                (plan.pipeline_key.clone(), 0),
+                RuntimeRecoveryState {
+                    serving_generation: plan.target_generation,
+                    restart_count: 0,
+                    ready_since: None,
+                    worker_id: Some(17),
+                    candidate_generation: None,
+                    cancel_requested: false,
+                },
+            );
+            recovery_policy
+        };
+        let recovery_snapshot = runtime
+            .prepare_runtime_recovery_snapshot_for_test(&plan.pipeline_key, 0, 17, &recovery_policy)
+            .expect("committed core should prepare a recovery attempt");
+        assert!(
+            recovery_snapshot.is_empty(),
+            "runtime recovery must reuse the committed target snapshot"
+        );
+
+        runtime.note_instance_exit(deployed_key("g1", "p1", 0, 0), RuntimeInstanceExit::Success);
+        running
+            .shutdown()
+            .await
+            .expect("hierarchy should stop cleanly");
+    }));
+}
+
 /// Scenario: a control-plane caller deletes a stopped logical pipeline.
 /// Guarantees: the pipeline is removed from committed live config and the
 /// containing group remains available as an empty group.
@@ -4267,6 +4461,48 @@ groups:
             if message.contains("hosted extensions in pipeline group `g1`")
     ));
     assert_eq!(runtime.engine_config_snapshot(), config);
+}
+
+/// Scenario: full-config reconciliation changes telemetry settings that the
+/// hierarchy host does not consume while an engine extension remains active.
+/// Guarantees: Tokio metrics and runtime detail above Basic can change live
+/// without an unnecessary engine-restart requirement.
+#[test]
+fn reconcile_engine_config_accepts_irrelevant_hosted_extension_policy_changes() {
+    let config = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  telemetry:
+    tokio_metrics: true
+    runtime_metrics: basic
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("config should parse");
+    let desired = OtelDataflowSpec::from_yaml(
+        r#"
+version: otel_dataflow/v1
+policies:
+  telemetry:
+    tokio_metrics: false
+    runtime_metrics: detailed
+extensions:
+  root_auth:
+    type: urn:test:extension:hierarchy-shared
+"#,
+    )
+    .expect("desired config should parse");
+    let runtime = test_runtime(&config);
+
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired.clone(), true))
+        .expect("unused hosted-extension telemetry changes should reconcile");
+
+    assert_eq!(status.state, EngineConfigReconcileState::Succeeded);
+    assert_eq!(runtime.engine_config_snapshot(), desired);
 }
 
 /// Scenario: successful full-config reconciliation changes the configured log level.
@@ -5769,10 +6005,10 @@ fn exited_runtime_instances_without_active_operation_are_pruned_immediately() {
     assert!(!state.runtime_instances.contains_key(&deployed_key));
 }
 
-/// Scenario: a runtime thread reports exit before the controller finishes
-/// registering the launched instance as active.
-/// Guarantees: early exit bookkeeping is reconciled during registration, so
-/// active-instance tracking does not leak and the pending-exit entry is cleared.
+/// Scenario: a synthetic test instance reports exit before its placeholder is
+/// registered as active.
+/// Guarantees: the test registration helper reconciles the pending exit without
+/// leaking active-instance bookkeeping.
 #[test]
 fn register_launched_instance_reconciles_early_exit_without_leaking_active_count() {
     let config = engine_config_with_pipeline(simple_pipeline_yaml());
@@ -5793,12 +6029,306 @@ fn register_launched_instance_reconciles_early_exit_without_leaking_active_count
     assert!(!state.runtime_instances.contains_key(&deployed_key));
 }
 
+/// Scenario: a pipeline launch is reserved immediately before its OS thread is
+/// created and has not yet published a control sender.
+/// Guarantees: liveness includes the launching thread and spawn failure can
+/// roll the reservation back exactly once.
+#[test]
+fn launch_reservation_counts_liveness_before_activation() {
+    let runtime = test_runtime(&empty_engine_config());
+    let deployed_key = deployed_key("g1", "p1", 0, 7);
+
+    runtime
+        .reserve_instance_launch(&deployed_key)
+        .expect("launch reservation should succeed");
+    {
+        let state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.active_instances, 1);
+        assert!(state.launching_instances.contains(&deployed_key));
+        assert!(!state.runtime_instances.contains_key(&deployed_key));
+    }
+
+    runtime.abort_instance_launch(&deployed_key);
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(state.active_instances, 0);
+    assert!(!state.launching_instances.contains(&deployed_key));
+}
+
+/// Scenario: a pipeline thread exits after launch reservation but before the
+/// spawning thread can activate its runtime record.
+/// Guarantees: the exit consumes the reservation, decrements liveness once,
+/// and a late activation cannot resurrect the exited instance.
+#[test]
+fn exit_before_activation_consumes_launch_reservation_once() {
+    let runtime = test_runtime(&empty_engine_config());
+    let deployed_key = deployed_key("g1", "p1", 0, 8);
+    let (sender, _calls) = recording_admin_sender(None);
+
+    runtime
+        .reserve_instance_launch(&deployed_key)
+        .expect("launch reservation should succeed");
+    runtime.note_instance_exit(deployed_key.clone(), RuntimeInstanceExit::Success);
+    assert!(
+        runtime
+            .activate_instance_launch(deployed_key.clone(), sender)
+            .is_none()
+    );
+
+    let state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(state.active_instances, 0);
+    assert!(!state.launching_instances.contains(&deployed_key));
+    assert!(!state.runtime_instances.contains_key(&deployed_key));
+}
+
+/// Scenario: global shutdown begins after a launch reservation but before its
+/// pipeline thread publishes a control sender.
+/// Guarantees: launch admission closes atomically, the in-flight activation
+/// inherits the shutdown deadline, and later launches are rejected.
+#[test]
+fn global_shutdown_catches_inflight_launch_activation() {
+    let runtime = test_runtime(&empty_engine_config());
+    let in_flight_key = deployed_key("g1", "p1", 0, 9);
+    let observability_key = deployed_key(
+        SYSTEM_PIPELINE_GROUP_ID,
+        SYSTEM_OBSERVABILITY_PIPELINE_ID,
+        0,
+        0,
+    );
+    let (observability_sender, observability_shutdown) = deadline_notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        observability_key.clone(),
+        observability_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    runtime
+        .reserve_instance_launch(&in_flight_key)
+        .expect("in-flight launch should reserve");
+
+    runtime
+        .request_shutdown_all(2)
+        .expect("empty shutdown snapshot should succeed");
+    assert!(
+        observability_shutdown
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "observability must wait for the in-flight producer"
+    );
+
+    let (sender, calls) = recording_admin_sender(None);
+    let deadline = runtime
+        .activate_instance_launch(in_flight_key.clone(), Arc::clone(&sender))
+        .expect("in-flight launch should inherit global shutdown");
+    sender
+        .try_send_shutdown(deadline, "global shutdown".to_owned())
+        .expect("newly activated launch should accept shutdown");
+    runtime.release_instance_control_sender(&in_flight_key);
+
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_slice(),
+        ["global shutdown"]
+    );
+    assert!(
+        runtime
+            .reserve_instance_launch(&deployed_key("g1", "p1", 1, 9))
+            .is_err()
+    );
+
+    runtime.note_instance_exit(in_flight_key, RuntimeInstanceExit::Success);
+    let (reason, _) = observability_shutdown
+        .recv_timeout(Duration::from_secs(1))
+        .expect("observability should stop after the producer exits");
+    assert_eq!(reason, "global shutdown");
+    runtime.note_instance_exit(observability_key, RuntimeInstanceExit::Success);
+    assert!(runtime.wait_for_global_shutdown_completion());
+    assert!(runtime.all_instances_exited());
+}
+
+/// Scenario: a fatal callback releases the normal instance wait while a launch
+/// reservation still represents a live pipeline thread.
+/// Guarantees: the teardown-only wait ignores the release latch and remains
+/// blocked until the reserved thread reports its terminal exit.
+#[test]
+fn unconditional_instance_wait_ignores_fatal_release_latch() {
+    let runtime = test_runtime(&empty_engine_config());
+    let deployed_key = deployed_key("g1", "p1", 0, 10);
+    runtime
+        .reserve_instance_launch(&deployed_key)
+        .expect("launch reservation should succeed");
+    runtime.release_instance_wait();
+
+    let waiter = {
+        let runtime = Arc::clone(&runtime);
+        thread::spawn(move || runtime.wait_until_all_instances_exit_unconditionally())
+    };
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !waiter.is_finished(),
+        "unconditional teardown wait must ignore the release latch"
+    );
+
+    runtime.note_instance_exit(deployed_key, RuntimeInstanceExit::Success);
+    waiter.join().expect("teardown waiter should finish");
+}
+
+/// Scenario: a fatal callback releases the main wait and a later idempotent
+/// shutdown pass runs to close a startup-registration race.
+/// Guarantees: repeated global shutdown never clears the one-way fatal release
+/// latch and cannot re-block the controller's transition into teardown.
+#[test]
+fn repeated_global_shutdown_preserves_fatal_release_latch() {
+    let runtime = test_runtime(&empty_engine_config());
+    runtime.release_instance_wait();
+
+    runtime
+        .request_shutdown_all(1)
+        .expect("empty repeated shutdown should succeed");
+
+    assert!(
+        runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .instance_wait_released
+    );
+}
+
+/// Scenario: an early controller error drops the hierarchy guard while a
+/// reserved pipeline thread is still alive.
+/// Guarantees: the guard closes launch admission and waits for the descendant
+/// exit before cancelling the hierarchy host task.
+#[test]
+fn hierarchy_guard_keeps_host_alive_until_reserved_pipeline_exits() {
+    let runtime = test_runtime(&empty_engine_config());
+    let in_flight_key = deployed_key("g1", "p1", 0, 11);
+    runtime
+        .reserve_instance_launch(&in_flight_key)
+        .expect("launch reservation should succeed");
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let handle = spawn_thread_local_task(
+        "test-hierarchy-guard",
+        TracingSetup::new(ProviderSetup::Noop, LogLevel::default(), engine_context),
+        move |cancellation_token| async move {
+            let _ = started_tx.send(());
+            cancellation_token.cancelled().await;
+            let _ = stopped_tx.send(());
+            Ok::<(), Error>(())
+        },
+    )
+    .expect("test hierarchy host should spawn");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("test hierarchy host should start");
+
+    let guard = HierarchyHostGuard::new(handle, Arc::clone(&runtime));
+    let drop_thread = thread::spawn(move || drop(guard));
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        stopped_rx.try_recv().is_err(),
+        "hierarchy host must remain alive while a descendant is reserved"
+    );
+
+    runtime.note_instance_exit(in_flight_key, RuntimeInstanceExit::Success);
+    drop_thread
+        .join()
+        .expect("hierarchy guard cleanup should finish");
+    stopped_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hierarchy host should stop after descendants exit");
+}
+
+/// Scenario: a producer outlives the first finite global-shutdown deadline, so
+/// the coordinator restores the observability sender before the producer exits.
+/// Guarantees: hierarchy cleanup re-drives phased shutdown, stops observability
+/// after the late producer, and only then cancels the hierarchy host.
+#[test]
+fn hierarchy_guard_retries_restored_observability_shutdown() {
+    let runtime = test_runtime(&engine_config_with_pipeline(simple_pipeline_yaml()));
+    let producer_key = deployed_key("g1", "p1", 0, 0);
+    let observability_key = deployed_key(
+        SYSTEM_PIPELINE_GROUP_ID,
+        SYSTEM_OBSERVABILITY_PIPELINE_ID,
+        1,
+        0,
+    );
+    let (producer_sender, producer_shutdown) = notifying_admin_sender();
+    let (observability_sender, observability_shutdown) = notifying_admin_sender();
+    register_runtime_instance_with_sender(
+        &runtime,
+        producer_key.clone(),
+        producer_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+    register_runtime_instance_with_sender(
+        &runtime,
+        observability_key.clone(),
+        observability_sender,
+        RuntimeInstanceLifecycle::Active,
+    );
+
+    let (host_stopped_tx, host_stopped_rx) = std::sync::mpsc::channel();
+    let handle = spawn_thread_local_task(
+        "test-hierarchy-retry",
+        TracingSetup::new(ProviderSetup::Noop, LogLevel::default(), engine_context),
+        move |cancellation_token| async move {
+            cancellation_token.cancelled().await;
+            let _ = host_stopped_tx.send(());
+            Ok::<(), Error>(())
+        },
+    )
+    .expect("test hierarchy host should spawn");
+    let guard = HierarchyHostGuard::new_with_timeout(handle, Arc::clone(&runtime), 1);
+    let drop_thread = thread::spawn(move || drop(guard));
+
+    let producer_reason = producer_shutdown
+        .recv_timeout(Duration::from_secs(1))
+        .expect("producer should receive the first shutdown request");
+    assert_eq!(producer_reason, "global shutdown");
+    assert!(
+        observability_shutdown
+            .recv_timeout(Duration::from_millis(1_200))
+            .is_err(),
+        "observability must remain active after the producer misses the first deadline"
+    );
+    assert!(
+        host_stopped_rx.try_recv().is_err(),
+        "hierarchy host must remain active while descendants are still running"
+    );
+
+    runtime.note_instance_exit(producer_key, RuntimeInstanceExit::Success);
+    let observability_reason = observability_shutdown
+        .recv_timeout(Duration::from_secs(2))
+        .expect("guard should retry the restored observability sender");
+    assert_eq!(observability_reason, "global shutdown");
+    runtime.note_instance_exit(observability_key, RuntimeInstanceExit::Success);
+
+    drop_thread
+        .join()
+        .expect("hierarchy guard cleanup should finish");
+    host_stopped_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hierarchy host should stop after observability exits");
+}
+
 /// Scenario: a controller extension fails at runtime while a pipeline instance
 /// is still active and never drains (e.g. the graceful shutdown request stalls).
 /// Guarantees: `release_instance_wait` unblocks `wait_until_all_instances_exit`
-/// unconditionally, so the main controller thread proceeds to teardown instead
-/// of hanging. Regression test for the removed `thread::park`/`unpark` escape
-/// hatch -- the condvar wait is now the only wake path and must honor the latch.
+/// so the main controller thread can enter ordered teardown; the hierarchy guard
+/// still performs a separate unconditional descendant wait.
 #[test]
 fn release_instance_wait_unblocks_wait_with_active_instances() {
     let runtime = test_runtime(&empty_engine_config());

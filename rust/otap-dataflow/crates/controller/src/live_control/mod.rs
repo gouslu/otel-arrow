@@ -41,6 +41,8 @@ mod planning;
 mod runtime;
 mod state;
 
+pub(crate) use self::runtime::deployed_instance_label;
+
 #[cfg(test)]
 use self::state::TERMINAL_OPERATION_RETENTION_TTL;
 use self::state::{
@@ -107,6 +109,7 @@ struct ControllerControlPlane<PData: 'static + Clone + Send + Sync + std::fmt::D
 /// The controller stores the `control_sender` while the instance is active and
 /// drops it after shutdown is requested so the pipeline can observe control
 /// channel closure once node tasks finish.
+#[cfg(test)]
 pub(super) struct LaunchedPipelineThread<PData> {
     /// Concrete deployed instance key for the launched runtime thread.
     pub(super) pipeline_key: DeployedPipelineKey,
@@ -159,6 +162,7 @@ impl<
                 config_revision: 0,
                 logical_pipelines: HashMap::new(),
                 runtime_instances: HashMap::new(),
+                launching_instances: HashSet::new(),
                 runtime_recoveries: HashMap::new(),
                 deferred_runtime_recoveries: HashMap::new(),
                 pipeline_operation_reservations: HashMap::new(),
@@ -171,6 +175,7 @@ impl<
                 terminal_shutdowns: HashMap::new(),
                 generation_counters: HashMap::new(),
                 active_instances: 0,
+                launches_closed: false,
                 active_engine_operation: None,
                 next_reconcile_id: 0,
                 next_rollout_id: 0,
@@ -182,6 +187,7 @@ impl<
                 first_error: None,
                 instance_wait_released: false,
                 global_shutdown_requested: false,
+                global_shutdown_deadline: None,
                 global_shutdown_coordinators: 0,
             }),
             state_changed: Condvar::new(),
@@ -189,9 +195,29 @@ impl<
     }
 
     /// Seeds the runtime registry with a pipeline already committed at startup.
+    #[cfg(test)]
     pub(super) fn register_committed_pipeline(
         &self,
         resolved: ResolvedPipelineConfig,
+        placement: PipelinePlacement,
+        generation: u64,
+    ) {
+        let inherited_extensions =
+            self.inherited_extensions_for_pipeline(&resolved.pipeline_group_id, &resolved.pipeline);
+        self.register_committed_pipeline_with_inherited(
+            resolved,
+            inherited_extensions,
+            placement,
+            generation,
+        );
+    }
+
+    /// Seeds one committed pipeline with the exact ancestor-provider snapshot
+    /// used to launch its runtime generation.
+    pub(super) fn register_committed_pipeline_with_inherited(
+        &self,
+        resolved: ResolvedPipelineConfig,
+        inherited_extensions: InheritedExtensionRegistrations,
         placement: PipelinePlacement,
         generation: u64,
     ) {
@@ -217,6 +243,7 @@ impl<
             pipeline_key,
             LogicalPipelineRecord {
                 resolved,
+                inherited_extensions,
                 active_generation: generation,
                 placement,
                 placement_generation: 0,
@@ -280,10 +307,17 @@ impl<
         pipeline_key: &DeployedPipelineKey,
         exit: &RuntimeInstanceExit,
     ) -> bool {
-        if let Some(instance) = state.runtime_instances.get_mut(pipeline_key) {
-            instance.lifecycle = RuntimeInstanceLifecycle::Exited(exit.clone());
+        let was_active = state
+            .runtime_instances
+            .get(pipeline_key)
+            .is_some_and(|instance| matches!(instance.lifecycle, RuntimeInstanceLifecycle::Active));
+        if was_active {
+            if let Some(instance) = state.runtime_instances.get_mut(pipeline_key) {
+                instance.lifecycle = RuntimeInstanceLifecycle::Exited(exit.clone());
+                instance.control_sender = None;
+            }
+            state.active_instances = state.active_instances.saturating_sub(1);
         }
-        state.active_instances = state.active_instances.saturating_sub(1);
         let logical_pipeline_key = PipelineKey::new(
             pipeline_key.pipeline_group_id.clone(),
             pipeline_key.pipeline_id.clone(),

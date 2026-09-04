@@ -479,6 +479,8 @@ pub(super) struct RuntimeRecoveryState {
 /// Committed logical pipeline config plus the active deployment generation.
 pub(super) struct LogicalPipelineRecord {
     pub(super) resolved: ResolvedPipelineConfig,
+    /// Ancestor provider snapshot captured when this logical config was committed.
+    pub(super) inherited_extensions: InheritedExtensionRegistrations,
     /// Pipeline-wide config generation; recovered cores may serve newer generations.
     pub(super) active_generation: u64,
     pub(super) placement: PipelinePlacement,
@@ -526,6 +528,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) logical_pipelines: HashMap<PipelineKey, LogicalPipelineRecord>,
     /// Deployed runtime instances keyed by group/pipeline/core/generation.
     pub(super) runtime_instances: HashMap<DeployedPipelineKey, RuntimeInstanceRecord>,
+    /// Pipeline threads reserved before OS-thread spawn and not yet activated.
+    pub(super) launching_instances: HashSet<DeployedPipelineKey>,
     /// Per-core restart streak and active recovery-worker state.
     pub(super) runtime_recoveries: HashMap<(PipelineKey, usize), RuntimeRecoveryState>,
     /// Runtime failures held while an explicit operation owns their lifecycle.
@@ -533,9 +537,8 @@ pub(super) struct ControllerRuntimeState {
     /// Planning-stage lifecycle reservations keyed by logical pipeline.
     pub(super) pipeline_operation_reservations:
         HashMap<PipelineKey, PipelineOperationReservationState>,
-    // A pipeline thread can finish before register_launched_instance() publishes it as Active.
-    // We park that exit here and reconcile it during registration instead of leaving stale
-    // liveness behind.
+    // Synthetic tests can report an exit before registering their placeholder
+    // instance. Production launches reserve before spawning and do not use this.
     pub(super) pending_instance_exits: HashMap<DeployedPipelineKey, RuntimeInstanceExit>,
     /// Rollout snapshots retained for active and recent terminal lookups.
     pub(super) rollouts: HashMap<String, RolloutRecord>,
@@ -551,10 +554,15 @@ pub(super) struct ControllerRuntimeState {
     pub(super) terminal_shutdowns: HashMap<PipelineKey, VecDeque<String>>,
     /// Next deployment generation to assign for each logical pipeline.
     pub(super) generation_counters: HashMap<PipelineKey, u64>,
-    /// Count of runtime instances still considered active by the controller.
+    /// Count of pipeline threads still launching or active.
     pub(super) active_instances: usize,
+    /// Monotonic latch preventing any new pipeline thread from being spawned.
+    pub(super) launches_closed: bool,
     /// Whether at least one engine-wide shutdown request has been accepted.
     pub(super) global_shutdown_requested: bool,
+    /// Shutdown deadline inherited by threads that finish spawning after
+    /// global shutdown has begun.
+    pub(super) global_shutdown_deadline: Option<Instant>,
     /// Number of phased global-shutdown coordinators still running.
     pub(super) global_shutdown_coordinators: usize,
     /// Active engine-scoped live operation, if any.
@@ -586,7 +594,8 @@ pub(super) struct ControllerRuntimeState {
 impl ControllerRuntimeState {
     /// Returns whether an explicit operation currently owns this pipeline.
     pub(super) fn recovery_preempted(&self, pipeline_key: &PipelineKey) -> bool {
-        self.global_shutdown_requested
+        self.launches_closed
+            || self.global_shutdown_requested
             || self.active_rollouts.contains_key(pipeline_key)
             || self.active_shutdowns.contains_key(pipeline_key)
             || self
@@ -621,6 +630,8 @@ pub(super) struct CandidateRolloutPlan {
     pub(super) action: RolloutAction,
     /// Resolved target pipeline config after applying the request.
     pub(super) resolved_pipeline: ResolvedPipelineConfig,
+    /// Ancestor provider snapshot captured while this rollout was planned.
+    pub(super) target_inherited_extensions: InheritedExtensionRegistrations,
     /// Runtime config revision used to build this plan.
     pub(super) base_config_revision: u64,
     /// Current committed record, absent for create rollouts.
