@@ -75,6 +75,8 @@ pub(super) struct ControllerRuntime<PData: 'static + Clone + Send + Sync + std::
     engine_event_reporter: ObservedEventReporter,
     /// Metrics reporter cloned into launched runtime instances.
     metrics_reporter: MetricsReporter,
+    /// Immutable capability catalogs for engine and pipeline-group extensions.
+    extension_scope_registry: ExtensionScopeRegistry,
     /// Topic registry shared by all runtime instances.
     declared_topics: DeclaredTopics<PData>,
     /// Controller-wide core ids available for policy-based allocation.
@@ -105,6 +107,7 @@ struct ControllerControlPlane<PData: 'static + Clone + Send + Sync + std::fmt::D
 /// The controller stores the `control_sender` while the instance is active and
 /// drops it after shutdown is requested so the pipeline can observe control
 /// channel closure once node tasks finish.
+#[cfg(test)]
 pub(super) struct LaunchedPipelineThread<PData> {
     /// Concrete deployed instance key for the launched runtime thread.
     pub(super) pipeline_key: DeployedPipelineKey,
@@ -127,6 +130,7 @@ impl<
         observed_state_handle: ObservedStateHandle,
         engine_event_reporter: ObservedEventReporter,
         metrics_reporter: MetricsReporter,
+        extension_scope_registry: ExtensionScopeRegistry,
         declared_topics: DeclaredTopics<PData>,
         available_core_ids: Vec<CoreId>,
         topology: NumaTopology,
@@ -144,6 +148,7 @@ impl<
             observed_state_handle,
             engine_event_reporter,
             metrics_reporter,
+            extension_scope_registry,
             declared_topics,
             available_core_ids,
             topology,
@@ -156,6 +161,7 @@ impl<
                 config_revision: 0,
                 logical_pipelines: HashMap::new(),
                 runtime_instances: HashMap::new(),
+                launching_instances: HashSet::new(),
                 runtime_recoveries: HashMap::new(),
                 deferred_runtime_recoveries: HashMap::new(),
                 pipeline_operation_reservations: HashMap::new(),
@@ -178,7 +184,11 @@ impl<
                 next_pipeline_operation_reservation_id: 0,
                 first_error: None,
                 instance_wait_released: false,
+                launches_closed: false,
                 global_shutdown_requested: false,
+                global_shutdown_deadline: None,
+                observability_shutdown_deadline: None,
+                extension_scope_hosts_stopped: false,
                 global_shutdown_coordinators: 0,
             }),
             state_changed: Condvar::new(),
@@ -186,9 +196,29 @@ impl<
     }
 
     /// Seeds the runtime registry with a pipeline already committed at startup.
+    #[cfg(test)]
     pub(super) fn register_committed_pipeline(
         &self,
         resolved: ResolvedPipelineConfig,
+        placement: PipelinePlacement,
+        generation: u64,
+    ) {
+        let inherited_extensions =
+            self.inherited_extensions_for_pipeline(&resolved.pipeline_group_id, &resolved.pipeline);
+        self.register_committed_pipeline_with_inherited(
+            resolved,
+            inherited_extensions,
+            placement,
+            generation,
+        );
+    }
+
+    /// Seeds one committed pipeline with the exact inherited-provider snapshot
+    /// used to launch its runtime generation.
+    pub(super) fn register_committed_pipeline_with_inherited(
+        &self,
+        resolved: ResolvedPipelineConfig,
+        inherited_extensions: InheritedExtensionRegistrations,
         placement: PipelinePlacement,
         generation: u64,
     ) {
@@ -214,6 +244,7 @@ impl<
             pipeline_key,
             LogicalPipelineRecord {
                 resolved,
+                inherited_extensions,
                 active_generation: generation,
                 placement,
                 placement_generation: 0,
@@ -237,6 +268,16 @@ impl<
         &self.declared_topics
     }
 
+    /// Resolves the shared providers inherited by one pipeline.
+    pub(super) fn inherited_extensions_for_pipeline(
+        &self,
+        pipeline_group_id: &PipelineGroupId,
+        pipeline: &PipelineConfig,
+    ) -> InheritedExtensionRegistrations {
+        self.extension_scope_registry
+            .registrations_for_pipeline(pipeline_group_id, pipeline.extensions())
+    }
+
     /// Exposes the runtime as the admin control-plane trait object.
     pub(super) fn control_plane(self: &Arc<Self>) -> Arc<dyn ControlPlane> {
         Arc::new(ControllerControlPlane {
@@ -249,7 +290,11 @@ impl<
         state: &ControllerRuntimeState,
         pipeline_key: &PipelineKey,
     ) -> bool {
-        state.active_rollouts.contains_key(pipeline_key)
+        // Global shutdown is terminal for this runtime, so retaining its finite
+        // deployed-instance set cannot grow across later generations. The
+        // records close snapshot/send races until every coordinator finishes.
+        state.global_shutdown_requested
+            || state.active_rollouts.contains_key(pipeline_key)
             || state.active_shutdowns.contains_key(pipeline_key)
             || state
                 .pipeline_operation_reservations

@@ -9,6 +9,8 @@
 //! to conflict detection and bounded history retention.
 
 use super::*;
+use otel_arrow_dfe_config::policy::{Policies, ResolvedPolicies};
+use otel_arrow_dfe_engine::extension::scope::ExtensionHostRuntimePolicy;
 
 pub(super) struct EngineOperationGuard<
     PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
@@ -603,6 +605,135 @@ impl<
         Ok(())
     }
 
+    fn validate_live_extension_scope_declarations_unchanged(
+        current_config: &OtelDataflowSpec,
+        desired_config: &OtelDataflowSpec,
+        delete_missing: bool,
+    ) -> Result<(), ControlPlaneError> {
+        if current_config.extensions != desired_config.extensions {
+            return Err(ControlPlaneError::InvalidRequest {
+                message:
+                    "request would require runtime engine extension mutation; restart the engine to change top-level extensions"
+                        .to_owned(),
+            });
+        }
+
+        let group_ids: HashSet<_> = current_config
+            .groups
+            .keys()
+            .chain(desired_config.groups.keys())
+            .cloned()
+            .collect();
+        for pipeline_group_id in group_ids {
+            let current = current_config.groups.get(&pipeline_group_id);
+            let desired = desired_config.groups.get(&pipeline_group_id);
+            match (current, desired) {
+                (Some(current), Some(desired)) if current.extensions != desired.extensions => {
+                    return Err(ControlPlaneError::InvalidRequest {
+                        message: format!(
+                            "request would require runtime extension mutation for pipeline group `{}`; restart the engine to change group extensions",
+                            pipeline_group_id.as_ref()
+                        ),
+                    });
+                }
+                (None, Some(desired)) if !desired.extensions.is_empty() => {
+                    return Err(ControlPlaneError::InvalidRequest {
+                        message: format!(
+                            "creating pipeline group `{}` with extensions requires an engine restart",
+                            pipeline_group_id.as_ref()
+                        ),
+                    });
+                }
+                (Some(current), None) if delete_missing && !current.extensions.is_empty() => {
+                    return Err(ControlPlaneError::InvalidRequest {
+                        message: format!(
+                            "deleting pipeline group `{}` with hosted extensions requires an engine restart",
+                            pipeline_group_id.as_ref()
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_extension_scope_declarations(
+        current_config: &OtelDataflowSpec,
+        desired_config: &mut OtelDataflowSpec,
+    ) {
+        for (extension_id, extension) in current_config.extensions.iter() {
+            if !desired_config
+                .extensions
+                .contains_key(extension_id.as_ref())
+            {
+                desired_config
+                    .extensions
+                    .insert(extension_id.clone(), extension.as_ref().clone());
+            }
+        }
+        for (pipeline_group_id, desired_group) in &mut desired_config.groups {
+            if let Some(current_group) = current_config.groups.get(pipeline_group_id) {
+                for (extension_id, extension) in current_group.extensions.iter() {
+                    if !desired_group.extensions.contains_key(extension_id.as_ref()) {
+                        desired_group
+                            .extensions
+                            .insert(extension_id.clone(), extension.as_ref().clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_live_extension_host_policies_unchanged(
+        current_config: &OtelDataflowSpec,
+        desired_config: &OtelDataflowSpec,
+        delete_missing: bool,
+    ) -> Result<(), ControlPlaneError> {
+        let runtime_policy_changed = |current: &ResolvedPolicies, desired: &ResolvedPolicies| {
+            ExtensionHostRuntimePolicy::from_resolved(current)
+                != ExtensionHostRuntimePolicy::from_resolved(desired)
+        };
+
+        if !current_config.extensions.is_empty() {
+            let current = Policies::resolve([&current_config.policies]);
+            let desired = Policies::resolve([&desired_config.policies]);
+            if runtime_policy_changed(&current, &desired) {
+                return Err(ControlPlaneError::InvalidRequest {
+                    message: "request would change runtime policies used by hosted engine extensions; restart the engine to change their channel capacity or telemetry policy".to_owned(),
+                });
+            }
+        }
+
+        for (pipeline_group_id, current_group) in &current_config.groups {
+            if current_group.extensions.is_empty() {
+                continue;
+            }
+            let desired_group = match desired_config.groups.get(pipeline_group_id) {
+                Some(group) => group,
+                None if !delete_missing => current_group,
+                None => continue,
+            };
+            let current = current_group.policies.as_ref().map_or_else(
+                || Policies::resolve([&current_config.policies]),
+                |group_policies| Policies::resolve([group_policies, &current_config.policies]),
+            );
+            let desired = desired_group.policies.as_ref().map_or_else(
+                || Policies::resolve([&desired_config.policies]),
+                |group_policies| Policies::resolve([group_policies, &desired_config.policies]),
+            );
+            if runtime_policy_changed(&current, &desired) {
+                return Err(ControlPlaneError::InvalidRequest {
+                    message: format!(
+                        "request would change runtime policies used by hosted extensions in pipeline group `{}`; restart the engine to change their channel capacity or telemetry policy",
+                        pipeline_group_id.as_ref()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Reserves, plans, and starts one explicit per-pipeline rollout.
     pub(super) fn request_reconfigure_pipeline(
         self: &Arc<Self>,
@@ -686,11 +817,6 @@ impl<
         };
 
         let candidate_pipeline = request.pipeline.clone();
-        candidate_pipeline
-            .validate(&pipeline_group_id, &pipeline_id)
-            .map_err(|err| ControlPlaneError::InvalidRequest {
-                message: err.to_string(),
-            })?;
 
         let mut candidate_config = planning_config
             .cloned()
@@ -727,6 +853,11 @@ impl<
             });
         }
         Self::validate_live_memory_limiter_unchanged(&live_config, &candidate_config)?;
+        Self::validate_live_extension_host_policies_unchanged(
+            &live_config,
+            &candidate_config,
+            true,
+        )?;
 
         let resolved_pipeline = candidate_config
             .resolve()
@@ -740,6 +871,10 @@ impl<
             .ok_or_else(|| ControlPlaneError::Internal {
                 message: "candidate pipeline disappeared during resolution".to_owned(),
             })?;
+        let target_inherited_extensions = self.inherited_extensions_for_pipeline(
+            &resolved_pipeline.pipeline_group_id,
+            &resolved_pipeline.pipeline,
+        );
         let current_pipeline_placement = current_record
             .as_ref()
             .map(|record| record.placement.clone());
@@ -976,6 +1111,7 @@ impl<
             pipeline_id,
             action,
             resolved_pipeline,
+            target_inherited_extensions,
             base_config_revision,
             current_record,
             current_placement,
@@ -1181,6 +1317,7 @@ impl<
                 plan.pipeline_key.clone(),
                 LogicalPipelineRecord {
                     resolved: plan.resolved_pipeline.clone(),
+                    inherited_extensions: plan.target_inherited_extensions.clone(),
                     active_generation,
                     placement: plan.target_placement.placement.clone(),
                     placement_generation: plan.target_placement.listener_group_snapshot.generation,
@@ -1478,6 +1615,12 @@ impl<
                     .to_owned(),
             });
         }
+        if !group.extensions.is_empty() {
+            return Err(ControlPlaneError::InvalidRequest {
+                message: "pipeline group creation with extensions requires an engine restart"
+                    .to_owned(),
+            });
+        }
         group
             .validate(&pipeline_group_id)
             .map_err(|err| ControlPlaneError::InvalidRequest {
@@ -1534,6 +1677,7 @@ impl<
         state.live_config.version = desired_config.version.clone();
         state.live_config.policies = desired_config.policies.clone();
         state.live_config.topics = desired_config.topics.clone();
+        state.live_config.extensions = desired_config.extensions.clone();
         state.live_config.engine = desired_config.engine.clone();
         for (pipeline_group_id, desired_group) in &desired_config.groups {
             let group = state
@@ -1543,6 +1687,7 @@ impl<
                 .or_default();
             group.policies = desired_group.policies.clone();
             group.topics = desired_group.topics.clone();
+            group.extensions = desired_group.extensions.clone();
             for (pipeline_id, pipeline) in &desired_group.pipelines {
                 _ = group
                     .pipelines
@@ -1866,6 +2011,14 @@ impl<
             let Some(group) = state.live_config.groups.get(&pipeline_group_id) else {
                 return Err(ControlPlaneError::GroupNotFound);
             };
+            if !group.extensions.is_empty() {
+                return Err(ControlPlaneError::InvalidRequest {
+                    message: format!(
+                        "deleting pipeline group `{}` with hosted extensions requires an engine restart",
+                        pipeline_group_id.as_ref()
+                    ),
+                });
+            }
             let mut ids: Vec<_> = group.pipelines.keys().cloned().collect();
             for pipeline_key in state.logical_pipelines.keys() {
                 if pipeline_key.pipeline_group_id() == &pipeline_group_id
@@ -1952,7 +2105,15 @@ impl<
         );
 
         let live_config = self.engine_config_snapshot();
-        let desired_config = request.config;
+        let mut desired_config = request.config;
+        if !request.delete_missing {
+            Self::retain_extension_scope_declarations(&live_config, &mut desired_config);
+        }
+        Self::validate_live_extension_scope_declarations_unchanged(
+            &live_config,
+            &desired_config,
+            request.delete_missing,
+        )?;
         desired_config
             .validate()
             .map_err(|err| ControlPlaneError::InvalidRequest {
@@ -1972,6 +2133,11 @@ impl<
             });
         }
         Self::validate_live_memory_limiter_unchanged(&live_config, &desired_config)?;
+        Self::validate_live_extension_host_policies_unchanged(
+            &live_config,
+            &desired_config,
+            request.delete_missing,
+        )?;
 
         let mut desired_keys = Vec::new();
         for (pipeline_group_id, group) in &desired_config.groups {
