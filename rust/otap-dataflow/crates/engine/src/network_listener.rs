@@ -5,6 +5,7 @@
 
 use futures::Stream;
 use otel_arrow_dfe_config::{LogicalPipelineDeploymentKey, NodeId};
+use otel_arrow_dfe_telemetry::otel_warn;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 
@@ -22,6 +24,7 @@ const LISTEN_BACKLOG: i32 = 8192;
 const SHARED_ENDPOINT_CAPACITY: usize = 4096;
 const MIN_SHARED_CONSUMER_CAPACITY: usize = 64;
 const MAX_SHARED_CONSUMER_CAPACITY: usize = 1024;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Transport protocol associated with a declared network endpoint.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -77,6 +80,8 @@ pub struct NetworkListenerPlan {
     pub members: Vec<NetworkListenerMember>,
     /// Receiver endpoints declared by the pipeline.
     pub endpoints: Vec<NetworkEndpoint>,
+    /// Receivers without endpoint declarations that retain legacy direct binding.
+    pub unmanaged_receivers: Vec<NodeId>,
 }
 
 impl NetworkListenerPlan {
@@ -100,6 +105,9 @@ impl NetworkListenerPlan {
         endpoints.sort();
         let mut physical_endpoints = HashMap::with_capacity(endpoints.len());
         for endpoint in &endpoints {
+            if endpoint.bind_address.port() == 0 {
+                continue;
+            }
             let physical_key = (endpoint.bind_address, endpoint.transport);
             if let Some(previous_node) =
                 physical_endpoints.insert(physical_key, endpoint.receiver_node_id.clone())
@@ -118,7 +126,14 @@ impl NetworkListenerPlan {
             deployment_key,
             members,
             endpoints,
+            unmanaged_receivers: Vec::new(),
         })
+    }
+
+    /// Returns whether neither planned nor legacy receiver listeners are needed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty() && self.unmanaged_receivers.is_empty()
     }
 
     fn contains_core(&self, core_id: usize) -> bool {
@@ -352,11 +367,17 @@ impl NetworkListenerSet {
         receiver_node_id: NodeId,
         bind_address: SocketAddr,
     ) -> io::Result<NetworkTcpListener> {
-        if let Some(plan) = &self.deployment.plan {
+        let endpoint = NetworkEndpoint::new(receiver_node_id, bind_address, NetworkTransport::Tcp);
+        let backend = if let Some(plan) = &self.deployment.plan {
             debug_assert!(plan.contains_core(self.core_id));
-            let endpoint =
-                NetworkEndpoint::new(receiver_node_id, bind_address, NetworkTransport::Tcp);
-            if !plan.contains_endpoint(&endpoint) {
+            if plan.contains_endpoint(&endpoint) {
+                self.deployment.backend.as_ref()
+            } else if plan
+                .unmanaged_receivers
+                .contains(&endpoint.receiver_node_id)
+            {
+                &NetworkListenerBackend::SocketPerListener
+            } else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
@@ -365,19 +386,17 @@ impl NetworkListenerSet {
                     ),
                 ));
             }
-            self.create_tcp_listener(endpoint, bind_address)
         } else {
-            self.create_tcp_listener(
-                NetworkEndpoint::new(receiver_node_id, bind_address, NetworkTransport::Tcp),
-                bind_address,
-            )
-        }
+            self.deployment.backend.as_ref()
+        };
+        self.create_tcp_listener(endpoint, bind_address, backend)
     }
 
     fn create_tcp_listener(
         &self,
         endpoint: NetworkEndpoint,
         bind_address: SocketAddr,
+        backend: &NetworkListenerBackend,
     ) -> io::Result<NetworkTcpListener> {
         let key = RegistrationKey {
             core_id: self.core_id,
@@ -401,7 +420,7 @@ impl NetworkListenerSet {
             let _ = registrations.insert(key.clone(), registration_id);
         }
 
-        let result = match self.deployment.backend.as_ref() {
+        let result = match backend {
             NetworkListenerBackend::SocketPerListener => create_listener(bind_address)
                 .and_then(TcpListener::from_std)
                 .map(NetworkTcpListenerInner::SocketPerListener),
@@ -853,6 +872,7 @@ async fn run_shared_endpoint(
 ) {
     let mut next_consumer = 0;
     let mut pending_connection = None;
+    let mut accept_retry_at = None;
     loop {
         if let Some(connection) = pending_connection.take() {
             match dispatch_shared_connection(&mut consumers, &mut next_consumer, connection) {
@@ -881,12 +901,30 @@ async fn run_shared_endpoint(
                         break;
                     }
                 }
-                accepted = listener.accept() => {
+                accepted = async {
+                    if let Some(deadline) = accept_retry_at {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                    listener.accept().await
+                } => {
                     match accepted {
-                        Ok(connection) => pending_connection = Some(connection),
+                        Ok(connection) => {
+                            if accept_retry_at.take().is_some() {
+                                *terminal_error.lock() = None;
+                            }
+                            pending_connection = Some(connection);
+                        }
                         Err(error) => {
+                            if accept_retry_at.is_none() {
+                                otel_warn!(
+                                    "network_listener.accept_failed",
+                                    error = %error,
+                                    message = "Retrying TCP accept after backoff"
+                                );
+                            }
                             *terminal_error.lock() = Some(SharedAcceptError::from_io(&error));
-                            break;
+                            accept_retry_at =
+                                Some(tokio::time::Instant::now() + ACCEPT_ERROR_BACKOFF);
                         }
                     }
                 }
@@ -1021,10 +1059,7 @@ impl Stream for TcpIncoming {
         let listener = this.listener.as_mut().expect("listener checked above");
         match listener.poll_accept(cx) {
             Poll::Ready(Ok((stream, _))) => Poll::Ready(Some(Ok(stream))),
-            Poll::Ready(Err(error)) => {
-                this.listener = None;
-                Poll::Ready(Some(Err(error)))
-            }
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1126,6 +1161,166 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shared_socket_backend_accepts_connections() {
         assert_backend_accepts(NetworkListenerBackend::shared_socket()).await;
+    }
+
+    /// Scenario: an undeclared custom receiver shares a pipeline with a planned receiver.
+    /// Guarantees: only the custom receiver uses legacy binding; planned endpoints stay strict.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unmanaged_receiver_preserves_legacy_binding_alongside_planned_endpoint() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let mut plan = two_member_plan(1, addr);
+        plan.unmanaged_receivers.push("custom".into());
+        let broker = NetworkListenerBroker::with_backend(NetworkListenerBackend::shared_socket());
+        let listeners = broker.listener_set_for(Arc::new(plan), 2).unwrap();
+        let custom = listeners.tcp_listener("custom".into(), addr).unwrap();
+        assert!(matches!(
+            custom.inner,
+            NetworkTcpListenerInner::SocketPerListener(_)
+        ));
+        let planned = listeners.tcp_listener("syslog".into(), addr).unwrap();
+        assert!(matches!(
+            planned.inner,
+            NetworkTcpListenerInner::SharedSocket(_)
+        ));
+        let wrong_address = listeners
+            .tcp_listener("syslog".into(), "127.0.0.1:1514".parse().unwrap())
+            .err()
+            .expect("planned receiver must not gain legacy binding");
+        assert_eq!(wrong_address.kind(), io::ErrorKind::NotFound);
+        let wrong_receiver = listeners
+            .tcp_listener("other".into(), addr)
+            .err()
+            .expect("unlisted receiver must not gain legacy binding");
+        assert_eq!(wrong_receiver.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Scenario: two receiver nodes independently ask the OS for an ephemeral port.
+    /// Guarantees: planning and binding allow distinct listeners instead of a false bind conflict.
+    #[tokio::test(flavor = "current_thread")]
+    async fn distinct_ephemeral_endpoints_bind_independently() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let mut plan = two_member_plan(1, addr);
+        plan.endpoints.push(NetworkEndpoint::new(
+            "second".into(),
+            addr,
+            NetworkTransport::Tcp,
+        ));
+        let plan =
+            NetworkListenerPlan::new(plan.deployment_key, plan.members, plan.endpoints).unwrap();
+        let broker = NetworkListenerBroker::with_backend(NetworkListenerBackend::shared_socket());
+        let listeners = broker.listener_set_for(Arc::new(plan), 2).unwrap();
+        let first = listeners.tcp_listener("syslog".into(), addr).unwrap();
+        let second = listeners.tcp_listener("second".into(), addr).unwrap();
+        assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
+    }
+
+    /// Scenario: TCP accept reaches a temporary descriptor limit in an isolated child process.
+    /// Guarantees: direct incoming streams and the shared broker recover once descriptors are freed.
+    #[cfg(unix)]
+    #[test]
+    fn incoming_recovers_after_fd_exhaustion() {
+        use futures::StreamExt;
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+        const CHILD_BACKEND: &str = "OTEL_ARROW_TEST_ACCEPT_FD_LIMIT";
+        let Some(backend) = std::env::var_os(CHILD_BACKEND) else {
+            for backend in ["direct", "shared"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "network_listener::tests::incoming_recovers_after_fd_exhaustion",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_BACKEND, backend)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{backend} accept recovery failed:\n{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        };
+        struct RestoreLimit(nix::libc::rlim_t, nix::libc::rlim_t);
+        impl Drop for RestoreLimit {
+            fn drop(&mut self) {
+                setrlimit(Resource::RLIMIT_NOFILE, self.0, self.1).unwrap();
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let backend = if backend == "shared" {
+                NetworkListenerBackend::shared_socket()
+            } else {
+                NetworkListenerBackend::SocketPerListener
+            };
+            let broker = NetworkListenerBroker::with_backend(backend);
+            let listeners = broker
+                .listener_set_for(
+                    Arc::new(two_member_plan(1, "127.0.0.1:0".parse().unwrap())),
+                    2,
+                )
+                .unwrap();
+            let listener = listeners
+                .tcp_listener("syslog".into(), "127.0.0.1:0".parse().unwrap())
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shared_error = match &listener.inner {
+                NetworkTcpListenerInner::SharedSocket(listener) => {
+                    Some(Arc::clone(&listener.terminal_error))
+                }
+                NetworkTcpListenerInner::SocketPerListener(_) => None,
+            };
+            let mut incoming = tcp_incoming(listener, std::future::pending());
+            let client =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+            let restore = RestoreLimit(soft, hard);
+            setrlimit(Resource::RLIMIT_NOFILE, soft.min(64), hard).unwrap();
+            let mut files = Vec::new();
+            let exhaustion = loop {
+                match std::fs::File::open("/dev/null") {
+                    Ok(file) => files.push(file),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(exhaustion.raw_os_error(), Some(nix::libc::EMFILE));
+            client
+                .connect_timeout(&addr.into(), Duration::from_secs(2))
+                .unwrap();
+            if let Some(error) = shared_error {
+                timeout(Duration::from_secs(5), async {
+                    while error.lock().is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("shared broker should observe descriptor exhaustion");
+            } else {
+                let error = timeout(Duration::from_secs(5), incoming.next())
+                    .await
+                    .unwrap()
+                    .expect("direct accept should report descriptor exhaustion")
+                    .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(nix::libc::EMFILE));
+            }
+            drop(files);
+            drop(restore);
+            let _recovery_client = TcpStream::connect(addr).await.unwrap();
+            let accepted = timeout(Duration::from_secs(5), incoming.next())
+                .await
+                .expect("accept should resume once descriptors are available");
+            assert!(
+                matches!(accepted, Some(Ok(_))),
+                "incoming did not recover: {accepted:?}"
+            );
+        });
     }
 
     /// Scenario: a shared backend is configured before any receiver requests a socket.

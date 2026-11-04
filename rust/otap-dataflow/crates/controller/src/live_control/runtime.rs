@@ -68,6 +68,19 @@ fn runtime_recovery_streak_expired(
     ready_since.is_some_and(|ready_since| now.saturating_duration_since(ready_since) >= reset_after)
 }
 
+/// Readiness is historical: a terminal observation must not hide an earlier ready callback.
+/// The second marker load follows terminal observation, closing the ready-then-exit race.
+pub(super) fn pipeline_readiness_decision(
+    ready: impl Fn() -> bool,
+    terminal_error: impl FnOnce() -> Option<String>,
+) -> Option<Result<(), String>> {
+    if ready() {
+        return Some(Ok(()));
+    }
+    let error = terminal_error()?;
+    Some(if ready() { Ok(()) } else { Err(error) })
+}
+
 impl<
     PData: 'static + Clone + Send + Sync + std::fmt::Debug + ReceivedAtNode + Unwindable + FlowMetricHook,
 > ControllerRuntime<PData>
@@ -89,6 +102,7 @@ impl<
             InternalTelemetrySettings,
             std_mpsc::SyncSender<Result<(), EngineError>>,
         )>,
+        start_ticket: Option<StartGateTicket>,
     ) -> Result<LaunchedPipelineThread<PData>, Error> {
         let core_placement =
             deployment
@@ -191,6 +205,7 @@ impl<
                         tracing_setup,
                         internal_telemetry,
                         thread_startup_ready,
+                        start_ticket,
                     )
                 })) {
                     Ok(Ok(_)) => RuntimeInstanceExit::Success,
@@ -232,6 +247,17 @@ impl<
         core_id: usize,
         deployment_generation: u64,
     ) -> Result<DeployedPipelineKey, Error> {
+        self.launch_gated_pipeline_instance(deployment, core_id, deployment_generation, None)
+    }
+
+    /// Launches a new instance held between build and run when a start ticket is supplied.
+    pub(super) fn launch_gated_pipeline_instance(
+        self: &Arc<Self>,
+        deployment: &LogicalPipelineDeployment,
+        core_id: usize,
+        deployment_generation: u64,
+        start_ticket: Option<StartGateTicket>,
+    ) -> Result<DeployedPipelineKey, Error> {
         let thread_id = self.next_thread_id();
         let launched = self.launch_pipeline_thread(
             deployment,
@@ -240,6 +266,7 @@ impl<
             thread_id,
             self.engine_tracing_setup.clone(),
             None,
+            start_ticket,
         )?;
         let deployed_key = launched.pipeline_key.clone();
         self.register_launched_instance(launched);
@@ -1382,50 +1409,59 @@ impl<
             deployed_key.pipeline_id.clone(),
         );
         loop {
-            if self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .runtime_instances
-                .get(deployed_key)
-                .is_some_and(|instance| {
-                    instance
-                        .startup_ready
-                        .load(std::sync::atomic::Ordering::Acquire)
-                })
-            {
-                return Ok(());
-            }
-
-            let mut observed_terminal_phase = false;
-            if let Some(status) = self.observed_state_handle.pipeline_status(&pipeline_key)
-                && let Some(instance) =
-                    status.instance_status(deployed_key.core_id, deployed_key.deployment_generation)
-            {
-                observed_terminal_phase = matches!(
-                    instance.phase(),
-                    PipelinePhase::Failed(_)
-                        | PipelinePhase::Rejected(_)
-                        | PipelinePhase::Deleted
-                        | PipelinePhase::Stopped
-                );
-            }
-
-            if let Some(exit) = self.instance_exit(deployed_key) {
-                return match exit {
-                    RuntimeInstanceExit::Success => Err(format!(
-                        "pipeline exited before reporting ready on core {} (generation {})",
-                        deployed_key.core_id, deployed_key.deployment_generation
-                    )),
-                    RuntimeInstanceExit::Error(error) => Err(error.message),
-                };
-            }
-
-            if observed_terminal_phase {
-                return Err(format!(
-                    "pipeline failed to become ready on core {} (generation {})",
-                    deployed_key.core_id, deployed_key.deployment_generation
-                ));
+            let decision = pipeline_readiness_decision(
+                || {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .runtime_instances
+                        .get(deployed_key)
+                        .is_some_and(|instance| {
+                            instance
+                                .startup_ready
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        })
+                },
+                || {
+                    let observed_terminal_phase = self
+                        .observed_state_handle
+                        .pipeline_status(&pipeline_key)
+                        .and_then(|status| {
+                            status
+                                .instance_status(
+                                    deployed_key.core_id,
+                                    deployed_key.deployment_generation,
+                                )
+                                .map(|instance| {
+                                    matches!(
+                                        instance.phase(),
+                                        PipelinePhase::Failed(_)
+                                            | PipelinePhase::Rejected(_)
+                                            | PipelinePhase::Deleted
+                                            | PipelinePhase::Stopped
+                                    )
+                                })
+                        })
+                        .unwrap_or(false);
+                    if let Some(exit) = self.instance_exit(deployed_key) {
+                        return Some(match exit {
+                            RuntimeInstanceExit::Success => format!(
+                                "pipeline exited before reporting ready on core {} (generation {})",
+                                deployed_key.core_id, deployed_key.deployment_generation
+                            ),
+                            RuntimeInstanceExit::Error(error) => error.message,
+                        });
+                    }
+                    observed_terminal_phase.then(|| {
+                        format!(
+                            "pipeline failed to become ready on core {} (generation {})",
+                            deployed_key.core_id, deployed_key.deployment_generation
+                        )
+                    })
+                },
+            );
+            if let Some(result) = decision {
+                return result;
             }
 
             if Instant::now() >= deadline {

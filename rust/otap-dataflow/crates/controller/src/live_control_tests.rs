@@ -621,6 +621,262 @@ static RECOVERY_TEST_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::ne
     &[],
 );
 
+/// Cross-thread records are separated by group so topic-flow tests can run concurrently.
+static TOPIC_FLOW_RECEIVED: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+static TOPIC_FLOW_EXPORTERS_STARTED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Serializes the single blocked-build fixture across tests; pipeline threads signal it directly.
+static TOPIC_FLOW_BUILD_BLOCK_LOCK: Mutex<()> = Mutex::new(());
+static TOPIC_FLOW_BUILD_BLOCK_STARTED: AtomicBool = AtomicBool::new(false);
+static TOPIC_FLOW_BUILD_BLOCK_RELEASED: AtomicBool = AtomicBool::new(false);
+
+struct TopicFlowBuildBlockRelease;
+
+impl Drop for TopicFlowBuildBlockRelease {
+    fn drop(&mut self) {
+        TOPIC_FLOW_BUILD_BLOCK_RELEASED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Mirrors production topic receivers by subscribing during build, not runtime start.
+struct TopicFlowReceiver {
+    subscription: otel_arrow_dfe_engine::topic::Subscription<()>,
+    record_key: (String, String, String),
+}
+
+#[async_trait(?Send)]
+impl receiver::Receiver<()> for TopicFlowReceiver {
+    async fn start(
+        self: Box<Self>,
+        mut ctrl_chan: receiver::ControlChannel<()>,
+        effect_handler: receiver::EffectHandler<()>,
+    ) -> Result<TerminalState, EngineError> {
+        use otel_arrow_dfe_engine::topic::RecvItem;
+        let Self {
+            mut subscription,
+            record_key,
+        } = *self;
+        let mut listening = true;
+        loop {
+            tokio::select! {
+                item = subscription.recv(), if listening => match item {
+                    Ok(RecvItem::Message(_)) => {
+                        TOPIC_FLOW_RECEIVED
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(record_key.clone());
+                        listening = false;
+                    }
+                    Ok(_) => {}
+                    Err(_) => listening = false,
+                },
+                msg = ctrl_chan.recv() => match msg? {
+                    NodeControlMsg::DrainIngress { deadline, .. } => {
+                        effect_handler.notify_receiver_drained().await?;
+                        return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
+                    }
+                    NodeControlMsg::Shutdown { deadline, .. } => {
+                        return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+}
+
+struct TopicFlowExporter {
+    handle: otel_arrow_dfe_engine::topic::TopicHandle<()>,
+    record_key: (String, String),
+}
+
+#[async_trait(?Send)]
+impl exporter::Exporter<()> for TopicFlowExporter {
+    async fn start(
+        self: Box<Self>,
+        mut inbox: ExporterInbox<()>,
+        _effect_handler: exporter::EffectHandler<()>,
+    ) -> Result<TerminalState, EngineError> {
+        TOPIC_FLOW_EXPORTERS_STARTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(self.record_key.clone());
+        // Stand in for ingress arriving as soon as the runtime starts.
+        let _ = self
+            .handle
+            .try_publish(Arc::new(()))
+            .expect("topic-flow exporter should publish");
+        loop {
+            if let Message::Control(NodeControlMsg::Shutdown { deadline, .. }) =
+                inbox.recv().await?
+            {
+                return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
+            }
+        }
+    }
+}
+
+fn topic_flow_receiver_create(
+    pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    receiver_config: &ReceiverConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ReceiverWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    use otel_arrow_dfe_engine::topic::{SubscriberOptions, SubscriptionMode};
+    if node_config.config.get("block_build").is_some() {
+        TOPIC_FLOW_BUILD_BLOCK_STARTED.store(true, Ordering::SeqCst);
+        while !TOPIC_FLOW_BUILD_BLOCK_RELEASED.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if node_config.config.get("fail_build").is_some() {
+        return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: "simulated topic-flow receiver build failure".to_owned(),
+        });
+    }
+    let topic = Controller::<()>::parse_topic_name_from_node_config(&node_config)
+        .expect("topic-flow receiver should name a topic");
+    let mode = match Controller::<()>::parse_topic_receiver_mode(&node_config) {
+        TopicReceiverMode::Balanced(group) => SubscriptionMode::Balanced { group },
+        _ => SubscriptionMode::Broadcast,
+    };
+    let subscription = pipeline_ctx
+        .topic_set::<()>()
+        .expect("topic-flow pipeline should have a topic set")
+        .get_required(topic.as_ref())
+        .expect("topic-flow receiver topic should be declared")
+        .subscribe(mode, SubscriberOptions::default())
+        .expect("topic-flow receiver should subscribe");
+    let record_key = (
+        pipeline_ctx.pipeline_group_id().as_ref().to_owned(),
+        pipeline_ctx.pipeline_id().as_ref().to_owned(),
+        topic.as_ref().to_owned(),
+    );
+    Ok(ReceiverWrapper::local(
+        TopicFlowReceiver {
+            subscription,
+            record_key,
+        },
+        node,
+        node_config,
+        receiver_config,
+    ))
+}
+
+fn topic_flow_exporter_create(
+    pipeline_ctx: PipelineContext,
+    node: otel_arrow_dfe_engine::node::NodeId,
+    node_config: Arc<NodeUserConfig>,
+    exporter_config: &ExporterConfig,
+    _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<ExporterWrapper<()>, otel_arrow_dfe_config::error::Error> {
+    let topic = Controller::<()>::parse_topic_name_from_node_config(&node_config)
+        .expect("topic-flow exporter should name a topic");
+    let handle = pipeline_ctx
+        .topic_set::<()>()
+        .expect("topic-flow pipeline should have a topic set")
+        .get_required(topic.as_ref())
+        .expect("topic-flow exporter topic should be declared")
+        .into_handle();
+    let record_key = (
+        pipeline_ctx.pipeline_group_id().as_ref().to_owned(),
+        pipeline_ctx.pipeline_id().as_ref().to_owned(),
+    );
+    Ok(ExporterWrapper::local(
+        TopicFlowExporter { handle, record_key },
+        node,
+        node_config,
+        exporter_config,
+    ))
+}
+
+static TOPIC_FLOW_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
+    ReceiverFactory {
+        name: "urn:test:receiver:example",
+        create: recovery_test_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ReceiverFactory {
+        name: "urn:otel:receiver:topic",
+        create: topic_flow_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ReceiverFactory {
+        name: "urn:otel:receiver:internal_telemetry",
+        create: recovery_test_receiver_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+];
+
+static TOPIC_FLOW_EXPORTER_FACTORIES: &[ExporterFactory<()>] = &[
+    ExporterFactory {
+        name: "urn:test:exporter:example",
+        create: recovery_test_exporter_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ExporterFactory {
+        name: "urn:otel:exporter:topic",
+        create: topic_flow_exporter_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ExporterFactory {
+        name: "urn:otel:exporter:console",
+        create: recovery_test_exporter_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+    ExporterFactory {
+        name: "urn:otel:exporter:noop",
+        create: recovery_test_exporter_create,
+        context_declarations: None,
+        wiring_contract: WiringContract::UNRESTRICTED,
+        validate_config: test_validate_config,
+    },
+];
+
+static TOPIC_FLOW_PIPELINE_FACTORY: PipelineFactory<()> = PipelineFactory::new(
+    TOPIC_FLOW_RECEIVER_FACTORIES,
+    TEST_PROCESSOR_FACTORIES,
+    TOPIC_FLOW_EXPORTER_FACTORIES,
+    &[],
+);
+
+fn wait_for_topic_flow(group_id: &str, expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut received: Vec<_> = TOPIC_FLOW_RECEIVED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(group, _, _)| group == group_id)
+            .map(|(_, pipeline, topic)| (pipeline.clone(), topic.clone()))
+            .collect();
+        received.sort();
+        received.dedup();
+        if expected.iter().all(|(pipeline, topic)| {
+            received
+                .iter()
+                .any(|(got_pipeline, got_topic)| got_pipeline == pipeline && got_topic == topic)
+        }) || Instant::now() >= deadline
+        {
+            return received;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 static STARTUP_FAILING_RECEIVER_FACTORIES: &[ReceiverFactory<()>] = &[
     ReceiverFactory {
         name: "urn:test:receiver:example",
@@ -1132,7 +1388,7 @@ fn register_committed_pipeline(
     let network_plan =
         network_listener::plan_for_pipeline(&resolved, &placement, deployment_key.clone())
             .expect("committed pipeline network plan must be valid");
-    let network_plan = (!network_plan.endpoints.is_empty()).then(|| Arc::new(network_plan));
+    let network_plan = (!network_plan.is_empty()).then(|| Arc::new(network_plan));
     let deployment = LogicalPipelineDeployment::new(
         resolved,
         context_bindings,
@@ -1590,7 +1846,7 @@ fn terminal_shutdown_record(
 /// allocation from one assigned core to two.
 /// Guarantees: rollout planning classifies the change as a resize, starts only
 /// the added core, keeps the active generation unchanged, and assigns a fresh
-/// placement generation.
+/// placement generation while retaining unmanaged receiver compatibility.
 #[test]
 fn prepare_rollout_plan_accepts_core_allocation_scale_up() {
     let config = engine_config_with_pipeline(
@@ -1665,7 +1921,16 @@ connections:
         plan.target_deployment.deployment_key.placement_generation(),
         1
     );
-    assert!(plan.target_deployment.network_plan.is_none());
+    let network_plan = plan
+        .target_deployment
+        .network_plan
+        .as_ref()
+        .expect("custom receivers retain their compatibility plan");
+    assert!(network_plan.endpoints.is_empty());
+    assert_eq!(
+        network_plan.unmanaged_receivers,
+        vec![otel_arrow_dfe_config::NodeId::from("receiver")]
+    );
     assert_eq!(
         plan.rollout
             .cores
@@ -4272,6 +4537,37 @@ fn startup_readiness_marker_wins_over_later_runtime_exit() {
         .expect("readiness marker should win over a later runtime exit");
 }
 
+/// Scenario: readiness changes from false to true while an exit or terminal phase is observed.
+/// Guarantees: a fresh readiness load after terminal observation preserves successful startup.
+#[test]
+fn startup_readiness_marker_set_during_terminal_observation_wins() {
+    for terminal_reason in ["runtime exited", "observed terminal phase"] {
+        let ready = AtomicBool::new(false);
+        let decision = runtime::pipeline_readiness_decision(
+            || ready.load(Ordering::Acquire),
+            || {
+                ready.store(true, Ordering::Release);
+                Some(terminal_reason.to_owned())
+            },
+        );
+        assert_eq!(decision, Some(Ok(())), "{terminal_reason}");
+    }
+}
+
+/// Scenario: terminal state is observed without ever reporting ready.
+/// Guarantees: the readiness recheck does not hide genuine startup failures.
+#[test]
+fn startup_readiness_marker_unset_preserves_terminal_failure() {
+    let decision = runtime::pipeline_readiness_decision(
+        || false,
+        || Some("runtime exited before ready".to_owned()),
+    );
+    assert_eq!(
+        decision,
+        Some(Err("runtime exited before ready".to_owned()))
+    );
+}
+
 fn run_create_undesired_instance_scenario(
     scenario: UndesiredInstanceScenario,
 ) -> Result<(), RolloutExecutionError> {
@@ -6338,12 +6634,19 @@ fn startup_reconciliation_failure_stops_controller_startup() {
     }
 }
 
-/// Scenario: startup commits one regular pipeline before a later pipeline rollout fails.
-/// Guarantees: startup failure stops both the committed regular pipeline and system observability
-/// before returning the pipeline-specific error.
+/// Scenario: startup releases two built pipelines, and one fails when its receiver starts.
+/// Guarantees: startup failure stops the other regular pipeline and system observability before
+/// returning the pipeline-specific error; a child process isolates the shutdown counters.
 #[test]
 fn startup_reconciliation_failure_cleans_up_launched_pipelines() {
     const UNREACHED_CONTROLLER_EXTENSION_URN: &str = "urn:test:extension:unreached_cleanup_startup";
+
+    if std::env::var_os("OTAP_CONSOLE_REPORTING_CHILD").is_none() {
+        crate::tests::run_console_reporting_child(
+            "live_control::tests::startup_reconciliation_failure_cleans_up_launched_pipelines",
+        );
+        return;
+    }
 
     let config = OtelDataflowSpec::from_yaml(&format!(
         r#"
@@ -6382,7 +6685,7 @@ groups:
               count: 1
         nodes:
           receiver:
-            type: "urn:test:receiver:build-fails"
+            type: "urn:test:receiver:start-fails"
             config: null
           exporter:
             type: "urn:test:exporter:example"
@@ -6421,20 +6724,23 @@ groups:
     match err {
         Error::StartupReconciliationFailed { message } => {
             assert!(
-                message.contains("simulated startup pipeline build failure"),
+                message.contains("simulated startup pipeline start failure"),
                 "{message}"
             );
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    assert!(
-        after.0 > before.0,
-        "system observability receiver did not stop"
+    assert_eq!(
+        before,
+        (0, 0),
+        "child process should start with clean counters"
     );
-    assert!(
-        after.1 > before.1,
-        "successfully committed regular pipeline receiver did not stop"
+    assert!(after.0 > 0, "system observability receiver did not stop");
+    assert_eq!(
+        after.1, 1,
+        "regular pipeline receiver did not stop exactly once"
     );
+    std::process::exit(0);
 }
 
 /// Scenario: a desired engine config contains an invalid core assignment after an otherwise valid
@@ -6573,12 +6879,10 @@ groups:
     assert!(state.runtime_instances.is_empty());
 }
 
-/// Scenario: four pipelines form a three-topic chain whose producer-first IDs oppose dependency
-/// order, including intermediate pipelines that both consume and produce topics.
-/// Guarantees: full-config reconciliation starts the chain from the final consumer back to the
-/// initial producer so every downstream subscription is active before its producer can publish.
+/// Scenario: four new pipelines form a three-topic chain with producer-first pipeline IDs.
+/// Guarantees: every downstream subscription exists before its producer runs and all hops deliver.
 #[test]
-fn reconcile_engine_config_starts_topic_consumers_before_producers() {
+fn reconcile_engine_config_builds_topic_consumers_before_producers_run() {
     let desired = OtelDataflowSpec::from_yaml(
         r#"
 version: otel_dataflow/v1
@@ -6671,7 +6975,7 @@ groups:
 "#,
     )
     .expect("producer-first topic config should parse");
-    let runtime = test_runtime_with_factory(&desired, &RECOVERY_TEST_PIPELINE_FACTORY);
+    let runtime = test_runtime_with_factory(&desired, &TOPIC_FLOW_PIPELINE_FACTORY);
     let _runner = ObservedStateRunner::start(&runtime);
 
     let status = runtime
@@ -6683,22 +6987,245 @@ groups:
         EngineConfigReconcileState::Succeeded,
         "{status:?}"
     );
+    assert_eq!(status.changes.len(), 4);
+    let expected = [("p2", "topic_1"), ("p3", "topic_2"), ("p4", "topic_3")];
     assert_eq!(
-        status
-            .changes
+        wait_for_topic_flow("g", &expected),
+        expected
             .iter()
-            .map(|change| change
-                .pipeline_id
-                .as_ref()
-                .expect("change should identify its pipeline")
-                .as_ref())
-            .collect::<Vec<_>>(),
-        vec!["p4", "p3", "p2", "p1"]
+            .map(|(pipeline, topic)| ((*pipeline).to_owned(), (*topic).to_owned()))
+            .collect::<Vec<_>>()
     );
     runtime
         .request_shutdown_all(5)
         .expect("topic pipelines should shut down");
     assert!(runtime.wait_until_all_instances_exit_for(Duration::from_secs(5)));
+}
+
+/// Builds an acyclic node graph whose pipelines exchange topics in both directions.
+fn topic_cycle_config(group_id: &str, b_has_ingress: bool) -> OtelDataflowSpec {
+    let b_ingress = if b_has_ingress {
+        r#"
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          ingress_to_topic_2:
+            type: "urn:otel:exporter:topic"
+            config:
+              topic: topic_2"#
+    } else {
+        ""
+    };
+    let b_ingress_connection = if b_has_ingress {
+        r#"
+          - from: receiver
+            to: ingress_to_topic_2"#
+    } else {
+        ""
+    };
+    OtelDataflowSpec::from_yaml(&format!(
+        r#"
+version: otel_dataflow/v1
+topics:
+  topic_1: {{}}
+  topic_2: {{}}
+groups:
+  {group_id}:
+    pipelines:
+      a:
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: 1
+        nodes:
+          receiver:
+            type: "urn:test:receiver:example"
+            config: null
+          to_topic_1:
+            type: "urn:otel:exporter:topic"
+            config:
+              topic: topic_1
+          from_topic_2:
+            type: "urn:otel:receiver:topic"
+            config:
+              topic: topic_2
+          exporter:
+            type: "urn:test:exporter:example"
+            config: null
+        connections:
+          - from: receiver
+            to: to_topic_1
+          - from: from_topic_2
+            to: exporter
+      b:
+        policies:
+          resources:
+            core_allocation:
+              type: core_count
+              count: 1
+        nodes:{b_ingress}
+          from_topic_1:
+            type: "urn:otel:receiver:topic"
+            config:
+              topic: topic_1
+          to_topic_2:
+            type: "urn:otel:exporter:topic"
+            config:
+              topic: topic_2
+        connections:{b_ingress_connection}
+          - from: from_topic_1
+            to: to_topic_2
+"#
+    ))
+    .expect("topic cycle config should parse")
+}
+
+/// Scenario: new pipelines form a pipeline-level topic cycle but their node graph is acyclic.
+/// Guarantees: live reconciliation accepts the graph and both subscriptions precede publication.
+#[test]
+fn reconcile_engine_config_accepts_pipeline_level_topic_cycle() {
+    let desired = topic_cycle_config("cycle_live", false);
+    let runtime = test_runtime_with_factory(&desired, &TOPIC_FLOW_PIPELINE_FACTORY);
+    let _runner = ObservedStateRunner::start(&runtime);
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect("topic pipelines should reconcile");
+    assert_eq!(
+        status.state,
+        EngineConfigReconcileState::Succeeded,
+        "{status:?}"
+    );
+    assert_eq!(status.changes.len(), 2);
+    let expected = [("a", "topic_2"), ("b", "topic_1")];
+    assert_eq!(
+        wait_for_topic_flow("cycle_live", &expected),
+        expected
+            .iter()
+            .map(|(pipeline, topic)| ((*pipeline).to_owned(), (*topic).to_owned()))
+            .collect::<Vec<_>>()
+    );
+    runtime.request_shutdown_all(5).expect("shutdown");
+    assert!(runtime.wait_until_all_instances_exit_for(Duration::from_secs(5)));
+}
+
+/// Scenario: startup creates pipelines that each send independent ingress to the other's topic.
+/// Guarantees: startup succeeds without a pipeline-level ordering and both first messages arrive.
+#[test]
+fn startup_reconciliation_delivers_crossing_ingress_between_pipelines() {
+    let desired = topic_cycle_config("crossing_startup", true);
+    let runtime = test_runtime_with_factory(&desired, &TOPIC_FLOW_PIPELINE_FACTORY);
+    let _runner = ObservedStateRunner::start(&runtime);
+    let status = runtime
+        .reconcile_engine_config_startup(desired, 5)
+        .expect("startup should reconcile");
+    assert_eq!(
+        status.state,
+        EngineConfigReconcileState::Succeeded,
+        "{status:?}"
+    );
+    let expected = [("a", "topic_2"), ("b", "topic_1")];
+    assert_eq!(
+        wait_for_topic_flow("crossing_startup", &expected),
+        expected
+            .iter()
+            .map(|(pipeline, topic)| ((*pipeline).to_owned(), (*topic).to_owned()))
+            .collect::<Vec<_>>()
+    );
+    runtime.request_shutdown_all(5).expect("shutdown");
+    assert!(runtime.wait_until_all_instances_exit_for(Duration::from_secs(5)));
+}
+
+/// Scenario: a new topic consumer fails to build in a batch with a producer and another consumer.
+/// Guarantees: the entire batch fails without running any exporter, and every new instance exits.
+#[test]
+fn reconcile_engine_config_build_failure_runs_no_new_pipeline() {
+    let mut desired =
+        serde_json::to_value(topic_cycle_config("build_failure", false)).expect("serialize config");
+    desired["groups"]["build_failure"]["pipelines"]["b"]["nodes"]["from_topic_1"]["config"]["fail_build"] =
+        serde_json::json!(true);
+    let desired = serde_json::from_value(desired).expect("deserialize config");
+    let runtime = test_runtime_with_factory(&desired, &TOPIC_FLOW_PIPELINE_FACTORY);
+    let _runner = ObservedStateRunner::start(&runtime);
+    let status = runtime
+        .reconcile_engine_config(reconcile_request(desired, true))
+        .expect("reconcile should report a status");
+    assert_eq!(
+        status.state,
+        EngineConfigReconcileState::Failed,
+        "{status:?}"
+    );
+    assert!(
+        status
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("simulated topic-flow receiver build failure"),
+        "{status:?}"
+    );
+    assert!(runtime.wait_until_all_instances_exit_for(Duration::from_secs(5)));
+    let started: Vec<_> = TOPIC_FLOW_EXPORTERS_STARTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(group, _)| group == "build_failure")
+        .cloned()
+        .collect();
+    assert!(started.is_empty(), "new exporters ran: {started:?}");
+}
+
+/// Scenario: startup is waiting for a blocked build when engine shutdown is requested.
+/// Guarantees: startup returns before that build is released and every instance subsequently exits.
+#[test]
+fn startup_shutdown_during_start_gate_wait_returns_promptly() {
+    let mut desired =
+        serde_json::to_value(topic_cycle_config("gate_shutdown", false)).expect("serialize config");
+    desired["groups"]["gate_shutdown"]["pipelines"]["b"]["nodes"]["from_topic_1"]["config"]["block_build"] =
+        serde_json::json!(true);
+    let desired = serde_json::from_value(desired).expect("deserialize config");
+    let _block_lock = TOPIC_FLOW_BUILD_BLOCK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TOPIC_FLOW_BUILD_BLOCK_STARTED.store(false, Ordering::SeqCst);
+    TOPIC_FLOW_BUILD_BLOCK_RELEASED.store(false, Ordering::SeqCst);
+    let release = TopicFlowBuildBlockRelease;
+    let runtime = test_runtime_with_factory(&desired, &TOPIC_FLOW_PIPELINE_FACTORY);
+    let _runner = ObservedStateRunner::start(&runtime);
+    // The receive guard detects waiting for the build timeout instead of shutdown interruption.
+    let (status_tx, status_rx) = std::sync::mpsc::channel();
+    let reconcile_runtime = Arc::clone(&runtime);
+    let reconcile = thread::spawn(move || {
+        let status = reconcile_runtime.reconcile_engine_config_startup(desired, 120);
+        let _ = status_tx.send(status);
+    });
+    let guard = Instant::now() + Duration::from_secs(20);
+    while !TOPIC_FLOW_BUILD_BLOCK_STARTED.load(Ordering::SeqCst) {
+        assert!(Instant::now() < guard, "slow build should start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let shutdown_runtime = Arc::clone(&runtime);
+    let shutdown = thread::spawn(move || shutdown_runtime.request_shutdown_all(5));
+    let result = status_rx.recv_timeout(Duration::from_secs(20));
+    assert!(!TOPIC_FLOW_BUILD_BLOCK_RELEASED.load(Ordering::SeqCst));
+    drop(release);
+    reconcile.join().expect("reconcile thread");
+    shutdown.join().expect("shutdown thread").expect("shutdown");
+    let status = result
+        .expect("startup should return while the slow build is still blocked")
+        .expect("startup should report a status");
+    assert_eq!(
+        status.state,
+        EngineConfigReconcileState::Failed,
+        "{status:?}"
+    );
+    assert!(runtime.wait_until_all_instances_exit_for(Duration::from_secs(10)));
+    let started = TOPIC_FLOW_EXPORTERS_STARTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        !started.iter().any(|(group, _)| group == "gate_shutdown"),
+        "shutdown must not release built pipelines to run"
+    );
 }
 
 /// Scenario: two all-remaining-core pipelines follow an explicit core reservation.

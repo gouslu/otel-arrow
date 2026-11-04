@@ -9,6 +9,7 @@
 //! `SO_REUSEPORT`, or attach any selector.
 
 use crate::placement::PipelinePlacement;
+use otel_arrow_dfe_config::node::NodeKind;
 use otel_arrow_dfe_config::{LogicalPipelineDeploymentKey, engine::ResolvedPipelineConfig};
 use otel_arrow_dfe_engine::network_listener::{
     NetworkEndpoint, NetworkListenerMember, NetworkListenerPlan, NetworkTransport,
@@ -18,8 +19,8 @@ use std::io;
 use std::net::SocketAddr;
 
 // TODO(#3687): Replace controller-owned receiver schema extraction with
-// receiver-declared listener identities. Distinguish declared-none from
-// undeclared before network plans drive coordination.
+// receiver-declared listener identities. Undeclared receivers retain direct
+// binding until they can participate in managed network plans.
 const KNOWN_RECEIVER_URNS: &[&str] = &[
     "urn:otel:receiver:otlp",
     "urn:otel:receiver:otap",
@@ -126,8 +127,12 @@ pub(crate) fn plan_for_pipeline(
         .collect::<Vec<_>>();
 
     let mut endpoints = Vec::new();
+    let mut unmanaged_receivers = Vec::new();
     for (node_id, node_cfg) in pipeline.pipeline.node_iter() {
         if !KNOWN_RECEIVER_URNS.contains(&node_cfg.r#type.as_str()) {
+            if node_cfg.kind() == NodeKind::Receiver {
+                unmanaged_receivers.push(node_id.clone());
+            }
             continue;
         }
 
@@ -142,7 +147,10 @@ pub(crate) fn plan_for_pipeline(
         }
     }
 
-    NetworkListenerPlan::new(deployment_key, members, endpoints)
+    unmanaged_receivers.sort();
+    let mut plan = NetworkListenerPlan::new(deployment_key, members, endpoints)?;
+    plan.unmanaged_receivers = unmanaged_receivers;
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -253,6 +261,53 @@ nodes:
         assert_eq!(plan.endpoints.len(), 1);
         assert_eq!(plan.endpoints[0].receiver_node_id.as_ref(), "otap");
         assert_eq!(plan.endpoints[0].transport, NetworkTransport::Tcp);
+    }
+
+    /// Scenario: a custom receiver and a built-in receiver share a pipeline.
+    /// Guarantees: only the custom receiver is marked for legacy direct binding.
+    #[test]
+    fn preserves_undeclared_receiver_compatibility_alongside_planned_endpoint() {
+        let pipeline = resolved_pipeline(
+            r#"
+nodes:
+  custom:
+    type: "urn:test:receiver:custom"
+  otap:
+    type: "urn:otel:receiver:otap"
+    config:
+      listening_addr: "127.0.0.1:4317"
+  sink:
+    type: "urn:test:exporter:noop"
+"#,
+        );
+        let plan = plan_for_pipeline(&pipeline, &placement(), deployment_key(1)).unwrap();
+        assert_eq!(
+            plan.unmanaged_receivers,
+            vec![otel_arrow_dfe_config::NodeId::from("custom")]
+        );
+        assert_eq!(plan.endpoints.len(), 1);
+        assert_eq!(plan.endpoints[0].receiver_node_id.as_ref(), "otap");
+        assert!(!plan.is_empty());
+    }
+
+    /// Scenario: a pipeline contains only an undeclared custom receiver.
+    /// Guarantees: its compatibility listener plan is retained despite having no fixed endpoints.
+    #[test]
+    fn custom_receiver_keeps_nonempty_plan_without_declared_endpoints() {
+        let pipeline = resolved_pipeline(
+            r#"
+nodes:
+  custom:
+    type: "urn:test:receiver:custom"
+"#,
+        );
+        let plan = plan_for_pipeline(&pipeline, &placement(), deployment_key(1)).unwrap();
+        assert!(plan.endpoints.is_empty());
+        assert_eq!(
+            plan.unmanaged_receivers,
+            vec![otel_arrow_dfe_config::NodeId::from("custom")]
+        );
+        assert!(!plan.is_empty());
     }
 
     /// Scenario: multiple listener-capable receiver nodes are discovered in a

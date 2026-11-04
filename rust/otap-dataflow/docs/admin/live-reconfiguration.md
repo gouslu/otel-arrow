@@ -454,8 +454,14 @@ Behavior:
 - Placement-sensitive rollouts are planned before they start. Desired
   `core_set` pipelines are considered before desired `core_count` pipelines so
   controller-selected `core_count` placements avoid explicit core requests.
-- Pipelines connected through topics are rolled out in consumer-first order so
-  topic receivers are ready before their producers begin sending.
+- All newly created instances build before any of them run. Topic receivers
+  subscribe during build, so new subscriptions exist before new producers send,
+  even when the acyclic node graph has a pipeline-level topic cycle. Nodes must
+  not publish during build. Existing running instances are not paused; replace,
+  resize, and no-op rollouts retain their existing behavior.
+- `stepTimeoutSecs` applies separately to building the new batch and waiting for
+  readiness after it is released. Build failure, timeout, or engine shutdown
+  aborts the gate without running the newly built instances.
 - `core_count` placements avoid both committed `core_set` cores and other
   committed or in-flight `core_count` cores. Explicit `core_set` pipelines may
   still overlap other explicit `core_set` pipelines as operator intent.

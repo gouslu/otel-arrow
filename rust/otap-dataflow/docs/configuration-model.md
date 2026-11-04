@@ -182,9 +182,13 @@ Standalone pipeline files are not a startup root format.
 
 Regular pipelines from the startup file are deployed through the same
 full-engine reconciliation and rollout machinery used by live control. The
-controller plans the complete placement before launching workers, starts topic
-consumer pipelines before topic producers, and waits up to the configured
-startup step timeout for every instance to become admitted and ready. Controller
+controller plans the complete placement before launching workers, builds every
+new instance before starting any of them, then waits for admitted and ready.
+Topic receivers subscribe during build, so subscriptions exist before any new
+pipeline accepts or emits data, even when the node-acyclic topic graph has a
+pipeline-level cycle. Nodes must not publish during build. The configured
+startup step timeout applies separately to the batch build and readiness phases.
+Controller
 extension tasks and the admin server, including health endpoints, do not start
 until this reconciliation succeeds. A failed or timed-out rollout drains all
 pipelines through one global shutdown, including system observability and any
@@ -457,8 +461,9 @@ Optional observability policies are supported at:
 
 ### Controller Startup
 
-Initial startup reconciliation waits up to 30 seconds for each configured
-pipeline rollout step to become ready. Set
+Initial startup reconciliation waits up to 30 seconds for all new instances to
+build, then up to another 30 seconds for each pipeline's instances to become
+ready. Set
 `engine.controller.startup_step_timeout_secs` to a positive number of seconds
 to raise or lower that limit. If startup fails, the controller gives all
 regular pipelines a shared 30-second global drain window before stopping system
